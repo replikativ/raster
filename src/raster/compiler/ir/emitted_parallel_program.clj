@@ -8,6 +8,7 @@
             [raster.compiler.ir.emitted-equation-dispatch :as equation-dispatch]
             [raster.compiler.ir.emitted-parallel-equation :as emitted-equation]
             [raster.compiler.ir.emitted-structured-loop :as emitted-loop]
+            [raster.compiler.ir.invocation-plan :as invocation]
             [raster.compiler.ir.kernel-artifact :as artifact]
             [raster.compiler.ir.numerical-contract :as numerics]
             [raster.compiler.ir.parallel-program :as program]
@@ -115,6 +116,63 @@
   (filterv #(not (true? (get-in % [:attributes :host-only])))
            (get-in candidate [:body :equations])))
 
+(defn- canonical-candidate-source-region!
+  "Recover one exact scheduled source region from already validated emitted alternatives."
+  [equation candidates]
+  (let [regions (mapv candidate-numerical-equations candidates)
+        canonical (first regions)
+        source-equations (get-in equation [:attributes :emitted-source-equations])
+        exact-region?
+        (if source-equations
+          #(= source-equations (mapv :id %))
+          #(and (= 1 (count %))
+                (= (scheduled-equation-view equation)
+                   (scheduled-equation-view (first %)))))]
+    (when-not (and (seq regions)
+                   (every? exact-region? regions)
+                   (every? #(semantic-fingerprint/equivalent? canonical %) (next regions)))
+      (throw (ex-info "emitted alternatives differ from their retained scheduled source region"
+                      {:reason :emitted-parallel-program-source-region
+                       :outer-equation (:id equation)
+                       :expected-source-equations source-equations
+                       :actual-source-equations (mapv #(mapv :id %) regions)
+                       :ir :emitted-parallel-program})))
+    canonical))
+
+(defn- expanded-source-program!
+  "Reconstruct the exact scheduled equation spine retained inside validated emitted candidates.
+
+   Compound emission replaces constituent IDs on the outer spine. The candidate body deliberately
+   retains those scheduled constituents, so validation expands them here without reparsing source
+   or trusting `:emitted-source-equations` alone. The original InvocationPlan remains the boundary
+   owner and must match the expanded dataflow before it can contribute scalar constraints."
+  [parallel-program candidates-for]
+  (let [{:keys [equations regions]}
+        (reduce
+         (fn [{:keys [equations regions]} equation]
+           (let [candidates (when-let [operation (first (:operations equation))]
+                              (seq (candidates-for operation)))
+                 region (if candidates
+                          (canonical-candidate-source-region! equation (vec candidates))
+                          [equation])]
+             {:equations (into equations region)
+              :regions (assoc regions (:id equation) region)}))
+         {:equations [] :regions {}} (:equations parallel-program))
+        plan (get-in parallel-program [:attributes :invocation-plan])
+        plan (when plan (invocation/validate! plan))
+        source-inputs (if plan (:program-inputs plan) (:inputs parallel-program))
+        source-outputs (if plan (:program-outputs plan) (:outputs parallel-program))]
+    (when-not (= source-outputs (:outputs parallel-program))
+      (throw (ex-info "expanded emitted constituents differ from the retained invocation boundary"
+                      {:reason :emitted-parallel-program-source-boundary
+                       :expected-outputs source-outputs
+                       :actual-outputs (:outputs parallel-program)
+                       :ir :emitted-parallel-program})))
+    {:program (program/validate!
+               (assoc parallel-program :inputs source-inputs :equations (vec equations)
+                      :outputs source-outputs))
+     :regions regions}))
+
 (defn- validate-host-prefix-slices!
   "Bind every narrowed emitted body to its exact enclosing host-scalar execution prefix.
 
@@ -123,6 +181,9 @@
    substituting a different (though locally valid) prefix: its host equations, terminal numerical
    equation, inferred inputs, outputs, and effects must be the exact slice of this program."
   [parallel-program candidates-for]
+  (let [{source-program :program source-regions :regions}
+        (when (get-in parallel-program [:attributes :invocation-plan])
+          (expanded-source-program! parallel-program candidates-for))]
   (loop [host-prefix [] remaining (:equations parallel-program)]
     (when-let [equation (first remaining)]
       (if (true? (get-in equation [:attributes :host-only]))
@@ -135,6 +196,14 @@
                                          body-equations)
                   numerical-body (candidate-numerical-equations candidate)
                   source-equations (get-in equation [:attributes :emitted-source-equations])
+                  source-region (get source-regions (:id equation))
+                  expected-invocation-preconditions
+                  (if source-program
+                    (equation-graph/invocation-scalar-preconditions
+                     source-program source-region)
+                    [])
+                  actual-invocation-preconditions
+                  (equation-graph/body-invocation-scalar-preconditions body)
                   exact-source?
                   (if source-equations
                     (= source-equations (mapv :id numerical-body))
@@ -158,6 +227,8 @@
                                     {:reason :emitted-reduction-outer-slice
                                      :equation (:id equation)})))))
               (when-not (and (= host-prefix actual-prefix)
+                             (= expected-invocation-preconditions
+                                actual-invocation-preconditions)
                              exact-source?
                              (= expected-inputs (:inputs body))
                              (= (:results equation) (:outputs body))
@@ -169,9 +240,13 @@
                                  :actual-prefix (mapv :id actual-prefix)
                                  :expected-source-equations source-equations
                                  :actual-source-equations (mapv :id numerical-body)
+                                 :expected-invocation-scalar-preconditions
+                                 expected-invocation-preconditions
+                                 :actual-invocation-scalar-preconditions
+                                 actual-invocation-preconditions
                                  :expected-inputs expected-inputs :actual-inputs (:inputs body)
                                  :ir :emitted-parallel-program})))))
-          (recur host-prefix (next remaining)))))))
+          (recur host-prefix (next remaining))))))))
 
 (defn- validate-program!
   [parallel-program candidates-fn caller-options]

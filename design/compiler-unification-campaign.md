@@ -4,6 +4,47 @@
 
 ### Current boundary ledger
 
+Latest exact-head CI accounting, `7a9bc9ef8` (October 26): setup, build,
+emitted-source fixtures, CUDA compilation and HIP compilation pass. Unit job
+35045 and CPU-OpenCL job 35046 fail; this branch is not merge-ready. Unit has
+15 completed shards: 7,193 tests, 90,910 passing assertions, 20 failures and
+28 errors across 38 failing Vars. Shard 3 remains incomplete with 239 observed
+Vars, so these are not full-suite totals. CPU-OpenCL has all four completed
+shards: 656 tests, 8,358 passing assertions, 7 failures and 29 errors across
+34 failing Vars. The current artifacts supersede the older checkpoint counts
+below without waiving any remaining failure.
+
+The next address-proof repair must transport exact integral InvocationPlan
+producer relationships into sliced scheduled bodies as executable equality
+constraints. Both read-footprint proofs and runtime graph preconditions must
+derive from those same retained constraints; the enclosing source program must
+independently reconstruct their correspondence. Similar-looking expressions,
+alpha-renamed local names or an unguarded scalar-definition map are not evidence.
+This repairs the observed GQA-JVP lost-producer boundary without weakening
+portable OpenCL overflow or capacity checks. A separate training probe exposed
+a zero-operand Object completion of a scalar literal: validation, outlined
+bytecode and runtime invocation all need the same bounded operand grammar before
+that case may be admitted.
+
+The integral producer constraint bundle now passes the current scheduled-graph
+and map-read suites in the warm REPL: 43 tests / 214 assertions, plus the public
+GQA-JVP OpenCL/CUDA/HIP emission regression: 1 test / 21 assertions. Independent
+review found and helped correct recursive capture substitution, fused-spine
+reconstruction and cross-equality cycles before landing; final review found no
+remaining blockers. Exact parameter leaves, same-body ABI closure, width checks,
+runtime equality checks and original-plan rederivation remain separate checks.
+SWR, unsupported producer algebra and unavailable dependencies gain no proof.
+The wider clean-process C-family gate is still running at this checkpoint; these
+warm counts are not a claim that the branch or full campaign is green.
+
+A warm single-target GQA compile measured 5,978 ms, with 33 InvocationPlan
+correspondence checks totaling 52 ms. This is one diagnostic measurement under
+background load, not a performance baseline. It does not justify speculative
+persistent proof caching. The long-lived REPL was retired after selective
+function reload changed a sealing-factory closure class without refreshing its
+class constant; clean-process qualification must distinguish that development
+lifecycle issue from a production validation failure.
+
 The October 25 independent review keeps all eight original campaign objectives.
 The numerical IR is compositional; the source-execution and public ownership
 boundary is not yet uniformly compositional. Consolidate the common boundary

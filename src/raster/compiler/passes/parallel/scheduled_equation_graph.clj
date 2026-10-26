@@ -20,6 +20,8 @@
             [raster.compiler.ir.segmented-weighted-reduction :as swr]
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.ir.index-expression :as index-expression]
+            [raster.compiler.ir.invocation-plan :as invocation]
+            [raster.compiler.ir.kernel-precondition :as precondition]
             [raster.compiler.passes.parallel.product-reduction-regions :as product-regions]
             [raster.compiler.passes.parallel.typed-soac-projection :as typed-projection]
             [raster.compiler.passes.parallel.map-read-requirements :as map-reads]
@@ -143,6 +145,58 @@
                  (= :long result-dtype (some-> (get values result) :dtype dtype/canon)))
         [result (list 'extent id)]))))
 
+(defn- project-integral-launch-expression
+  "Project one already-validated, closed integral scalar region into KernelLaunch algebra.
+
+   `bindings` replace the region's lexical captures with their exact earlier proof expressions.
+   The caller remains responsible for authenticating the region and those bindings; this helper
+   owns only typed lowering, narrowing refusal, checked arithmetic, and result-width preservation."
+  [result expression captures capture-dtype result-dtype bindings reference-dtype]
+  (let [result-dtype (dtype/canon result-dtype)
+        narrowing-cast?
+        (boolean
+         (some (fn [form]
+                 (and (seq? form) (= 2 (count form))
+                      (contains? '#{int clojure.core/int} (first form))))
+               (tree-seq coll? seq expression)))
+        _ (when narrowing-cast?
+            (throw (ex-info "launch/storage scalar projection cannot erase narrowing"
+                            {:reason :derived-scalar-narrowing
+                             :result result :expression expression})))
+        decline! (fn [rule message data]
+                   (throw (ex-info message
+                                   (assoc data :reason rule
+                                               :pass :scheduled-equation-graph))))
+        index (index-expression/lower-typed
+               expression (set captures) capture-dtype result-dtype decline!)
+        lowered (index-expression/to-launch-expression index decline!)
+        ;; `rebind-expression` deliberately expands definitions transitively. Capture bindings,
+        ;; however, are a simultaneous lexical substitution: an identity binding (`n -> n`) or
+        ;; swapped names must not recursively reinterpret the replacement as another definition.
+        ;; Move through deterministic private leaves first, then splice the authenticated operand
+        ;; projections in a second pass. No private leaf survives this helper.
+        capture-tokens (mapv (fn [ordinal capture]
+                               [:invocation-scalar-capture result ordinal capture])
+                             (range) captures)
+        alpha-renamed (launch/rebind-expression
+                       lowered
+                       (into {} (map (fn [capture token]
+                                       [capture (launch/runtime-value token)])
+                                     captures capture-tokens)))
+        projected (launch/rebind-expression
+                   alpha-renamed
+                   (into {} (map (fn [capture token]
+                                   [token (get bindings capture (launch/runtime-value capture))])
+                                 captures capture-tokens)))
+        projected-dtype (launch/typed-expression-dtype projected reference-dtype)]
+    (when-not (= projected-dtype result-dtype)
+      (throw (ex-info "launch/storage scalar projection changes its retained width"
+                      {:reason :derived-scalar-dtype
+                       :result result :projected projected
+                       :projected-dtype projected-dtype
+                       :result-dtype result-dtype})))
+    projected))
+
 (defn- launch-definition
   [values bindings equation]
   (when-let [[result expression] (scalar-result-expression equation)]
@@ -150,41 +204,17 @@
                               (first (soac/equations (:algorithm equation))))]
       (or (backing-length-definition values captures result expression)
           (when (and (integral-scalar-value? (get values result))
-                 (every? #(integral-scalar-value? (get values %)) captures))
-        (try
-          (let [narrowing-cast?
-                (boolean
-                 (some (fn [form]
-                         (and (seq? form) (= 2 (count form))
-                              (contains? '#{int clojure.core/int} (first form))))
-                       (tree-seq coll? seq expression)))
-                _ (when narrowing-cast?
-                    (throw (ex-info "launch/storage scalar projection cannot erase narrowing"
-                                    {:reason :derived-scalar-narrowing
-                                     :result result :expression expression})))
-                decline! (fn [rule message data]
-                           (throw (ex-info message
-                                           (assoc data :reason rule
-                                                       :pass :scheduled-equation-graph))))
-                index (index-expression/lower-typed
-                       expression (set captures)
-                       #(get-in values [% :dtype]) (get-in values [result :dtype]) decline!)
-                projected (launch/rebind-expression
-                           (index-expression/to-launch-expression index decline!) bindings)
-                projected-dtype
-                (launch/typed-expression-dtype
-                 projected #(some-> (get values %) :dtype))]
-            (when-not (= projected-dtype (dtype/canon (get-in values [result :dtype])))
-              (throw (ex-info "launch/storage scalar projection changes its retained width"
-                              {:reason :derived-scalar-dtype
-                               :result result :projected projected
-                               :projected-dtype projected-dtype
-                               :result-dtype (get-in values [result :dtype])})))
-            [result projected])
-          ;; Scalar equations also represent ordinary arithmetic.  Only the monotone, integral
-          ;; subset accepted by KernelLaunch is an allocation definition; other scalar work stays
-          ;; opaque at this boundary exactly as before.
-          (catch clojure.lang.ExceptionInfo _ nil)))))))
+                     (every? #(integral-scalar-value? (get values %)) captures))
+            (try
+              [result
+               (project-integral-launch-expression
+                result expression captures
+                #(get-in values [% :dtype]) (get-in values [result :dtype]) bindings
+                #(some-> (get values %) :dtype))]
+              ;; Scalar equations also represent ordinary arithmetic. Only the monotone,
+              ;; integral subset accepted by KernelLaunch is a graph-storage definition; other
+              ;; scalar work stays opaque at this boundary exactly as before.
+              (catch clojure.lang.ExceptionInfo _ nil)))))))
 
 (defn derived-scalar-expressions
   "Derive replayable graph-storage expressions from ordered, already-validated scalar equations.
@@ -235,6 +265,153 @@
              {:equations (mapv :id equations) :indices indices
               :span (mapv :id span) :host-gap (mapv :id host-gap)}))
     {:indices indices :host-gap host-gap}))
+
+(def ^:private invocation-scalar-preconditions-key
+  :invocation-scalar-preconditions)
+
+(defn- scalar-compute-expression
+  [step]
+  (let [{:keys [parameters locals body-results]} (soac/lambda-parts (:region step))]
+    (when (and (= parameters (mapv :symbol (:operands step)))
+               (empty? locals) (= 1 (count body-results)))
+      (first body-results))))
+
+(defn invocation-scalar-preconditions
+  "Derive ordered equality guards for integral numerical inputs computed by the exact invocation.
+
+   The returned KernelPreconditions are a narrow projection of validated ScalarCompute steps,
+   never a second evaluator or a name-based alias table. A result is retained only when its exact
+   program binding names one step, every operand can be represented by one scalar in this
+   numerical boundary, and typed IndexExpression lowering preserves its width and checked
+   arithmetic. Unsupported or ambiguous steps contribute no proof."
+  [parallel-program equations]
+  (let [equations (vec equations)]
+    ;; SegmentedWeightedReduction plans have a separate schedule-neutral graph constructor which
+    ;; does not consume derived scalar definitions or retain these guards. Keep this first bounded
+    ;; projection on exact TypedSOAC regions; attaching unactioned proof to a plan body would be a
+    ;; false executable contract.
+    (if-not (every? (comp soac/program-form? :algorithm) equations)
+      []
+      (let [_ (contiguous-equation-region! parallel-program equations)
+            plan (get-in parallel-program [:attributes :invocation-plan])]
+        (if-not plan
+          []
+          (let [plan (invocation/validate-against! plan parallel-program)
+            values (:values parallel-program)
+            numerical-inputs (program/infer-inputs equations)
+            scalar-inputs
+            (into [] (filter #(integral-scalar-value? (get values %))) numerical-inputs)
+            scalar-input-set (set scalar-inputs)
+            bindings
+            (filterv #(contains? scalar-input-set (:program-value %)) (:bindings plan))
+            bindings-by-invocation (group-by :invocation-value bindings)
+            parameter-ids (set (map :id (:parameters plan)))
+            ;; Seed only exact public parameters. A ShapeProjection, ValueAlias, or other prefix
+            ;; step is not silently promoted into integer algebra by this bounded projection.
+            initial
+            (reduce-kv
+             (fn [projected invocation-id matches]
+               (if (and (contains? parameter-ids invocation-id) (= 1 (count matches)))
+                 (assoc projected invocation-id
+                        (launch/runtime-value (:program-value (first matches))))
+                 projected))
+             {} bindings-by-invocation)
+            projected-by-invocation
+            (reduce
+             (fn [projected step]
+               (if (and (invocation/scalar-compute? step)
+                        (integral-scalar-value? (:value step)))
+                 (let [expression (scalar-compute-expression step)
+                       operands (:operands step)
+                       operand-projections (mapv #(get projected (:value %)) operands)]
+                   (if (and expression (every? some? operand-projections))
+                     (if-let [projection
+                              (try
+                                (project-integral-launch-expression
+                                 (:symbol step) expression (mapv :symbol operands)
+                                 (fn [capture]
+                                   (some (fn [operand]
+                                           (when (= capture (:symbol operand))
+                                             (get-in plan [:values (:value operand) :dtype])))
+                                         operands))
+                                 (get-in step [:value :dtype])
+                                 (zipmap (mapv :symbol operands) operand-projections)
+                                 #(some-> (get values %) :dtype))
+                                (catch clojure.lang.ExceptionInfo _ nil))]
+                       (assoc projected (:id step) projection)
+                       projected)
+                     projected))
+                 projected))
+             initial (:steps plan))]
+            (into []
+                  (keep (fn [step]
+                          (let [matches (get bindings-by-invocation (:id step))
+                                result (when (= 1 (count matches))
+                                         (:program-value (first matches)))
+                                projection (get projected-by-invocation (:id step))
+                                references (when projection
+                                             (launch/expression-references projection))]
+                            (when (and (invocation/scalar-compute? step)
+                                       result projection
+                                       (= (:value step) (get values result))
+                                       (set/subset? references scalar-input-set)
+                                       (not (contains? references result)))
+                              {:expression result :op := :value projection}))))
+                  (:steps plan))))))))
+
+(defn body-invocation-scalar-preconditions
+  "Validate and return the invocation-derived equality guards retained by one scheduled body."
+  [body]
+  (let [conditions (get-in body [:attributes invocation-scalar-preconditions-key] [])
+        values (:values body)
+        scalar-dtypes (into {} (keep (fn [[id value]]
+                                       (when (integral-scalar-value? value)
+                                         [id (dtype/canon (:dtype value))]))) values)
+        scalar-identities (into #{} (keep (fn [[id value]]
+                                            (when (integral-scalar-value? value) id))) values)
+        inputs (set (:inputs body))
+        defined (set (map :expression conditions))]
+    (when-not (vector? conditions)
+      (fail! :scheduled-equation-invocation-scalar-preconditions
+             "invocation scalar preconditions must be an ordered vector"
+             {:preconditions conditions}))
+    (precondition/validate! conditions scalar-identities)
+    (when-not (and (= (count conditions) (count (distinct (map :expression conditions))))
+                   (every? (fn [{:keys [expression op value]}]
+                             (let [references
+                                   (into (launch/expression-references expression)
+                                         (launch/expression-references value))]
+                               (and (= := op)
+                                    (or (symbol? expression) (keyword? expression))
+                                    (contains? inputs expression)
+                                    (set/subset? references inputs)
+                                    (try
+                                      (= (get scalar-dtypes expression)
+                                         (launch/typed-expression-dtype value scalar-dtypes))
+                                      (catch clojure.lang.ExceptionInfo _ false))
+                                    (empty? (set/intersection
+                                             defined
+                                             (launch/expression-references value))))))
+                           conditions))
+      (fail! :scheduled-equation-invocation-scalar-preconditions
+             "invocation scalar preconditions require width-preserving distinct input equalities without cycles"
+             {:preconditions conditions :inputs inputs}))
+    conditions))
+
+(defn- invocation-scalar-definitions
+  [body]
+  (into {} (map (juxt :expression :value))
+        (body-invocation-scalar-preconditions body)))
+
+(defn- merge-scalar-definitions!
+  [retained invocation-derived]
+  (doseq [id (set/intersection (set (keys retained)) (set (keys invocation-derived)))]
+    (when-not (= (get retained id) (get invocation-derived id))
+      (fail! :scheduled-equation-scalar-definition-conflict
+             "retained and invocation-derived scalar definitions disagree"
+             {:scalar id :retained (get retained id)
+              :invocation-derived (get invocation-derived id)})))
+  (merge retained invocation-derived))
 
 (defn- region-outputs
   [parallel-program equations indices]
@@ -289,7 +466,18 @@
         scalar-prefix (vec (filter #(true? (get-in % [:attributes :host-only])) preceding))
         outputs (region-outputs parallel-program equations indices)
         body-equations (vec (concat scalar-prefix host-gap equations))
-        values (slice-value-contracts (:values parallel-program) body-equations)]
+        values (slice-value-contracts (:values parallel-program) body-equations)
+        invocation-preconditions (invocation-scalar-preconditions parallel-program equations)
+        _ (when (contains? body-attributes invocation-scalar-preconditions-key)
+            (fail! :scheduled-equation-invocation-scalar-preconditions
+                   "callers cannot supply invocation scalar proof constraints"
+                   {:attribute invocation-scalar-preconditions-key}))
+        body-attributes
+        (cond-> (merge {:host-control :explicit-typed-algorithm
+                        :equation-region (mapv :id equations)}
+                       body-attributes)
+          (seq invocation-preconditions)
+          (assoc invocation-scalar-preconditions-key invocation-preconditions))]
     (program/make
      {:dialect dialect
       :source nil
@@ -301,9 +489,7 @@
       :diagnostics []
       :provenance {:source-dialect source-dialect
                    :pass :scheduled-equation-graph}
-      :attributes (merge {:host-control :explicit-typed-algorithm
-                          :equation-region (mapv :id equations)}
-                         body-attributes)
+      :attributes body-attributes
       :operation? operation?
       :algorithm? algorithm?})))
 
@@ -410,8 +596,11 @@
                    "input storage requires an exact operation from its retained equation"
                    {:equation (:id equation) :operation (:id operation)}))
         values (:values body)
-        definitions (derived-scalar-expressions
-                     values (take-while #(true? (get-in % [:attributes :host-only])) (:equations body)))]
+        retained-definitions
+        (derived-scalar-expressions
+         values (take-while #(true? (get-in % [:attributes :host-only])) (:equations body)))
+        definitions (merge-scalar-definitions!
+                     retained-definitions (invocation-scalar-definitions body))]
     {:scalar-definitions definitions
      :scalar-types (into {} (keep (fn [[id value]]
                                    (when (integral-scalar-value? value)
@@ -601,8 +790,11 @@
          _ (when (empty? operations)
              (fail! :scheduled-equation-empty
                     "a KernelGraph requires at least one scheduled operation" {}))
-         derived-scalars (derived-scalar-expressions (:values scheduled) host-prefix)
          values (:values scheduled)
+         invocation-preconditions (body-invocation-scalar-preconditions scheduled)
+         retained-scalars (derived-scalar-expressions values host-prefix)
+         derived-scalars (merge-scalar-definitions!
+                          retained-scalars (invocation-scalar-definitions scheduled))
          transform-read-requirements
          (into {}
                (map (fn [equation]
@@ -812,7 +1004,9 @@
                            :value (checked-expression required)}))))
               distinct
               vec)
-         scalars (public-scalars scheduled operations buffer-specs capacity-preconditions)]
+         graph-preconditions (vec (distinct (concat invocation-preconditions
+                                                    capacity-preconditions)))
+         scalars (public-scalars scheduled operations buffer-specs graph-preconditions)]
      (let [kernel-graph
            (graph/from-segops
             operations
@@ -820,7 +1014,7 @@
              :outputs outputs
              :temporaries (select-keys buffer-specs temporary-ids)
              :scalars scalars
-             :preconditions capacity-preconditions
+             :preconditions graph-preconditions
              :buffer-specs buffer-specs
              :dtype (:dtype (first (vals buffer-specs)))
              :effects (or effects {:semantic (:effects (soac/facts algorithm))})
