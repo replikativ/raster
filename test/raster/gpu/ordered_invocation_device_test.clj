@@ -6,8 +6,10 @@
             [raster.compiler.ir.invocation-link :as invocation-link]
             [raster.compiler.ir.invocation-source-order-test :as fixture]
             [raster.compiler.ir.ordered-invocation-realization-test :as allocation-fixture]
+            [raster.compiler.fixtures.symbolic-storage :as symbolic-storage]
             [raster.dl.gpu-grad-parity :as ze-probe]
             [raster.gpu.core :as gpu]
+            [raster.gpu.compiled :as compiled]
             [raster.gpu.device-probe :as ocl-probe]
             [raster.gpu.link :as link]
             [raster.gpu.parallel-program :as program]))
@@ -303,3 +305,37 @@
   (if @ze-probe/gpu-available?
     (check-ordered-prefix-returns! :ze:0)
     (ze-probe/gpu-skip! "ordered prefix views and whole source returns")))
+
+(defn- check-symbolic-prefix-ranges! [target]
+  (doseq [[capacity n m extra prepared-stages expected-reason]
+          [[3 4 4 {} 0 :program-link-graph-range]
+           [6 6 7 {} 1 :program-link-graph-range]
+           ;; Static facts may add an earlier guarded kernel precondition, never permission
+           ;; to erase the original pointwise read minimum.
+           [3 4 4 {:values {'x (av/tensor {:dtype :float :shape [3]})}} 0 :kernel-precondition-failed]]]
+    (let [input (float-array (range capacity))
+          original (vec input)
+          prepared (compiled/lower #'symbolic-storage/prefix-map [input n m]
+                                   (merge {:compiler :equation-first :target target :dtype :float} extra))
+          artifact (compiled/instantiate! prepared)
+          preparations (atom 0)
+          prepare program/prepare-sequence-with-retained-programs!]
+      (try
+        (with-redefs [program/prepare-sequence-with-retained-programs!
+                      (fn [& args] (swap! preparations inc) (apply prepare args))]
+          (is (= expected-reason (reason #(artifact)))
+              "the current binding checks actual capacity even with supplied static facts"))
+        (is (= prepared-stages @preparations)
+            "range refusal precedes preparation/submission of the invalid stage")
+        (is (zero? @(:completed-replays (:executable artifact))))
+        (is (= original (vec input)))
+        (is (= :link-execution-poisoned (reason #(artifact))))
+        (finally (compiled/close! artifact))))))
+
+(deftest symbolic-prefix-ranges-fail-before-the-invalid-stage
+  (if @ocl-probe/opencl-available?
+    (check-symbolic-prefix-ranges! :ocl:0)
+    (ocl-probe/opencl-skip! "ordered symbolic prefix range failures"))
+  (if @ze-probe/gpu-available?
+    (check-symbolic-prefix-ranges! :ze:0)
+    (ze-probe/gpu-skip! "ordered symbolic prefix range failures")))

@@ -35,6 +35,7 @@
             [raster.compiler.passes.parallel.typed-soac-route :as typed-route]
             [raster.compiler.passes.parallel.structured-control-route :as structured-route]
             [raster.gpu.compiled :as compiled]
+            [raster.gpu.core :as gpu]
             [raster.gpu.parallel-program :as program-runtime]
             [raster.core :refer [deftm]]
             [raster.dl.attention :as attention]
@@ -242,29 +243,29 @@
             "failed proof must not evict a concurrent replacement owner")))
     (finally (compiled/clear-compilation-cache!))))
 
-(deftest symbolic-storage-prefixes-are-range-checked-before-allocation
-  (doseq [target [ocl-target cuda-target hip-target]]
-    (is (map? (compiled/lower #'symbolic-storage/prefix-map [(float-array 6) 6 4]
-                             {:compiler :equation-first :target target :dtype :float})))
-    (is (map? (compiled/lower #'symbolic-storage/prefix-map [(float-array 6) 4 4]
-                             {:compiler :equation-first :target target :dtype :float})))
-    (is (= :program-link-graph-range
-           (try
-             (compiled/lower #'symbolic-storage/prefix-map [(float-array 3) 4 4]
-                             {:compiler :equation-first :target target :dtype :float})
-             nil
-             (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
-    (is (= :program-link-graph-range
-           (try
-             (compiled/lower #'symbolic-storage/prefix-map [(float-array 6) 6 7]
-                             {:compiler :equation-first :target target :dtype :float})
-             nil
-             (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
-    (is (thrown? clojure.lang.ExceptionInfo
-                 (compiled/lower #'symbolic-storage/prefix-map [(float-array 3) 4 4]
-                                 {:compiler :equation-first :target target :dtype :float
-                                  :values {'x (av/tensor {:dtype :float :shape [3]})}}))
-        "a supplied static capacity cannot erase the reclassified pointwise minimum")))
+(deftest symbolic-storage-prefixes-retain-range-obligations-at-the-source-boundary
+  ;; Preparation must not execute allocations or advance over a preceding numerical action.
+  ;; The actual range failures are checked before the corresponding stage prepares/submits in
+  ;; ordered-invocation-device-test/symbolic-prefix-ranges-fail-before-the-invalid-stage.
+  (with-redefs [gpu/make-session (fn [& _] (throw (AssertionError. "preparation opened a session")))
+                gpu/alloc! (fn [& _] (throw (AssertionError. "preparation allocated")))]
+    (doseq [target [ocl-target cuda-target hip-target]
+            [arguments extra] [[[(float-array 6) 6 4] {}]
+                               [[(float-array 6) 4 4] {}]
+                               [[(float-array 3) 4 4] {}]
+                               [[(float-array 6) 6 7] {}]
+                               [[(float-array 3) 4 4]
+                                {:values {'x (av/tensor {:dtype :float :shape [3]})}}]]]
+      (let [prepared (compiled/lower #'symbolic-storage/prefix-map arguments
+                                     (merge {:compiler :equation-first :target target :dtype :float}
+                                            extra))]
+        (is (compiled/prepared? prepared))
+        (is (:ordered-invocation prepared))
+        (is (= :ordered-source (get-in prepared [:descriptor :execution-phase])))
+        (is (= :compiled-deferred-phase
+               (try (compiled/plan prepared) nil
+                    (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+            "no concrete plan or completed range proof is fabricated before source execution")))))
 
 (deftest public-effect-storage-is-capacity-not-traversal
   (doseq [target [ocl-target cuda-target hip-target]]
@@ -1207,6 +1208,30 @@
     (catch clojure.lang.ExceptionInfo exception
       (ex-data exception))))
 
+(defn- assert-public-preparation
+  "Check the public boundary without claiming physical outputs before source completion."
+  [function arguments options expected-outputs]
+  (let [forbidden (fn [& _] (throw (AssertionError. "public preparation touched device resources")))
+        prepared (with-redefs [gpu/make-session forbidden gpu/alloc! forbidden]
+                   (compiled/lower function arguments (assoc options :compiler :equation-first)))]
+    (is (compiled/prepared? prepared))
+    (if-let [ordered (:ordered-invocation prepared)]
+      (let [compilation (:compilation ordered)
+            outputs (get-in compilation [:emitted :outputs])]
+        (is (nil? (:lowering prepared)))
+        (is (= :semantic-preparation (get-in prepared [:preparation-report :phase])))
+        (is (false? (get-in prepared [:preparation-report :concrete-plan-available?])))
+        (is (= :after-source (get-in prepared [:preparation-report :output-projection-phase])))
+        (is (= expected-outputs (count outputs)))
+        (is (= outputs (get-in compilation [:semantic :outputs])))
+        (is (every? #(and (some? (:value %)) (not (contains? % :node))) (:out-tree prepared)))
+        (is (= outputs (mapv :value (:out-tree prepared)))))
+      (let [plan (compiled/plan prepared)]
+        (is (link-plan/link-plan? plan))
+        (is (= expected-outputs (count (:outputs plan))))
+        (is (= 0 (get-in plan [:attributes :driver-allocations])))))
+    prepared))
+
 (defn- assert-certified-output-boundary
   [prepared]
   (let [escaped (mapv :node (:out-tree prepared))
@@ -1383,18 +1408,15 @@
     (is (= [:output :output] (mapv :from (:out-tree explicit))))
     (is (= [:donated] (mapv :from (:out-tree donated))))
     (is (= [:result :tap] (mapv :from (:out-tree tapped))))
-    (is (= 2 (count (distinct (map :node (:out-tree tapped)))))
-        "the retained middle contraction is not the final semantic result")
-    (doseq [prepared [explicit donated tapped]]
-      (assert-certified-output-boundary prepared))
-    (let [plan (compiled/plan tapped)]
-      (is (= :invocation-link-output-boundary
-             (:reason (reason-of #(invocation-link/certify plan (pop (:outputs plan))))))
-          "recertification cannot silently drop an already retained output")
-      (is (= :link-outputs
-             (:reason (reason-of #(invocation-link/certify
-                                   plan (conj (:outputs plan) ::unknown-output)))))
-          "an escaped identity must name storage in the validated plan"))))
+    (is (some? (:ordered-invocation tapped)))
+    (is (nil? (:lowering tapped)))
+    (is (every? #(not (contains? % :node)) (:out-tree tapped)))
+    (is (= 2 (count (distinct (map :value (:out-tree tapped)))))
+        "the middle tap and final result are distinct semantic candidates, not premature physical nodes")
+    ;; The complete physical escape/certificate matrix and recertification controls
+    ;; run on the completed four-layer owner in ordered-preparation-test.
+    (doseq [prepared [explicit donated]]
+      (assert-certified-output-boundary prepared))))
 
 (deftest equation-first-final-boundary-has-one-link-proof
   (let [arguments [(float-array 8) 8]
@@ -1535,27 +1557,25 @@
   (doseq [target [cuda-target hip-target]]
     (let [compilation (equation-first/compile
                        #'nn/softmax-backward {:target target :dtype :double})
-          linked (equation-first/lower
-                  compilation [(double-array [1.0 2.0 3.0])
-                               (double-array [0.2 0.3 0.5])])
           values (vals (get-in compilation [:semantic :values]))]
       (is (= :none (get-in compilation [:stats :fallback])))
       (is (= 1 (count (filter #(= :resident-scalar-buffer
                                  (get-in % [:representation :kind])) values))))
       (is (= 3 (count (:kernels compilation))))
       (is (every? #(get-in % [:attributes :kernel-body]) (:kernels compilation)))
-      (is (= 0 (get-in linked [:attributes :driver-allocations])))
-      (is (= 1 (count (:outputs linked)))))))
+      (assert-public-preparation #'nn/softmax-backward
+                                 [(double-array [1.0 2.0 3.0]) (double-array [0.2 0.3 0.5])]
+                                 {:target target :dtype :double} 1))))
 
 (deftest public-softmax-is-a-complete-typed-soac-program
   (doseq [target [cuda-target hip-target ocl-target]]
     (let [compilation (equation-first/compile #'nn/softmax {:target target :dtype :float})
-          semantic (:semantic compilation)
-          linked (equation-first/lower compilation [(float-array [1.0 2.0 3.0])])]
+          semantic (:semantic compilation)]
       (is (= :typed-parallel (:dialect semantic)))
       (is (= :none (get-in compilation [:stats :fallback])))
       (is (seq (get-in semantic [:attributes :invocation-plan :steps])))
-      (is (link-plan/link-plan? linked))
+      (assert-public-preparation #'nn/softmax [(float-array [1.0 2.0 3.0])]
+                                 {:target target :dtype :float} 1)
       (is (every? #(get-in % [:attributes :kernel-body]) (:kernels compilation)))
       (is (some #(and (str/includes? (:source %) "isnan(")
                       (str/includes? (:source %) "rstr_source_max_f32("))
@@ -1574,13 +1594,11 @@
              (float-array [0.1 0.2 0.3 0.4]) (float-array [0.0 0.0])
              (float-array [1.0 2.0 3.0]) (float-array [0.0 1.0])]
             9 1]]]
-    (let [compilation (equation-first/compile operation {:target target :dtype :float})
-          linked (equation-first/lower compilation arguments)]
+    (let [compilation (equation-first/compile operation {:target target :dtype :float})]
       (is (= :none (get-in compilation [:stats :fallback])))
       (is (= expected-kernels (count (:kernels compilation))))
       (is (every? #(get-in % [:attributes :kernel-body]) (:kernels compilation)))
-      (is (= expected-outputs (count (:outputs linked))))
-      (is (= 0 (get-in linked [:attributes :driver-allocations]))))))
+      (assert-public-preparation operation arguments {:target target :dtype :float} expected-outputs))))
 
 (deftest public-scalar-cast-helper-uses-the-common-gpu-frontend
   (doseq [target [ocl-target cuda-target hip-target]]
@@ -1621,8 +1639,8 @@
   (doseq [target [ocl-target cuda-target hip-target]]
     (let [compilation (equation-first/compile #'nn/softmax {:target target :dtype :float})]
       (is (= :none (get-in compilation [:stats :fallback])))
-      (is (= 1 (count (:outputs (equation-first/lower
-                                compilation [(float-array [1.0 2.0 3.0])])))))
+      (assert-public-preparation #'nn/softmax [(float-array [1.0 2.0 3.0])]
+                                 {:target target :dtype :float} 1)
       (is (every? #(get-in % [:attributes :kernel-body]) (:kernels compilation))))))
 
 (deftest ordinary-and-diagnostic-runners-preserve-non-gpu-inline-policy
@@ -2009,12 +2027,6 @@
            [hip-target :hip-parallel :hip-cpp]]]
     (let [compilation (equation-first/compile
                        #'attention/gqa-causal-mha {:target target :dtype :float})
-          linked (equation-first/lower
-                  compilation
-                  [(float-array [1 0 0 1 1 1 1 -1])
-                   (float-array [1 0 0 1])
-                   (float-array [1 2 3 4])
-                   1 2 2 1 2])
           kernels (:kernels compilation)
           loops (for [kernel kernels
                       operation (nested-operations
@@ -2031,8 +2043,10 @@
                   (remove #(= :segment-grid-stride (get-in % [:attributes :role])) loops)))
       (is (every? #(= :independent (get-in % [:attributes :association]))
                   (filter #(= :segment-grid-stride (get-in % [:attributes :role])) loops)))
-      (is (= 0 (get-in linked [:attributes :driver-allocations])))
-      (is (= 1 (count (:outputs linked))))
+      (assert-public-preparation #'attention/gqa-causal-mha
+                                 [(float-array [1 0 0 1 1 1 1 -1])
+                                  (float-array [1 0 0 1]) (float-array [1 2 3 4]) 1 2 2 1 2]
+                                 {:target target :dtype :float} 1)
       (is (= :none (get-in compilation [:stats :fallback]))))))
 
 (deftest public-gqa-jvp-is-the-same-generated-c-family-composition
@@ -2256,13 +2270,13 @@
 (deftest counted-softmax-initializers-use-the-public-c-family-boundary
   (doseq [target [cuda-target hip-target]]
     (let [compilation (equation-first/compile #'attention/softmax-rows!
-                                            {:target target :dtype :float})
-          plan (equation-first/lower compilation [(float-array 6) 2 3])]
+                                            {:target target :dtype :float})]
       (is (= 4 (count (:kernels compilation))))
       (is (every? #(< (count (:source %)) 32768) (:kernels compilation))
           "the polynomial's shared scalar spine must not expand into megabytes of source")
       (is (= :none (get-in compilation [:stats :fallback])))
-      (is (= 0 (get-in plan [:attributes :driver-allocations]))))))
+      (assert-public-preparation #'attention/softmax-rows! [(float-array 6) 2 3]
+                                 {:target target :dtype :float} 1))))
 
 (deftest counted-mixed-precision-stores-use-explicit-destination-conversion
   (doseq [target [cuda-target hip-target]]
@@ -2274,14 +2288,13 @@
 (deftest heat-2d-counted-stores-use-the-public-c-family-boundary
   (doseq [[target module-target] [[cuda-target :cuda-c] [hip-target :hip-cpp]]]
     (let [compilation (equation-first/compile #'pde/heat-rhs-2d!
-                                            {:target target :dtype :double})
-          plan (equation-first/lower compilation
-                                     [(double-array 35) (double-array 35)
-                                      5 7 0.25 4.0 9.0])]
+                                            {:target target :dtype :double})]
       (is (seq (:kernels compilation)))
       (is (every? #(= module-target (:target %)) (:kernels compilation)))
       (is (= :none (get-in compilation [:stats :fallback])))
-      (is (= 0 (get-in plan [:attributes :driver-allocations]))))))
+      (assert-public-preparation #'pde/heat-rhs-2d!
+                                 [(double-array 35) (double-array 35) 5 7 0.25 4.0 9.0]
+                                 {:target target :dtype :double} 1))))
 
 (deftest coarse-fine-operators-use-the-public-c-family-boundary
   (doseq [[target module-target] [[cuda-target :cuda-c] [hip-target :hip-cpp]]

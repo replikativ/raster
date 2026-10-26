@@ -11,6 +11,7 @@
             [raster.compiler.ir.ordered-invocation-realization-test :as allocation-fixture]
             [raster.compiler.ir.invocation-link :as invocation-link]
             [raster.compiler.ir.invocation-plan :as invocation]
+            [raster.compiler.ir.link-plan :as link-plan]
             [raster.compiler.ir.emitted-parallel-program :as emitted-program]
             [raster.compiler.ir.emitted-structured-loop :as emitted-loop]
             [raster.compiler.ir.soac-dialect :as soac]
@@ -512,6 +513,44 @@
                                        {:compiler :equation-first :target :ocl:0 :dtype :double
                                         :taps '[n]})))))))
 
+(defn- assert-completed-output-boundary! [executable]
+  (let [boundary (:resident-boundary @(:execution-state executable))
+        escaped (mapv :node (get-in boundary [:projection :out-tree]))
+        plan (:plan boundary)
+        ;; Independently certify the actual completed owner's plan, not an invented
+        ;; preparation-time plan or a claim that certification executed source work.
+        lowering (invocation-link/certify plan)
+        certificate (:certificate lowering)
+        witness (invocation-link/memory-witness lowering)
+        memory (:memory witness)]
+    (is (= 2 (count (distinct escaped)))
+        "the retained middle contraction is not the final semantic result")
+    (is (= escaped (:outputs plan))
+        "every escaped DeviceArray is part of the validated LinkPlan boundary")
+    (is (= escaped (:outputs certificate))
+        "the certificate records the same ordered physical boundary")
+    (is (= (set escaped) (:outputs (link-plan/initialization-contract plan)))
+        "effect validation covers every retained output")
+    (is (every? #(true? (get-in memory [:nodes % :output?])) escaped)
+        "liveness sees the same physical escape boundary")
+    (is (every? (fn [{:keys [storage public-output?]}]
+                  (= (contains? (set escaped) storage) public-output?))
+                (vals (:compiler-values witness)))
+        "compiler value bindings agree with physical storage escape")
+    (is (every? #(true? (get-in % [:retention :physical-storage-escaped?]))
+                (filter #(and (:public-output? %)
+                              (not= :storage-only (get-in % [:definition :kind])))
+                        (vals (:compiler-values witness))))
+        "physical output retention does not pretend to identify an earlier logical version")
+    (is (every? #(contains? (:boundary-reasons %) :physical-output)
+                (keep (get-in witness [:value-versions :storage]) escaped)))
+    (is (= :invocation-link-output-boundary
+           (reason #(invocation-link/certify plan (pop (:outputs plan)))))
+        "recertification cannot silently drop an already retained output")
+    (is (= :link-outputs
+           (reason #(invocation-link/certify plan (conj (:outputs plan) ::unknown-output))))
+        "an escaped identity must name storage in the validated plan")))
+
 (defn- check-ordered-output-selection! [target]
   (let [prepared (compiled/lower #'fixture/write-before-shape
                                  [(double-array [7.0]) (double-array 1) 1]
@@ -594,7 +633,8 @@
           (let [plan (get-in @(:execution-state (:executable artifact)) [:resident-boundary :plan])
                 middle (get-in plan [:attributes :compiler-buffer-bindings 'middle])]
             (is (not (contains? (set (vals (get-in plan [:attributes :public-buffer-bindings]))) middle)))
-            (is (contains? (set (:outputs plan)) middle)))))
+            (is (contains? (set (:outputs plan)) middle)))
+          (assert-completed-output-boundary! (:executable artifact))))
       (finally (compiled/close! artifact)))))
 
 (deftest opencl-ordered-explicit-outputs-and-taps

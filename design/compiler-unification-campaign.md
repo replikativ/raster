@@ -137,6 +137,29 @@ readiness/replay credit. Existing realized scratch roles/initializers cannot be
 tampered and silently repaired. This does not qualify deferred composition or
 the remaining semantic-value witness and full-CI failures.
 
+The physical-output/semantic-version mismatch is now locally corrected. A shared
+classification used by retention and reporting recognizes a physical boundary
+reference only from independently validated TypedSOAC result-storage, exact
+write-only graph accesses, a distinct producer with the same physical binding,
+and absence of semantic/host observations or another definition. It does not
+infer from names, roles or public labels. Such a slot is `:storage-only`, while
+its physical output/escape remains intact. Identity returns, old-version taps,
+read-write access, missing authority, root/child-view equivalence, dispatch/loop
+gaps and ambiguous multiple writes remain conservative. A `[2]` produced tensor
+is never substituted for an escaped `[8]` backing buffer.
+
+Range-fixture qualification now observes the existing deferred contract at the
+correct phase: `compiled/lower` does not evaluate source work or fabricate a
+concrete range proof; invocation rejects the invalid current stage before its
+preparation/submission, after any earlier valid stage. Supplied static facts may
+add a kernel precondition but cannot erase the actual read footprint. The previous
+preparation-time rejection expectation has been replaced by actual two-backend
+negative execution checks, not removed. Capped clean-process qualification passes
+15 tests / 511 assertions across retention mutations, actual public memory reports,
+range preflight, full-capacity partial writes, taps and scratch on both required
+local backends. Remaining portable trapping-arithmetic, deferred composition and
+full-suite failures still block merge.
+
 The result-import implementation separates four authorities: final-source
 ownership, emitted numerical producer correspondence, successful execution in the
 current replay, and source snapshot adaptation. All four now pass the local public

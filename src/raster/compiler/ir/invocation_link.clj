@@ -2155,6 +2155,119 @@
   [left right]
   (neg? (compare (position-key left) (position-key right))))
 
+(defn- checked-storage-relations
+  "Project exact logical-result/physical-storage contracts from already validated boundaries.
+
+   This does not infer storage from graph names. Unsupported algorithm families contribute no
+   relation; their physical inputs consequently remain ordinary semantic entry versions."
+  [emitted boundaries]
+  (let [equation-for-operation (java.util.IdentityHashMap.)]
+    (doseq [equation (:equations emitted)
+            :let [operation (first (:operations equation))]
+            :when operation]
+      (.put equation-for-operation operation equation))
+    (reduce
+     (fn [relations [boundary-index {:keys [operation projection]}]]
+       (let [outer (.get equation-for-operation operation)
+             checked (:boundary projection)
+             algorithm (:algorithm checked)]
+         (if-not (and outer projection (soac/program-form? algorithm))
+           relations
+           (let [facts (soac/facts algorithm)
+                 host-reads (set (get-in facts [:attributes :host-read-values]))
+                 physical-results (:physical-results projection)]
+             (reduce
+              (fn [relations equation]
+                (into relations
+                      (map (fn [result contract]
+                             {:boundary-index boundary-index
+                              :equation (:id outer)
+                              :result result
+                              :destination (:destination contract)
+                              :access (:access contract)
+                              :host-return (:host-return contract)
+                              :host-read? (boolean
+                                           (or (contains? host-reads result)
+                                               (contains? host-reads (:destination contract))))
+                              :physical-destination (get physical-results result ::missing)})
+                           (nth equation 2)
+                           (or (soac/result-storage facts (second equation)) []))))
+              relations (soac/equations algorithm))))))
+     [] (map-indexed vector boundaries))))
+
+(defn- storage-reference-values-from-relations
+  "Identify physical destination inputs that are not semantic entry versions.
+
+   Every graph access to the destination must be an exact write backed by a validated
+   result-storage relation. A missing relation, a read/read-write access, a semantic use, an
+   independent definition, or a different physical binding leaves the input unclassified."
+  [emitted bindings definitions uses boundaries relations]
+  (let [inputs (set (:inputs emitted))
+        outputs (set (:outputs emitted))
+        host-reads (set (get-in emitted [:attributes :host-read-values]))
+        access-sites
+        (reduce
+         (fn [sites [boundary-index boundary]]
+           (reduce-kv (fn [sites value access]
+                        (update sites value (fnil conj [])
+                                {:boundary-index boundary-index :access access}))
+                      sites (:buffer-accesses boundary)))
+         {} (map-indexed vector boundaries))
+        relations-by-destination (group-by :destination relations)]
+    (into #{}
+          (filter
+           (fn [destination]
+             (let [destination-binding (get bindings destination ::missing)
+                   sites (get access-sites destination [])
+                   destination-relations (get relations-by-destination destination [])
+                   valid-relation?
+                   (fn [{:keys [boundary-index equation result access host-return host-read?
+                                physical-destination]}]
+                     (and (not= result destination)
+                          (= :write access)
+                          (= :buffer host-return)
+                          (not host-read?)
+                          (= destination physical-destination)
+                          (= {:kind :equation :id equation} (get definitions result))
+                          (contains? bindings result)
+                          (= destination-binding (get bindings result))
+                          (some #(= boundary-index (:boundary-index %)) sites)))]
+               (and (contains? inputs destination)
+                    (contains? outputs destination)
+                    (not= ::missing destination-binding)
+                    (not (contains? definitions destination))
+                    (empty? (get uses destination))
+                    (not (contains? host-reads destination))
+                    (seq sites)
+                    (seq destination-relations)
+                    (every? valid-relation? destination-relations)
+                    (every? (fn [{:keys [boundary-index access]}]
+                              (and (= :write access)
+                                   (some #(and (= boundary-index (:boundary-index %))
+                                               (valid-relation? %))
+                                         destination-relations)))
+                            sites)))))
+          (keys bindings))))
+
+(defn- compiler-value-classification
+  "Classify each bound compiler value once for both retention and diagnostic reporting."
+  [emitted bindings definitions storage-references]
+  (let [inputs (set (:inputs emitted))
+        outputs (set (:outputs emitted))]
+    (into {}
+          (map (fn [[compiler-value _]]
+                 (let [storage-reference? (contains? storage-references compiler-value)
+                       definition (or (get definitions compiler-value)
+                                      (when (and (contains? inputs compiler-value)
+                                                 (not storage-reference?))
+                                        {:kind :program-input})
+                                      {:kind :storage-only})]
+                   [compiler-value
+                    {:definition definition
+                     :semantic-output? (and (not storage-reference?)
+                                            (contains? outputs compiler-value))}])))
+          bindings)))
+
 (defn- value-retention-witness
   "Derive semantic value intervals over one verified invocation's physical storage.
 
@@ -2162,11 +2275,9 @@
    read-before-write positions and rejects storage histories that cannot be justified from the
    existing complete-write effect evidence. Individual storage entries remain diagnostic when the
    aggregate status is unknown; any future safety decision must require the aggregate status."
-  [plan certificate report emitted bindings definitions uses]
+  [plan certificate report emitted bindings classification uses]
   (let [equations (:equations emitted)
         equation-index (into {} (map-indexed (fn [index equation] [(:id equation) index])) equations)
-        inputs (set (:inputs emitted))
-        semantic-outputs (set (:outputs emitted))
         output-nodes (set (:outputs plan))
         step-facts (get-in certificate [:effect-evidence :step-facts])
         storage-order (vec (distinct (vals bindings)))
@@ -2179,10 +2290,8 @@
         semantic-values
         (into {}
               (keep (fn [[compiler-value storage]]
-                      (let [definition (or (get definitions compiler-value)
-                                           (when (contains? inputs compiler-value)
-                                             {:kind :program-input}))]
-                        (when definition
+                      (let [{:keys [definition semantic-output?]} (get classification compiler-value)]
+                        (when-not (= :storage-only (:kind definition))
                           (let [definition-position
                                 (if (= :program-input (:kind definition))
                                   :entry
@@ -2196,8 +2305,7 @@
                                 logical-last-use (reduce (fn [latest position]
                                                            (if (later-position? position latest)
                                                              position latest))
-                                                         definition-position use-positions)
-                                semantic-output? (contains? semantic-outputs compiler-value)]
+                                                         definition-position use-positions)]
                             [compiler-value
                              {:storage storage
                               :definition-position definition-position
@@ -2379,10 +2487,19 @@
                                  (update sites value (fnil conj []) id))
                                sites (distinct operands)))
                      {} (:equations emitted))
-        inputs (set (:inputs emitted))
-        semantic-outputs (set (:outputs emitted))
+        static-validation (if (nil? caller-options)
+                            (emitted-program/validate-with-physical-results! emitted)
+                            (emitted-program/validate-with-physical-results! emitted caller-options))
+        boundaries (equation-boundaries (:program static-validation)
+                                        (:projections static-validation))
+        storage-references
+        (storage-reference-values-from-relations
+         emitted bindings definitions uses boundaries
+         (checked-storage-relations emitted boundaries))
+        classification (compiler-value-classification
+                        emitted bindings definitions storage-references)
         version-witness
-        (cond-> (value-retention-witness plan certificate report emitted bindings definitions uses)
+        (cond-> (value-retention-witness plan certificate report emitted bindings classification uses)
           (not= actual-bindings reported-bindings)
           (assoc :status :unknown)
           (not= actual-bindings reported-bindings)
@@ -2409,12 +2526,9 @@
                   [compiler-value
                    {:abstract (get-in emitted [:values compiler-value])
                     :storage storage-id
-                    :definition (or (get definitions compiler-value)
-                                    (when (contains? inputs compiler-value)
-                                      {:kind :program-input})
-                                    {:kind :storage-only})
+                    :definition (get-in classification [compiler-value :definition])
                     :uses (get uses compiler-value [])
-                    :semantic-output? (contains? semantic-outputs compiler-value)
+                    :semantic-output? (get-in classification [compiler-value :semantic-output?])
                     :public-output? (contains? (get-in version-witness
                                                        [:storage storage-id :boundary-reasons] #{})
                                                :physical-output)
