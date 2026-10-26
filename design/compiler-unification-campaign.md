@@ -76,6 +76,29 @@ original source/actual descendants under independent readiness ownership, and
 start a fresh semantic/target owner. Source-only programs must not gain JVM
 preparation. Deferred composition and all original campaign obligations remain.
 
+The source prerequisite phase is now implemented at the actual outer
+definition-input owner. It handles one closed operation, authenticated by the
+exact privately issued exception and request scope (not a callback, exception
+keyword or collector identity). Discovery requests readiness before scheduling;
+attachment consumes only. Independent preparation must preserve the same opaque
+semantic frontend/entry, while allowing the intended physical implementation
+change. Its original successful history is validated/adopted by a fresh target
+attempt. Stale receipts refuse; swallowed demand cannot publish its abandoned
+result; ordinary staleness retry counts neither reset nor grow.
+
+The isolated fresh-process first-call RMSNorm reproduction now passes:
+1 test / 10 assertions, no warmup and no numerical execution during preparation.
+The complete affected ownership/completion gate in the capped REPL passes:
+77 tests / 1,549 assertions, including required local OpenCL/Level Zero gradient
+oracles, changed-data replay, repeated result snapshots and lifetime checks.
+Owned-source/terminal suites separately pass 32 / 508. Exact nested collectors,
+forged/copied/swallowed requests, stale receipts, source mutation, failed
+preparation and unchanged source-only paths are covered. Independent review
+found no blockers. This does not waive full exact-head CI, remaining distributed
+composition failures or the original campaign. Uncached source-action compilation
+currently pays one semantic discovery pass; measure that cost before adding a
+non-preparing readiness query or any persistent cache.
+
 The October 25 independent review keeps all eight original campaign objectives.
 The numerical IR is compositional; the source-execution and public ownership
 boundary is not yet uniformly compositional. Consolidate the common boundary

@@ -654,7 +654,9 @@
                  :public-parameters '[xs]}
         compilation {:semantic source-program :emitted emitted}
         attach! (ns-resolve 'raster.compiler.equation-first 'attach-source-action-adapters)
-        attached (entry/call-with-definition-inputs #(attach! compilation options))
+        attached (entry/call-with-definition-inputs
+                  #(do (entry/demand-original-source-frontend! source-var)
+                       (attach! compilation options)))
         completions (filter invocation/source-completion? (:steps plan))
         imports (filter invocation/program-result-import? (:steps plan))]
     (is (seq completions))
@@ -670,9 +672,12 @@
                   source-program emitted plan step))))
     (is (= :equation-first-source-action-owner
            (entry/call-with-definition-inputs #(reason (fn [] (attach! compilation {}))))))
-    (let [ordinary {:semantic {:attributes {:invocation-plan {:steps []}}}}]
-      (is (identical? ordinary (attach! ordinary {}))
-          "ordinary source-free compilation does not prepare a JVM source witness"))))
+    (let [ordinary {:semantic {:attributes {:invocation-plan {:steps []}}}}
+          forbidden (fn [& _] (throw (AssertionError. "source-free compilation requested JVM readiness")))]
+      (with-redefs [entry/demand-original-source-frontend! forbidden
+                    entry/prepared-original-source-frontend! forbidden]
+        (is (identical? ordinary (attach! ordinary {}))
+            "ordinary source-free compilation does not prepare a JVM source witness")))))
 
 (deftest current-result-import-adapter-owns-the-numerical-port-and-boxed-return-recipe
   (doseq [target [nil Double/TYPE Float/TYPE]

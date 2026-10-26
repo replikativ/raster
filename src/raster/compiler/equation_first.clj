@@ -444,10 +444,9 @@
             _ (when-not (var? source-var)
                 (fail! :equation-first-source-action-owner
                        "source actions require their original deftm entry" {}))
-            ;; Preparation may promote helpers and stale earlier observations.
-            ;; The enclosing definition-input transaction retries the complete
-            ;; compilation; never refresh an old witness around new source.
-            original (rcore/prepare-owned-source-frontend! source-var)
+            ;; Readiness was demanded before scheduling/emission. This late
+            ;; consumer may validate/adopt it, but must never prepare or refresh.
+            original (method-entry/prepared-original-source-frontend! source-var)
             witness (source-import/prepare-contextual-source-witness
                      (:source program)
                      (assoc compiler-options :lexical-inputs (:public-parameters compiler-options)))
@@ -476,7 +475,19 @@
     (fail! :equation-first-coverage
            "program is outside the direct TypedSOAC/structured-control vertical"
            {:function function-id :dialect (:dialect semantic) :fallback :none}))
-  (let [{:keys [target-descriptor resolved-schedule
+  (let [invocation-plan (some-> semantic :attributes :invocation-plan invocation/validate!)
+        _ (when-not invocation-plan
+            (fail! :equation-first-invocation
+                   "equation-first semantic program has no retained public invocation plan"
+                   {:function function-id}))
+        _ (when (some #(or (invocation/source-completion? %) (invocation/program-result-import? %))
+                      (:steps invocation-plan))
+            (let [source-var (:source-var compiler-options)]
+              (when-not (var? source-var)
+                (fail! :equation-first-source-action-owner
+                       "source actions require their original deftm entry" {}))
+              (method-entry/demand-original-source-frontend! source-var)))
+        {:keys [target-descriptor resolved-schedule
                 dispatch-reassociated? dispatch-contractions?]} context
         scheduled (structured-route/schedule-program semantic compiler-options)
         backend (device/select-runtime-backend target true nil)
@@ -508,12 +519,7 @@
            function-id emission
            (assoc compiler-options :target-dialect target-dialect
                   :schedule resolved-schedule))
-          emission)
-        invocation-plan (some-> semantic :attributes :invocation-plan invocation/validate!)]
-    (when-not invocation-plan
-      (fail! :equation-first-invocation
-             "equation-first semantic program has no retained public invocation plan"
-             {:function function-id}))
+          emission)]
     (attach-source-action-adapters
      (->EquationFirstCompilation
      id function-id target dtype source-ns

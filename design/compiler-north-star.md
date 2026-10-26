@@ -1325,6 +1325,19 @@ ownership. A host definition represented in both forms denotes one evaluation. T
 correspondence is not execution, hoisting, lifetime, or completion evidence; source-free programs
 retain their separate explicit execution contracts.
 
+Physical-source readiness is a compilation prerequisite, not an invocation step or numerical
+operation. After semantic promotion identifies an actual source-completion/result-import
+consumer, discovery must request closure of that exact original source frontend before target
+scheduling/emission. The actual outer definition-input owner discards the discovery attempt;
+an independent owner prepares the original receiver and its actual emitted descendants. Fresh
+semantic/target construction then validates and adopts that successful readiness history.
+Nested collectors propagate the same authenticated request; they cannot refresh an enclosing
+owner's observations. A private request-local receipt is not portable IR or a persistent cache,
+and a stale receipt cannot silently trigger renewal. This prerequisite transition does not spend
+or reset the ordinary staleness retry budget. Source-only compilation requests no physical
+preparation. Neither source readiness nor target emission executes the numerical source or
+grants buffer initialization, invocation completion, transfer, or output-publication evidence.
+
 Public activation of source-ordered resident execution remains an implementation obligation. It uses the existing
 linked root, lifetime lock, replay transaction and cleanup machinery, with entry storage distinct
 from completed public outputs. A pending invocation has no completed LinkPlan/output boundary;

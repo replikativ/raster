@@ -336,6 +336,17 @@
   [prepare! receivers]
   (prepare-observed-definition-inputs! prepare! receivers false))
 
+(def ^:dynamic ^:private *source-prerequisite-scope* nil)
+
+(declare fulfill-source-prerequisite!)
+
+(defn- pending-source-prerequisite? [scope failure]
+  (when (instance? clojure.lang.IAtom scope)
+    (let [pending (:pending @scope)]
+      (and pending (identical? failure (:failure pending))
+           (identical? (:token @scope) (:owner pending))
+           (identical? (:request pending) (::source-prerequisite (ex-data failure)))))))
+
 (defn call-with-definition-inputs
   "Own normalization and emission together for a static compiled artifact.
    Dynamic executables additionally retain these observations in their existing
@@ -349,6 +360,11 @@
   (let [attempt! (fn []
                    (let [result (compile!)]
                      (try
+                       ;; A caller cannot swallow an authentic demand and publish the
+                       ;; abandoned discovery result instead of preparing its prerequisite.
+                       (when (instance? clojure.lang.IAtom *source-prerequisite-scope*)
+                         (when-let [pending (:pending @*source-prerequisite-scope*)]
+                           (throw (:failure pending))))
                        (assert-definition-inputs-current! @*emission-inputs*)
                        result
                        (catch Throwable failure
@@ -364,19 +380,35 @@
       ;; An enclosing compilation must restart from its own earliest proof,
       ;; not keep its stale observations while an inner owner retries.
       (attempt!)
-      (loop [attempt 0]
+      (let [handle-prerequisites? (nil? *source-prerequisite-scope*)
+            scope (if handle-prerequisites?
+                    (atom {:token (Object.) :ready {} :pending nil})
+                    *source-prerequisite-scope*)]
+       (binding [*source-prerequisite-scope* scope]
+        (loop [attempt 0]
         (let [outcome (try
                         {:result (binding [*emission-inputs* (atom {:static [] :values []})]
                                    (attempt!))}
                         (catch clojure.lang.ExceptionInfo failure {:failure failure}))]
           (if-let [failure (:failure outcome)]
-            (if (and (< attempt 2)
+            (cond
+              (and handle-prerequisites? (pending-source-prerequisite? scope failure))
+              (do (fulfill-source-prerequisite! scope failure)
+                  ;; This is a new phase with fresh observations, not an extra
+                  ;; generic staleness retry. Keep the original retry counter.
+                  (recur attempt))
+
+              (and handle-prerequisites? (:pending @scope))
+              (throw failure)
+
+              (and (< attempt 2)
                      (contains? #{:stale-definition-proof-input
                                   :unstable-definition-proof-input}
                                 (:reason (ex-data failure))))
               (recur (inc attempt))
-              (throw failure))
-            (:result outcome))))))))
+
+              :else (throw failure))
+            (:result outcome))))))))))
 
 (declare validate-static-emission!)
 
@@ -1132,6 +1164,92 @@
   (when-let [{:keys [operation implementation-op arity parameter-dtype]}
              (source-var-selection-request source-var)]
     (selected-frontend-source operation implementation-op arity source-var parameter-dtype)))
+
+(defn- source-prerequisite-scope! []
+  (when-not (and *emission-inputs* (instance? clojure.lang.IAtom *source-prerequisite-scope*))
+    (throw (ex-info "source readiness requires an actual outer definition-input owner"
+                    {:reason :missing-source-prerequisite-owner})))
+  *source-prerequisite-scope*)
+
+(defn- consume-source-prerequisite! [scope source-var]
+  (let [{:keys [frontend inputs] :as ready} (get-in @scope [:ready source-var])]
+    (when-not ready
+      (throw (ex-info "source adapters require readiness before target scheduling/emission"
+                      {:reason :missing-source-prerequisite :source source-var})))
+    (try
+      (assert-definition-inputs-current! inputs)
+      (assert-frontend-source! frontend source-var)
+      (assert-frontend-selection! frontend source-var)
+      (assert-emission-inputs-current! (:emission frontend))
+      (adopt-definition-inputs! inputs)
+      frontend
+      (catch clojure.lang.ExceptionInfo failure
+        ;; A satisfied prerequisite is immutable history, not permission to
+        ;; request a replacement and restamp an already derived target artifact.
+        (throw (ex-info "prepared source readiness changed during the owning request"
+                        {:reason :stale-source-prerequisite :source source-var} failure))))))
+
+(defn prepared-original-source-frontend!
+  "Consume only a satisfied request-local source prerequisite. Never prepare or issue a demand."
+  [source-var]
+  (consume-source-prerequisite! (source-prerequisite-scope!) source-var))
+
+(defn demand-original-source-frontend!
+  "Demand the one closed original-source readiness operation before target emission.
+   Discovery unwinds the actual outer compiler owner. No callback or portable receipt is accepted;
+   successful readiness is validated/adopted only by the following fresh whole-source attempt."
+  [source-var]
+  (let [scope (source-prerequisite-scope!)]
+    (if (contains? (:ready @scope) source-var)
+      (consume-source-prerequisite! scope source-var)
+      (do
+        (when (or (:pending @scope) (:preparing @scope))
+          (throw (ex-info "source prerequisite demand did not make progress"
+                          {:reason :source-prerequisite-no-progress :source source-var})))
+        (let [frontend (when (var? source-var) (original-source-frontend source-var))]
+          (when-not frontend
+            (throw (ex-info "source readiness requires its authentic original frontend"
+                            {:reason :unowned-source-prerequisite :source source-var})))
+          (assert-frontend-source! frontend source-var)
+          (let [before @scope request (Object.)
+                failure (ex-info "original source preparation must precede target emission"
+                                 {:reason :source-prerequisite-demand :source source-var
+                                  ::source-prerequisite request})
+                pending {:owner (:token before) :request request :failure failure
+                         :source source-var :frontend frontend}]
+            (when-not (compare-and-set! scope before (assoc before :pending pending))
+              (throw (ex-info "source prerequisite owner changed during demand"
+                              {:reason :source-prerequisite-no-progress :source source-var})))
+            (throw failure)))))))
+
+(defn- fulfill-source-prerequisite! [scope failure]
+  (when-not (pending-source-prerequisite? scope failure)
+    (throw failure))
+  (let [{:keys [source frontend]} (:pending @scope)]
+    (when (contains? (:ready @scope) source)
+      (throw (ex-info "a satisfied source prerequisite cannot be prepared again"
+                      {:reason :source-prerequisite-no-progress :source source})))
+    (swap! scope assoc :pending nil :preparing source)
+    ;; False disables demand handling inside this independent fixed operation.
+    ;; Its ordinary preparation retries remain unchanged and cannot adopt the
+    ;; abandoned discovery collector or recursively retain this request's store.
+    (let [ready
+          (binding [*emission-inputs* nil *source-prerequisite-scope* false]
+            (call-with-definition-inputs
+             (fn []
+               (assert-frontend-source! frontend source)
+               (assert-frontend-semantic-selection! frontend source)
+               (let [prepared ((requiring-resolve 'raster.core/prepare-owned-source-frontend!) source)]
+                 (when-not (and prepared
+                                (identical? (:source-frontend frontend) (:source-frontend prepared))
+                                (identical? (:source-entry frontend) (:source-entry prepared)))
+                   (throw (ex-info "source prerequisite changed its original semantic producer"
+                                   {:reason :changed-source-prerequisite :source source})))
+                 (assert-frontend-source! prepared source)
+                 (assert-frontend-selection! prepared source)
+                 (assert-emission-inputs-current! (:emission prepared))
+                 {:frontend prepared :inputs @*emission-inputs*}))))]
+      (swap! scope #(-> % (assoc-in [:ready source] ready) (dissoc :preparing))))))
 
 (defn source-var-body-entry-carriers
   "Actual registered typed formals for an already-resolved source Var.

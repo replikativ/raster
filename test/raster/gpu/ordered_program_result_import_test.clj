@@ -187,6 +187,7 @@
         (#'pipeline/contextual-reduction-constructor options)
         #(let [numerical (:program (typed-route/attempt source :double {'xs :double} options))
                semantic (structured/promote-program numerical options)
+               _ (entry/demand-original-source-frontend! (:source-var options))
                scheduled (structured/schedule-program semantic options)
                emitted (:program (c-family/emit-program scheduled options))]
            (#'equation-first/attach-source-action-adapters
