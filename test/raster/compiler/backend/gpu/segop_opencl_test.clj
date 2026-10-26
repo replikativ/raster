@@ -155,6 +155,11 @@
                  :scheduled-equation-body program)
         artifact (get-in emitted [:nodes 0 :operation])
         scheduled (get-in artifact [:attributes :scheduled-kernel-body])
+        call-arguments (fn [extent]
+                         [(float-array 2) (float-array 8)
+                          {:type :long :value 2}
+                          {:type :long :value 2}
+                          {:type :long :value extent}])
         input (first (filter #(= :input (:kind %))
                              (get-in artifact [:attributes :kernel-body :parameters])))]
     (is (= ['rows] (:shape input)))
@@ -165,11 +170,87 @@
          (emitted-equation/make (:algorithm equation) program emitted)))
     (is (= 'rows (:value (first (filter #(= 'rows (:parameter %))
                                        (:scalar-bindings scheduled))))))
+    (is (kernel-call/kernel-call? (kernel-call/make artifact (call-arguments 4)))
+        "the independently callable leaf accepts the source-derived compound extent")
+    (is (= :kernel-precondition-failed
+           (try (kernel-call/make artifact (call-arguments 8)) nil
+                (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+        "a detached caller cannot overrun the partial input by changing only the bound")
     (is (thrown? clojure.lang.ExceptionInfo
                  (sg/generate-kernel-graph
                   (update graph :scalars #(vec (remove (fn [scalar] (= 'rows (:id scalar))) %)))
                   :scheduled-equation-algorithm (:algorithm equation)
                   :scheduled-equation-body program)))))
+
+(deftest partial-storage-capacity-guard-remains-a-detached-leaf-precondition
+  (let [source '(let* [^long extent (clojure.core/long
+                                    ^long (clojure.core/* (clojure.core/long rows)
+                                                         (clojure.core/long width)))
+                       result (raster.par/pmap i extent float
+                                (clojure.core/+ (clojure.core/aget
+                                                a (clojure.core/quot i width))
+                                               (clojure.core/float rows)))] result)
+        options {:dtype :float :array-types {'a :float}
+                 :scalar-types {'capacity :long 'rows :long 'width :long}
+                 :values {'a (av/tensor {:dtype :float :shape ['capacity]})
+                          'capacity (av/tensor {:dtype :long :shape []})}}
+        typed (:program (typed-route/attempt source :float {'a :float} options))
+        program (:form (segop-lower/segop-lower-pass typed options))
+        equation (last (:equations program))
+        graph (equation-graph/make (:algorithm equation) program)
+        emitted (sg/generate-kernel-graph
+                 graph :scheduled-equation-algorithm (:algorithm equation)
+                 :scheduled-equation-body program)
+        artifact (get-in emitted [:nodes 0 :operation])
+        arguments
+        (fn [capacity]
+          (mapv (fn [slot]
+                  (case (:kind slot)
+                    :input (float-array capacity)
+                    :output (float-array 4)
+                    :scalar
+                    (let [values {'capacity capacity 'rows 2 'width 2
+                                  'extent 4 '_n_bound 4}]
+                      (when-not (contains? values (:name slot))
+                        (throw (ex-info "test omitted an emitted scalar argument" {:slot slot})))
+                      {:type (:kernel-dtype slot) :value (get values (:name slot))})))
+                (:abi artifact)))]
+    (is (some #(= :>= (:op %)) (:preconditions graph))
+        "the exact graph owns the symbolic backing-capacity premise")
+    (is (kernel-call/kernel-call? (kernel-call/make artifact (arguments 2))))
+    (is (= :kernel-precondition-failed
+           (try (kernel-call/make artifact (arguments 1)) nil
+                (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+        "the detached leaf retains the capacity premise used by its read proof")))
+
+(deftest output-only-map-does-not-inherit-an-unused-host-product
+  (let [source '(let* [^long extent (clojure.core/long
+                                    ^long (clojure.core/* (clojure.core/long n)
+                                                         (clojure.core/long 2)))
+                       result (raster.par/pmap i extent float (clojure.core/float i))]
+                       result)
+        options {:dtype :float :scalar-types {'n :long}}
+        typed (:program (typed-route/attempt source :float {} options))
+        program (:form (segop-lower/segop-lower-pass typed options))
+        equation (last (:equations program))
+        graph (equation-graph/make (:algorithm equation) program)
+        emitted (sg/generate-kernel-graph
+                 graph :scheduled-equation-algorithm (:algorithm equation)
+                 :scheduled-equation-body program)
+        artifact (get-in emitted [:nodes 0 :operation])
+        arguments (mapv (fn [slot]
+                          (case (:kind slot)
+                            :output (float-array 3)
+                            :scalar
+                            (let [values {'n 1 'extent 3 '_n_bound 3}]
+                              (when-not (contains? values (:name slot))
+                                (throw (ex-info "test omitted an emitted scalar argument"
+                                                {:slot slot})))
+                              {:type (:kernel-dtype slot)
+                               :value (get values (:name slot))})))
+                        (:abi artifact))]
+    (is (kernel-call/kernel-call? (kernel-call/make artifact arguments))
+        "a read-free leaf remains parameterized by its actual bound, not an unused host alias")))
 
 (deftest map-int-extents-and-empty-domains-retain-long-ordinals
   (doseq [bound ['n 0 -2]]

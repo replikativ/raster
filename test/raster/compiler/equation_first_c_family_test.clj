@@ -20,6 +20,8 @@
             [raster.compiler.ir.emitted-parallel-equation :as emitted-equation]
             [raster.compiler.ir.emitted-equation-dispatch :as equation-dispatch]
             [raster.compiler.ir.kernel-executable :as executable]
+            [raster.compiler.ir.kernel-call :as kernel-call]
+            [raster.compiler.ir.kernel-launch :as kernel-launch]
             [raster.compiler.ir.emitted-parallel-program-call :as program-call]
             [raster.compiler.ir.buffer-view :as bview]
             [raster.compiler.ir.abstract-value :as av]
@@ -2072,7 +2074,65 @@
            certified)
           "graph-certified addresses lower as IndexExpr, not trapping scalar arithmetic")
       (is (= {:kernel-body 11}
-             (get-in compilation [:stats :emission :emission-routes]))))))
+             (get-in compilation [:stats :emission :emission-routes])))
+      (when (= target cuda-target)
+        (let [guarded (vec
+                       (for [artifact certified
+                             source-condition (:preconditions artifact)
+                             :let [lhs-references
+                                   (kernel-launch/expression-references
+                                    (:expression source-condition))
+                                   rhs-references
+                                   (kernel-launch/expression-references
+                                    (:value source-condition))]
+                             :when (and (= := (:op source-condition))
+                                        (= 1 (count lhs-references))
+                                        (seq rhs-references))]
+                         {:artifact artifact :source-condition source-condition}))]
+          (is (seq guarded)
+              "the address-projected artifacts retain source scalar equalities")
+          (is (some (fn [{:keys [source-condition]}]
+                      (let [references
+                            (kernel-launch/expression-references (:value source-condition))]
+                        (not (and (= 1 (count references))
+                                  (= (:value source-condition)
+                                     (kernel-launch/runtime-value (first references)))))))
+                    guarded)
+              "at least one retained leaf guard is arithmetic, not only a duplicate-slot tie")
+          (doseq [{:keys [artifact source-condition]} guarded]
+            (let [initial
+                  (mapv (fn [index slot]
+                          (if (= :scalar (:kind slot))
+                            {:type (:kernel-dtype slot) :value 1}
+                            (keyword (str "gqa-direct-buffer-" index))))
+                        (range) (:abi artifact))
+                  slot-indexes (into {} (map-indexed (fn [index slot] [(:name slot) index]))
+                                     (:abi artifact))
+                  arguments
+                  (reduce
+                   (fn [arguments {:keys [expression op value]}]
+                     (if (and (= := op)
+                              (= 1 (count (kernel-launch/expression-references expression))))
+                       (let [parameter (first (kernel-launch/expression-references expression))
+                             values (into {} (keep-indexed
+                                              (fn [index slot]
+                                                (when (= :scalar (:kind slot))
+                                                  [(:name slot) (get-in arguments [index :value])]))
+                                              (:abi artifact)))
+                             resolved (kernel-launch/resolve-expression values value)]
+                         (assoc-in arguments [(get slot-indexes parameter) :value] resolved))
+                       arguments))
+                   initial (:preconditions artifact))
+                  parameter (first (kernel-launch/expression-references
+                                    (:expression source-condition)))
+                  parameter-index (get slot-indexes parameter)
+                  altered (update-in arguments [parameter-index :value] inc)]
+              (is (some? parameter-index))
+              (is (kernel-call/kernel-call? (kernel-call/make artifact arguments))
+                  "an extracted artifact remains independently callable at its certified boundary")
+              (is (= :kernel-precondition-failed
+                     (:reason (reason-of #(kernel-call/make artifact altered))))
+                  "each source equality remains load-bearing outside its graph"))))))))
 
 (deftest public-stencil-uses-portable-kernel-body
   (doseq [[target module-target]

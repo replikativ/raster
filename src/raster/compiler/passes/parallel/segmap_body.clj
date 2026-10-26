@@ -15,6 +15,7 @@
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-graph :as graph]
             [raster.compiler.ir.kernel-launch :as launch]
+            [raster.compiler.ir.kernel-precondition :as precondition]
             [raster.compiler.ir.numerical-contract :as numerics]
             [raster.compiler.ir.scalar-range :as ranges]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
@@ -925,6 +926,179 @@
           (scheduled-read-minima index bound (get-in (lower operation options)
                                                      [:kernel-body :operations]) options)
           (catch clojure.lang.ExceptionInfo _ nil))))))
+
+(defn- rebind-leaf-identities
+  "Simultaneously alpha-rename compiler scalar identities into KernelBody parameters."
+  [expression identities]
+  (let [identities (into {} (remove (fn [[source parameter]] (= source parameter))) identities)
+        ids (vec (sort-by str (keys identities)))
+        tokens (mapv (fn [ordinal id] [:leaf-precondition ordinal id]) (range) ids)
+        alpha (launch/rebind-expression
+               expression
+               (into {} (map (fn [id token] [id (launch/runtime-value token)]) ids tokens)))]
+    (launch/rebind-expression
+     alpha
+     (into {} (map (fn [id token]
+                     [token (launch/runtime-value (get identities id))])
+                   ids tokens)))))
+
+(defn- read-proof-needs-condition?
+  [condition operation certificate scalar-types]
+  (let [
+        without-definition
+        (map-reads/symbolic-read-certificate
+         operation
+         {:scalar-definitions (dissoc (:scalar-definitions certificate)
+                                      (:expression condition))
+          :scalar-types scalar-types})]
+    (not= (dissoc certificate :scalar-definitions)
+          (some-> without-definition (dissoc :scalar-definitions)))))
+
+(defn- proof-definition-preconditions
+  [operation certificate scalar-types]
+  (into []
+        (comp (map (fn [[id expression]]
+                     {:expression id :op := :value expression}))
+              (filter #(read-proof-needs-condition?
+                        % operation certificate scalar-types)))
+        (sort-by (comp str key) (:scalar-definitions certificate))))
+
+(defn- proof-capacity-preconditions
+  [certificate kernel-graph]
+  (let [buffers (into {} (map (juxt :id identity))
+                      (concat (:inputs kernel-graph) (:outputs kernel-graph)
+                              (:temporaries kernel-graph)))]
+    (into []
+          (mapcat
+           (fn [[id required]]
+             (let [capacity (:elements (get buffers id))]
+               (if (map-reads/capacity-covers? capacity required)
+                 []
+                 (let [conditions
+                       (filterv #(map-reads/graph-capacity-covers?
+                                  capacity required [%])
+                                (:preconditions kernel-graph))]
+                   (when-not (seq conditions)
+                     (throw (ex-info "map read proof exceeds its exact graph buffer"
+                                     {:reason :segmap-leaf-preconditions
+                                      :buffer id :required required :capacity capacity})))
+                   conditions))))
+          (:requirements certificate)))))
+
+(defn ^:no-doc address-proof-definition-preconditions
+  "Project retained scalar definitions whose removal changes one exact node's address proof.
+
+   The returned equalities are not self-authenticating metadata. The production caller must first
+   reconstruct this graph from its exact scheduled-equation source before using them as leaf
+   preconditions. Keeping demand here makes graph guards and host-prefix definitions follow the
+   same whole-certificate criterion."
+  [node kernel-graph]
+  (let [kernel-graph (graph/validate! kernel-graph)
+        scalar-types (into {} (map (juxt :id :dtype)) (:scalars kernel-graph))]
+    (when-not (some #(= node %) (:nodes kernel-graph))
+      (throw (ex-info "address proof conditions require an exact graph node"
+                      {:reason :segmap-leaf-preconditions :node (:id node)})))
+    (let [certificate (:read-capacity-certificate node)]
+      (vec (distinct
+            (concat (proof-definition-preconditions
+                     (:operation node) certificate scalar-types)
+                    (proof-capacity-preconditions certificate kernel-graph)))))))
+
+(defn ^:no-doc source-read-definition-preconditions
+  "Derive the source scalar equalities needed by one exact map read proof.
+
+   This covers a dense proof that was unavailable when the graph was first built, for example a
+   quotient read whose map bound is a later authenticated host product. It does not attach every
+   host equality to every leaf. The caller must authenticate `definitions` against the retained
+   source before consuming the result."
+  [node kernel-graph definitions]
+  (let [kernel-graph (graph/validate! kernel-graph)
+        _ (when-not (some #(= node %) (:nodes kernel-graph))
+            (throw (ex-info "source read conditions require an exact graph node"
+                            {:reason :segmap-leaf-preconditions :node (:id node)})))
+        scalar-types (into {} (map (juxt :id :dtype)) (:scalars kernel-graph))
+        certificate (map-reads/symbolic-read-certificate
+                     (:operation node)
+                     {:scalar-definitions definitions :scalar-types scalar-types})
+        conditions (when certificate
+                     (proof-definition-preconditions
+                      (:operation node) certificate scalar-types))]
+    (when (seq conditions)
+      (vec (distinct (concat conditions
+                             (proof-capacity-preconditions certificate kernel-graph)))))))
+
+(defn ^:no-doc project-leaf-definition-preconditions!
+  "Project authenticated source read conditions onto one leaf's existing scalar ABI.
+
+   The caller must first authenticate the node by reconstructing its graph from the independently
+   retained scheduled-equation source. `conditions` may include both host-prefix definitions and
+   definitions used by address projection. This helper alpha-renames them through validated scalar
+   bindings and never creates an ABI slot. Repeated slots for one compiler scalar are tied to one
+   canonical slot, so a direct KernelCall cannot vary `_n_bound` independently of its named scalar."
+  [scheduled node kernel-graph conditions]
+  (let [scheduled (scheduled-body/validate! scheduled)
+        kernel-graph (graph/validate! kernel-graph)
+        _ (when-not (and (= (:source scheduled) (:operation node))
+                         (some #(= node %) (:nodes kernel-graph)))
+            (throw (ex-info "leaf preconditions require the exact projected graph node"
+                            {:reason :segmap-leaf-preconditions :node (:id node)})))
+        conditions (vec (distinct conditions))
+        _ (when-not (every? #(and (contains? #{:= :>=} (:op %))
+                                  (launch/expression? (:expression %))
+                                  (launch/expression? (:value %)))
+                            conditions)
+            (throw (ex-info "leaf read conditions must be explicit integer comparisons"
+                            {:reason :segmap-leaf-preconditions :conditions conditions})))
+            references (reduce into #{}
+                               (map (fn [{:keys [expression value]}]
+                                      (into (launch/expression-references expression)
+                                            (launch/expression-references value)))
+                                    conditions))
+            by-value (group-by :value (:scalar-bindings scheduled))
+            exact-bindings (select-keys by-value references)
+            _ (when-not (= references (set (keys exact-bindings)))
+                (throw (ex-info "leaf scalar equality is not closed by the existing scalar ABI"
+                                {:reason :segmap-leaf-preconditions
+                                 :references references :bound-values (set (keys by-value))})))
+            canonical
+            (into {}
+                  (map (fn [[id bindings]]
+                         (let [named (filterv #(= id (:parameter %)) bindings)
+                               binding (cond
+                                         (= 1 (count named)) (first named)
+                                         (empty? named) (first bindings)
+                                         :else nil)]
+                           (when-not binding
+                             (throw (ex-info "leaf scalar has an ambiguous canonical parameter"
+                                             {:reason :segmap-leaf-preconditions
+                                              :scalar id :bindings bindings})))
+                           [id (:parameter binding)])))
+                  exact-bindings)
+            projected
+            (mapv (fn [{:keys [expression op value]}]
+                    {:expression (rebind-leaf-identities expression canonical)
+                     :op op :value (rebind-leaf-identities value canonical)})
+                  conditions)
+            duplicates
+            (into []
+                  (mapcat (fn [[id bindings]]
+                            (let [canonical-parameter (get canonical id)]
+                              (keep (fn [{:keys [parameter]}]
+                                      (when-not (= canonical-parameter parameter)
+                                        {:expression parameter :op :=
+                                         :value (launch/runtime-value canonical-parameter)}))
+                                    bindings))))
+                  exact-bindings)
+            leaf-conditions (vec (distinct (concat projected duplicates)))
+            scalar-parameters
+            (into #{} (keep (fn [{:keys [id kind dtype]}]
+                              (when (and (= :scalar kind)
+                                         (contains? #{:int :long} (dtype/canon dtype)))
+                                id)))
+                  (get-in scheduled [:body :parameters]))]
+        (precondition/validate! leaf-conditions scalar-parameters)
+        (scheduled-body/validate!
+         (update scheduled :preconditions #(vec (distinct (concat % leaf-conditions)))))))
 
 (defn schedule
   "Refine one SegMap into a complete, target-neutral ScheduledKernelBody.
