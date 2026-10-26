@@ -1405,7 +1405,10 @@
     expression))
 
 (defn inline-deftm-calls
-  "Inline deftm function bodies at call sites in let* forms."
+  "Inline deftm function bodies at call sites in let* forms.
+   The complete unpublished expansion owns local observations; individual helper
+   queries must not repeatedly inherit an unrelated enclosing compilation history.
+   The ordinary independent-owner boundary validates and adopts the result."
   ([form] (inline-deftm-calls form 3))
   ([form max-depth] (inline-deftm-calls form max-depth false))
   ([form max-depth safe?] (inline-deftm-calls form max-depth safe? false))
@@ -1426,15 +1429,19 @@
      form
 
      :else
-     (let [subst-fn (if safe? subst-syms-safe subst-syms)]
-       (loop [current-form form
-              depth max-depth]
-         (if (<= depth 0)
-           current-form
-           (let [{:keys [form inlined?]} (inline-one-pass current-form subst-fn skip-ad-rule-check?)]
-             (if inlined?
-               (recur form (dec depth))
-               form))))))))
+     (if (<= max-depth 0)
+       form
+       (method-entry/call-with-independent-definition-inputs
+        (fn []
+          (let [subst-fn (if safe? subst-syms-safe subst-syms)]
+            (loop [current-form form
+                   depth max-depth]
+              (if (<= depth 0)
+                current-form
+                (let [{:keys [form inlined?]} (inline-one-pass current-form subst-fn skip-ad-rule-check?)]
+                  (if inlined?
+                    (recur form (dec depth))
+                    form)))))))))))
 
 (defn lower-to-ad-primitives
   "Pre-AD lowering: expand compound deftm ops into primitive ops."

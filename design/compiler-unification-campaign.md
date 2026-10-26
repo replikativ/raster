@@ -245,6 +245,49 @@ with at most one persistence warning. The focused runner/sharding gate passes
 file/output failure controls. This improves diagnosis of the recurrent shard-3
 timeout; it does not resolve GSDM compile cost or establish complete coverage.
 
+### Expansion-local history and the remaining consumed-component bundle (October 25)
+
+The new CI checkpoints were exercised by exact-head unit job 34972 at
+`93bf3fc12`: all 16 artifacts exist, but shard 3 remains explicitly running when
+killed. Its latest event names `gsdm-fused-train-step-converges`. The 15 completed
+artifacts report 7,038 tests, 87,654 passing assertions, 28 failures and 42 errors
+across 52 failing Vars. The partial artifact observes 272 Vars separately; it
+must not be added to the completed denominator. The OpenCL gate remains red;
+the allocation-context failure is no longer among its reported failures.
+
+A real helper-expansion probe exposes repeated validation of unrelated inherited
+history: 2/8/16 accepted reduction calls visit an enclosing counting producer
+20/74/146 times. The complete positive-depth binding expansion now uses the
+existing independent-definition-input owner, with all depth iterations inside
+that boundary. Parent history is checked before and after construction; local
+history is checked and adopted with the unchanged conflict/CAS guards. Public
+frontend checks are unchanged, with no skip-validation flag or new proof cache.
+The same probe measures 4/4/4 inherited visits afterward. Non-binding forms and
+zero-depth requests retain their no-op path without opening another boundary.
+This is a validation-work bound, not a wall-time speedup or a demonstrated GSDM
+timeout fix. Local-history growth and other expansion entry points remain
+separate measurement questions. The affected warm gate passes 84 tests / 601
+assertions, including parent/local staleness, equal collector replacement,
+rollback, original exception identity, opacity and bare AD wrappers.
+
+The implementation-level independent review makes the next source/component
+bundle more precise. Semantic selection must precede hygienic copying; physical
+preparation happens only at live consumption. Splicing must transport assembled
+source pairs, descriptions, equations and source frames together through the
+existing causal transfer. Appending a child's typed program while retaining the
+opaque caller initializer would be incorrect, as would losing the caller's
+preceding extent context during isolated child analysis. Numerical versus whole
+buffer versus completed source returns must be selected before ID rebasing.
+
+For the observed Object-to-checked-Float chain, assembly and execution form one
+acceptance bundle: completed initialized reduction storage, exact owned boxed
+return, one checked conversion at its cursor, and distinct Float publication.
+The existing occurrence outliner cannot accept a later alpha-rewritten form as
+an original occurrence; planned adapters must receive fresh ownership through
+the shared compiler core. Transparent numerical helpers are the paired control
+and must keep baseline fusion/no readback. No broad call-preservation mode is
+enabled by these prerequisites, and all import obligations remain explicit.
+
 ### Whole-buffer source-return correction (October 25, branch qualification)
 
 The shared complete-source return projector now selects the certified physical

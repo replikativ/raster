@@ -56,6 +56,118 @@
                            (guard)
                            result))]))))))
 
+(defn- prepared-sum-source []
+  (let [source (core/resolve-deftm-var #'raster.par/sum)]
+    (core/prepare-emission-source-walk! source)
+    (entry/call-with-definition-inputs #(entry/original-source-frontend source))))
+
+(defn- repeated-sum-source [frontend n]
+  (list 'let*
+        (vec (mapcat (fn [i]
+                       [(symbol (str "answer" i))
+                        (list '.invk (get-in frontend [:definition :implementation-op]) 'input)])
+                     (range n)))
+        (symbol (str "answer" (dec n)))))
+
+(deftest complete-inline-expansion-does-not-multiply-unrelated-parent-history
+  (let [frontend (prepared-sum-source)
+        measurements
+        (mapv (fn [n]
+                (let [visits (atom 0)
+                      guard (reify entry/RetainedProducerInput
+                              (assert-producer-current! [this] (swap! visits inc) this))
+                      parent (atom {:static [] :values [] :producer-inputs [guard]})
+                      source (repeated-sum-source frontend n)
+                      expanded (binding [entry/*emission-inputs* parent]
+                                 (inline/inline-deftm-calls source 3 false true))
+                      checks @visits]
+                  (is (not= source expanded))
+                  (is (= 6.0 (eval (list 'let* ['input '(double-array [1 2 3])] expanded))))
+                  (is (contains? (:definition-proofs @parent)
+                                 (get-in frontend [:source-entry :source-var])))
+                  (is (some #(identical? guard %) (:producer-inputs @parent)))
+                  (is (true? (entry/assert-definition-inputs-current! @parent)))
+                  checks)) [2 16])]
+    (is (= (first measurements) (second measurements)))
+    (is (<= 1 (first measurements) 6)
+        "the inherited history is fenced once around the complete expansion")))
+
+(deftest no-op-inline-requests-do-not-open-a-new-history-boundary
+  (let [visits (atom 0)
+        guard (reify entry/RetainedProducerInput
+                (assert-producer-current! [this] (swap! visits inc) this))
+        parent (atom {:static [] :values [] :producer-inputs [guard]})
+        before @parent]
+    (binding [entry/*emission-inputs* parent]
+      (doseq [[form depth] [['input 3] ['(let* [answer input] answer) 0]]]
+        (is (identical? form (inline/inline-deftm-calls form depth)))))
+    (is (zero? @visits))
+    (is (identical? before @parent))))
+
+(deftest complete-inline-expansion-refuses-stale-or-replaced-parent-without-adoption
+  (let [frontend (prepared-sum-source)
+        source (repeated-sum-source frontend 1)
+        expand @#'inline/inline-one-pass]
+    (doseq [change [:already-stale :becomes-stale :replaced]]
+      (let [current? (atom (not= change :already-stale))
+            called? (atom false)
+            guard (reify entry/RetainedProducerInput
+                    (assert-producer-current! [this]
+                      (when-not @current?
+                        (throw (ex-info "stale enclosing owner" {:reason ::stale-parent})))
+                      this))
+            parent (atom {:static [] :values [] :producer-inputs [guard]})
+            before @parent
+            failure
+            (binding [entry/*emission-inputs* parent]
+              (with-redefs-fn
+                {#'inline/inline-one-pass
+                 (fn [& arguments]
+                   (reset! called? true)
+                   (let [result (apply expand arguments)]
+                     (case change
+                       :becomes-stale (reset! current? false)
+                       :replaced (reset! parent (into {} @parent))
+                       nil)
+                     result))}
+                #(try (inline/inline-deftm-calls source 3 false true) nil
+                      (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))]
+        (is (= (if (= change :replaced) :unstable-definition-proof-input ::stale-parent) failure))
+        (is (= (not= change :already-stale) @called?))
+        (is (empty? (:definition-proofs @parent)) "local observations were never published")
+        (is (= before @parent))
+        (is (= (not= change :replaced) (identical? before @parent)))))))
+
+(deftest complete-inline-expansion-preserves-local-source-freshness-and-failure-identity
+  (let [frontend (prepared-sum-source)
+        helper (get-in frontend [:source-entry :source-var])
+        source (repeated-sum-source frontend 1)
+        original-root @helper
+        expand @#'inline/inline-one-pass]
+    (doseq [change [:source-root :throws]]
+      (let [parent (atom {:static [] :values []})
+            before @parent
+            failure (Exception. "expansion failed after observing the helper")]
+        (try
+          (let [observed
+                (binding [entry/*emission-inputs* parent]
+                  (with-redefs-fn
+                    {#'inline/inline-one-pass
+                     (fn [& arguments]
+                       (let [result (apply expand arguments)]
+                         (if (= change :throws)
+                           (throw failure)
+                           (alter-var-root helper (constantly (fn [_] -99.0))))
+                         result))}
+                    #(try (inline/inline-deftm-calls source 1 false true) nil
+                          (catch Exception error error))))]
+            (if (= change :throws)
+              (is (identical? failure observed))
+              (is (= :stale-definition-proof-input (:reason (ex-data observed)))))
+            (is (identical? before @parent))
+            (is (empty? (:definition-proofs @parent))))
+          (finally (alter-var-root helper (constantly original-root))))))))
+
 (deftest source-preparation-is-scoped-to-the-actual-inline-candidate
   (let [scope (create-ns (gensym "raster.inline-source-frontier."))
         attempts (atom 0)
