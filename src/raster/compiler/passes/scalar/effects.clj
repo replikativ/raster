@@ -121,11 +121,17 @@
   []
   @raster-context)
 
+(defn- quoted-form? [expression]
+  (and (seq? expression) (= 2 (count expression))
+       (contains? '#{quote clojure.core/quote} (first expression))))
+
 (defn- collect-locals
   "Collect free non-operator symbols from an expression for beichte's :locals.
    Excludes call-position symbols (they should resolve as vars, not locals)."
   [expr]
   (cond
+    (quoted-form? expr) #{}
+
     (symbol? expr)
     (when (and (not (namespace expr))
                (not (contains? form/known-form-heads expr)))
@@ -133,8 +139,9 @@
     (seq? expr)
     ;; Skip head (operator position) — only collect from args
     (apply clojure.set/union #{} (map collect-locals (rest expr)))
-    (vector? expr)
-    (apply clojure.set/union #{} (map collect-locals expr))
+    (coll? expr)
+    (apply clojure.set/union #{}
+           (map collect-locals (if (map? expr) (mapcat identity expr) expr)))
     :else #{}))
 
 (declare descriptor)
@@ -217,9 +224,7 @@
                         ;; external purity, and actual primitive/Object storage.
                         (true? (:raster.effect/preserve-evaluation (meta node)))
                         (conj :preserve-source-evaluation))))
-         (tree-seq #(and (coll? %)
-                         (not (and (seq? %)
-                                   (contains? '#{quote clojure.core/quote} (first %)))))
+         (tree-seq #(and (coll? %) (not (quoted-form? %)))
                    seq expr))))
 
 (def ^:private descriptor-cache-capacity 65536)
@@ -285,10 +290,10 @@
    exact resolved operation identities. Open expressions use a fresh Beichte
    context; cached source analysis must not survive helper redefinition."
   [expr]
-  (if (not (seq? expr))
-    ;; Preserve the general API's existing leaf/collection effect convention.
-    ;; Explicit denials still survive here, including a marked collection or
-    ;; symbol produced by the new occurrence-owned representation rewrites.
+  (if (or (not (coll? expr)) (quoted-form? expr))
+    ;; A leaf performs no nested evaluation. Collection initializers, unlike
+    ;; leaves, can execute calls in their elements/keys/values and must use the
+    ;; same effect authority as ordinary call forms. Quote stays opaque there.
     {:effect :pure :flags (source-evaluation-flags expr)}
     (if-let [k (try
                  (when-let [proof (closed-registry-proof expr)]
@@ -337,8 +342,8 @@
     (and (= :pure effect)
          (empty? flags))))
 
-(defn cse-safe-expr?
-  "True if an expression is safe to common-subexpression eliminate.
+(defn cse-properties
+  "Project sharing eligibility and observation invalidation from one effect query.
 
    External purity is necessary but not sufficient: an allocator is removable
    when its result is dead, yet two live allocations have distinct mutable
@@ -346,17 +351,35 @@
    than teaching individual compiler markers or consumers to protect their
    operands. Declared storage writes, mutation and allocation also rule out CSE
    without reanalyzing the callee body. These contracts only deny sharing;
-   their absence never substitutes for Beichte's purity proof."
+   their absence never substitutes for Beichte's purity proof.
+
+   A local or external effect invalidates prior observations even when that
+   expression is not itself a sharing candidate. Source obligations are barriers
+   too: this pass has no successful-return/actual-carrier proof discharging them.
+   This conservative source epoch is not alias analysis or a fusion boundary."
   [expr]
-  (and (seq? expr)
-       (symbol? (first expr))
-       (not (descriptor/alloc-op? (form/effective-op expr)))
-       (not (when-let [op (descriptor/semantic-op expr)]
-              (let [[contract] (descriptor/resolve-op-descriptor op)]
-                (or (:buffer-write contract)
-                    (true? (get-in contract [:effects :mutating?]))
-                    (true? (get-in contract [:buffer :allocates?]))))))
-       (removable-expr? expr)))
+  (let [call? (and (seq? expr) (symbol? (first expr)))
+        contract (when call?
+                   (when-let [op (descriptor/semantic-op expr)]
+                     (first (descriptor/resolve-op-descriptor op))))
+        writes? (or (:buffer-write contract)
+                    (true? (get-in contract [:effects :mutating?])))
+        allocates? (or (and call? (descriptor/alloc-op? (form/effective-op expr)))
+                       (true? (get-in contract [:buffer :allocates?])))]
+    (if (or writes? allocates?)
+      ;; Storage contracts may deny sharing without inspecting the callee.
+      ;; Fresh-output identity alone does not prove an allocator's arguments or
+      ;; helper body cannot affect earlier observations: start a new epoch.
+      {:shareable? false :invalidates-observations? true}
+      (let [{:keys [effect flags]} (descriptor expr)]
+        {:shareable? (boolean (and call? (= :pure effect) (empty? flags)))
+         :invalidates-observations? (boolean (or (not= :pure effect) (seq flags)))}))))
+
+(defn cse-safe-expr?
+  "Whether the expression is eligible for sharing in an unchanged source epoch.
+   Consumers must also honor `cse-properties` observation barriers."
+  [expr]
+  (:shareable? (cse-properties expr)))
 
 (defn replay-safe-value?
   "Stable scalar/identity operands safe to repeat or omit during substitution.

@@ -13,6 +13,35 @@
         (is (zero? (get-in result [:stats :cse-aliases])))
         (is (= input (:form result)))))))
 
+(defn mutate-input! [^doubles input]
+  (aset input 0 9.0))
+
+(deftest mutable-observations-do-not-cross-a-source-effect
+  (doseq [write ['(clojure.core/aset input 0 9.0)
+                 '(clojure.core/aset alias 0 9.0)
+                 '(raster.compiler.passes.scalar.cse-test/mutate-input! input)
+                 '[(clojure.core/aset input 0 9.0)]
+                 '{:write (clojure.core/aset input 0 9.0)}
+                 '{(clojure.core/aset input 0 9.0) :write}
+                 '#{(clojure.core/aset input 0 9.0)}]]
+    (let [source (list 'let* ['alias 'input 'before '(clojure.core/aget input 0)
+                             'write write 'after '(clojure.core/aget input 0)] '[before after])
+          optimized (:form (cse/cse-let source))
+          run (fn [body]
+                (eval (list 'let* [(with-meta 'input {:tag 'doubles}) '(double-array [7.0])] body)))]
+      (is (= [7.0 9.0] (run source)))
+      (is (= (run source) (run optimized)))
+      (is (= '(clojure.core/aget input 0) (last (second optimized)))))))
+
+(deftest repeated-reads-in-an-unchanged-epoch-still-share
+  (doseq [pure ['[1 2 3] '{:a 1} '#{1 2}
+                '(quote [(clojure.core/aset input 0 9.0)])]]
+    (let [{:keys [form stats]}
+          (cse/cse-let (list 'let* ['before '(clojure.core/aget input 0)
+                                   'data pure 'after '(clojure.core/aget input 0)] '[before after]))]
+      (is (= 1 (:cse-aliases stats)))
+      (is (= 'before (last (second form)))))))
+
 (deftest basic-cse-test
   (testing "duplicate expressions become aliases"
     (let [form '(let* [a (Math/sin x)

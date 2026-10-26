@@ -15,6 +15,7 @@ rather than adding a route for each workload.
 | Ordered outputs and taps | Deferred public intent to completed physical boundary | Locally qualified: 45 tests / 997 assertions, shared projector, independent intermediate/final device values and replay/lifetime/failure/certificate controls; full branch gates still pending |
 | Aggregate state and composition | Entry slots locally qualified; deferred components remain open | 57 tests / 1,260 assertions qualify shared leaf projection and replay; next require composed AMR/distributed workload without a fabricated preparation-time LinkPlan |
 | Source buffer returns | Whole-buffer projection locally corrected; full branch and subsequent helper-consumption gates remain open | Capacity-eight/domain-two direct/alias/tuple returns and local zero allocations pass local device checks; initialized-tail, nominal keys and ordered stages are independently qualified below; helper-consuming-all-eight remains the next integration |
+| Source omission and repeatability | Constructor checks can disappear before semantic admission; stale-read CSE locally repaired | Preserve deterministic constructor failures before DCE; public JVM AOT read/write/read oracle and collection/alias controls; keep safe dead-work elimination and measure compile cost |
 | RK4 | Full qualification of unified ordered program stages | Local Intel Arc OpenCL/Level Zero recurrence and discrete RK4 oracle pass; affected/fresh/full gates remain pending |
 | Float/Object results | Completed numerical result to invocation-value import, then owned source completion and distinct result publication | Actual checked Float result, overflow/failure order, original occurrence ownership; CUDA/HIP fixture pair |
 | Remaining AD/native consumers | Causal producer families, product transpose and typed JVP | Numerical/finite-difference controls plus alias, conversion and code-quality checks |
@@ -32,6 +33,9 @@ The follow-up independent review orders the next acceptance bundles as follows:
    result, whole destination or effect-only return before rebasing IDs; retain
    source order and liveness through fusion. Preserve selected calls only with
    this consumer, not as unused early hooks or receipts across rewrites.
+   Before that integration, close the demonstrated upstream omission/repeatability
+   defects through the shared scalar source contracts; later source ownership
+   cannot recover an expression already erased or replaced by a stale read.
 3. Close result import, owned completion and actual Float output publication
    together. A transparent numerical chain must retain baseline fusion/no readback;
    an observable checked conversion must run exactly once at its source cursor.
@@ -137,7 +141,9 @@ empty prefix and the allocation's multiple valid owners: missing all owners or
 conflicting owners still refuses before count evaluation. The extended affected
 gate ran 717 tests / 7,614 assertions with two old single-owner expectations
 subsequently corrected and checked by that focused gate. Fresh-process combined
-qualification remains pending; none of these local gates qualify PR #1566 for merging.
+qualification subsequently passes at clean `7faf6b296`: 724 tests / 7,837
+assertions, including 32 complete affected namespaces and six focused public-source
+controls. This is not full branch qualification or merge approval for PR #1566.
 
 A separate correctness gap was exposed by an initially dead late allocation:
 the original JVM function throws for a negative size, but pre-semantic scalar
@@ -151,6 +157,31 @@ count and evaluation are proved safe. Unknown helper/overload semantics remain
 unclosed. Separately probe mutable reads across writes in scalar CSE; external
 purity is not a proof that a later read repeats the same value. The ordered tests
 above use a live late buffer and claim neither independent gap is fixed.
+
+### Source CSE observation epochs (October 25)
+
+The mutable-read concern is independently reproduced through public JVM AOT:
+reading 7, writing 9, and subtracting the saved read from a fresh read returns
+0 instead of 2 because scalar CSE reuses the pre-write observation. The direct
+deftm and an independent Clojure reference both return 2.
+
+The bounded correction derives sharing eligibility and observation invalidation
+from the existing effect/operation authorities in one `cse-properties` query.
+Declared storage writes/allocations deny sharing and invalidate conservatively
+without analyzing their body. Other effects and unresolved source obligations
+invalidate the expression cache before lookup. Saved SSA values and existing
+aliases remain saved values; only reuse of a later observation is invalidated.
+This is not another function registry, memory alias proof or SOAC fusion barrier.
+
+Executed vector/set elements and map keys/values use the same effect analysis as
+call forms, instead of the old non-sequence-is-pure shortcut. Exact quoted data
+remains opaque, including for local discovery and source-obligation traversal.
+Unchanged pure epochs still permit repeated-read CSE. Source optimization unit
+and complete JIT/AOT differential gates pass 53 tests / 653 assertions; the
+focused CSE/effect gate passes 28 tests / 178 assertions, and the public AOT
+regression passes four assertions on changed inputs. Fresh-process and branch-wide
+qualification remain separate. Constructor omission is not fixed by this change;
+more precise read/version and totality proofs remain later refinements.
 
 ### Current source-context qualification (October 25)
 

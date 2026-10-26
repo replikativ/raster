@@ -110,8 +110,13 @@
                    ;; CSE
                    ;; Substituting a declared local could erase its source reference context.
                    ;; No initializer Class/normal-return proof is available in this pass.
+                   properties (effects/cse-properties expr)
+                   ;; Pure reads are repeatable only until an intervening effect.
+                   ;; Do not reuse an old observation after a write through an
+                   ;; alias or an opaque call whose memory footprint is unknown.
+                   cache (if (:invalidates-observations? properties) {} cache)
                    norm (when (and (not (source-declaration/reference-declared? sym))
-                                   (effects/cse-safe-expr? expr)) (normalize-expr expr))
+                                   (:shareable? properties)) (normalize-expr expr))
                    cached (when norm (get cache norm))]
                (assoc
                 (if cached

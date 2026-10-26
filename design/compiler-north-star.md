@@ -1654,6 +1654,17 @@ source fixpoint already combines call/AD expansion, type-aware rewalking, PE and
 PE API also accepts known parameters and dimensions. General runtime-driven respecialization is
 the direction of this contract, not a claim that every runtime fact already feeds every pass.
 
+Source optimization distinguishes external effects, safe omission, repeatability and identity.
+Beichte's absence of external effects alone proves neither that an operation cannot throw nor
+that a read repeats the same value after mutation. Scalar CSE therefore uses observation epochs:
+declared writes/allocations, nonpure evaluations and unresolved source obligations invalidate
+cached expressions; already evaluated SSA values remain unchanged. Executed collection children
+participate in effect analysis and quoted data stays opaque. This conservative source boundary
+does not partition SOAC fusion. More precise memory-version/range evidence may recover sharing,
+but must not be replaced by nominal purity or final consumer shapes. Constructor totality and
+other partial-operation families must likewise retain their checks before source DCE; that
+migration remains explicit campaign work, not an assumed property of every pure operation.
+
 Use binding-time information at three boundaries: specialize static model/simulator structure
 before TypedSOAC fusion; specialize shapes, layouts and hardware choices before scheduling;
 then simplify the chosen KernelBody with typed constant/range facts. Keep large iteration spaces

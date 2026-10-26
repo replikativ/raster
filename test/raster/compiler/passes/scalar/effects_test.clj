@@ -7,6 +7,29 @@
 
 (defn unowned-effect-source [value] value)
 
+(deftest sharing-and-observation-invalidation-are-distinct
+  (is (= {:shareable? true :invalidates-observations? false}
+         (effects/cse-properties '(clojure.core/aget input 0))))
+  (is (= {:shareable? false :invalidates-observations? true}
+         (effects/cse-properties '(clojure.core/aset input 0 9.0))))
+  (is (= {:shareable? false :invalidates-observations? true}
+         (effects/cse-properties '(clojure.core/int unknown))))
+  (with-redefs [effects/descriptor (constantly {:effect :pure :flags #{}})
+                descriptor/resolve-op-descriptor
+                (fn [_] [{:buffer-write {:buf-arg-idx 0}} 'fixture/write])]
+    (is (= {:shareable? false :invalidates-observations? true}
+           (effects/cse-properties '(fixture/write input))))))
+
+(deftest collection-elements-have-execution-effects-but-quoted-data-does-not
+  (doseq [expression ['[(clojure.core/aset input 0 9.0)]
+                      '{:write (clojure.core/aset input 0 9.0)}
+                      '{(clojure.core/aset input 0 9.0) :write}
+                      '#{(clojure.core/aset input 0 9.0)}]]
+    (is (not (effects/removable-expr? expression)))
+    (is (= {:shareable? false :invalidates-observations? true}
+           (effects/cse-properties expression))))
+  (is (effects/removable-expr? '(quote [(clojure.core/aset input 0 9.0)]))))
+
 (deftest optional-effect-analysis-never-replays-unowned-var-source
   (let [lookups (atom [])
         operation 'raster.compiler.passes.scalar.effects-test/unowned-effect-source]
@@ -48,7 +71,7 @@
     (let [resolved (atom [])]
       (with-redefs [descriptor/resolve-op-descriptor
                     (fn [op] (swap! resolved conj op) [contract op])
-                    effects/removable-expr?
+                    effects/descriptor
                     (fn [_] (throw (ex-info "unnecessary body analysis" {})))]
         (is (false? (effects/cse-safe-expr? expression)))
         (is (= [(descriptor/semantic-op expression)] @resolved))))))
@@ -59,7 +82,8 @@
           removable? [false true]]
     (let [analyzed (atom []) expression '(fixture/operation buffer)]
       (with-redefs [descriptor/resolve-op-descriptor (fn [_] [contract 'fixture/operation])
-                    effects/removable-expr? (fn [expr] (swap! analyzed conj expr) removable?)]
+                    effects/descriptor (fn [expr] (swap! analyzed conj expr)
+                                         {:effect (if removable? :pure :io) :flags #{}})]
         (is (= removable? (effects/cse-safe-expr? expression)))
         (is (= [expression] @analyzed))))))
 
@@ -73,7 +97,8 @@
     (let [analyzed (atom [])]
       (with-redefs [descriptor/resolve-op-descriptor
                     (fn [_] (throw (ex-info "no global semantic identity" {})))
-                    effects/removable-expr? (fn [expr] (swap! analyzed conj expr) false)]
+                    effects/descriptor (fn [expr] (swap! analyzed conj expr)
+                                         {:effect :io :flags #{}})]
         (is (false? (effects/cse-safe-expr? expression)))
         (is (= [expression] @analyzed))))))
 
@@ -88,12 +113,13 @@
                           '(raster.nn/dense-backward-dW-into!_m_doubles_doubles_doubles dy x out)
                           (with-meta '(.invk generated/dw-impl dy x out)
                             {:raster.op/original operation})]]
-        (with-redefs [effects/removable-expr?
+        (with-redefs [effects/descriptor
                       (fn [_] (throw (ex-info "declared writer was analyzed" {})))]
           (is (false? (effects/cse-safe-expr? expression)))))
       (is (nil? (resolve-contract 'foreign/dense-backward-dW-into!_m_doubles_doubles_doubles)))
       (let [analyzed (atom 0)]
-        (with-redefs [effects/removable-expr? (fn [_] (swap! analyzed inc) false)]
+        (with-redefs [effects/descriptor (fn [_] (swap! analyzed inc)
+                                         {:effect :io :flags #{}})]
           (is (false? (effects/cse-safe-expr?
                        '(foreign/dense-backward-dW-into!_m_doubles_doubles_doubles dy x out))))
           (is (= 1 @analyzed)))))))
