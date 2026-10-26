@@ -57,10 +57,11 @@
            {:compiler :equation-first :target target :dtype :float
             :roles {'A :state 'B :state 'mA :state 'vA :state 'mB :state 'vB :state}
             :outputs '[A B mA vA mB vB]}))
+        ;; Semantic singleton certificates exist at preparation. A concrete resident LinkPlan
+        ;; does not: source actions must complete first. Do not fabricate it for this check.
+        program (get-in prepared [:ordered-invocation :compilation :semantic])
         stage-matches
-        (vec (for [instance (get-in prepared [:lowering :plan :instances])
-                   :let [program (get-in instance [:call :program])]
-                   closure (get-in program [:attributes :resident-uniform-input-scalar-closures])
+        (vec (for [closure (get-in program [:attributes :resident-uniform-input-scalar-closures])
                    :when (= 'time-buffer (:input closure))]
                [program closure]))
         _schedule
@@ -68,8 +69,9 @@
           (is (= 1 (count stage-matches)))
           (is (= :none (get-in prepared [:schedule :stats :fallback])))
           (when-let [[program closure] (first stage-matches)]
-            (is (= [:root :island] (mapv :kind (:stages closure))))
-            (is (= [1 2] (mapv #(count (:frontier %)) (:stages closure))))
+            (is (= [:root :island :island] (mapv :kind (:stages closure)))
+                "each optimizer's correction group stays on its own side of the intervening update")
+            (is (= [1 2 2] (mapv #(count (:frontier %)) (:stages closure))))
             (let [private-values (vec (mapcat :frontier (:stages closure)))
                   public-values (set (concat (:inputs program) (:outputs program)))
                   equations (into {} (map (juxt :id identity)) (:equations program))]

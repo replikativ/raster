@@ -33,6 +33,7 @@
             [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
             [raster.compiler.passes.parallel.typed-soac-route :as typed-route]
+            [raster.compiler.passes.parallel.typed-soac-frontend :as typed-frontend]
             [raster.compiler.pipeline :as pipeline]
             [raster.compiler.report :as report]
             [raster.core :refer [deftm]]
@@ -61,6 +62,38 @@
 (deftest wrapping-casts-do-not-prove-shape-projections
   (is (= 'xs (invocation-source/shape-projection-source '(clojure.core/long (alength xs)))))
   (is (nil? (invocation-source/shape-projection-source '(clojure.core/unchecked-int (alength xs))))))
+
+(deftest host-scalar-hoisting-preserves-buffer-read-ownership
+  (let [scalar (av/tensor {:dtype :long :shape []})
+        values {'buffer (av/tensor {:dtype :long :shape '[1]}) 'n scalar 'result scalar}
+        equation-for
+        (fn [expression]
+          (let [operation (typed-frontend/scalar-equation
+                           {:id 0 :sym (with-meta 'result {:tag 'long}) :expr expression}
+                           {'n :long} {'n :long})
+                captures (:captures (soac/operation-parts operation))
+                algorithm (soac/make
+                           (soac/default-program-facts
+                            {:values values :inputs captures
+                             :equations {0 (soac/default-equation-facts)}})
+                           [operation] '[result])]
+            (program/->ProgramEquation 0 [:binding 'result] expression captures '[result]
+                                       algorithm [operation] #{} {} {:source-prefix? true})))
+        read-equation (equation-for '(clojure.core/aget buffer 0))
+        shape-equation (equation-for '(clojure.core/alength buffer))
+        scalar-equation (equation-for '(clojure.core/+ n 1))
+        eligible? (fn [equation]
+                    (boolean (#'route/host-invocation-equation?
+                              #{'buffer 'n} values #{} #{'result} true equation)))]
+    (is (not (eligible? read-equation))
+        "an available public buffer does not satisfy ScalarCompute's operand contract")
+    (is (eligible? shape-equation) "exact alength retains the existing ShapeProjection path")
+    (is (eligible? scalar-equation) "ordinary checked scalar prefix computation remains supported")
+    (let [parallel (program/->ParallelProgram :typed-soac nil values '[buffer n]
+                                              [read-equation] [] #{} [] {} {})
+          retained (#'route/hoist-host-invocation-equations parallel #{'buffer 'n})]
+      (is (= [read-equation] (:equations retained)))
+      (is (= '[buffer n] (:inputs retained))))))
 
 (deftest effect-result-refinement-uses-authoritative-inner-storage
   (doseq [[host-return shape expected]

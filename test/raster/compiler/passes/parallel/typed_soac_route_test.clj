@@ -98,27 +98,9 @@
            (kernel-body-operations artifact)))
 
 (defn- interpret-resident-source-for-test
-  "Interpret the internal reduce-into marker for source-semantic regression only.
-
-   This is not a public raw-source JVM route. It recognizes the shared IR predicate, extracts its
-   canonical plain reduction, evaluates the destination once, stores slot zero, returns that
-   buffer, and then delegates every ordinary parallel form to the shared sequential expansion."
+  "Run the retained executable source through the ordinary sequential parallel expansion."
   [program]
-  (let [expanded
-        (par-ir/expand-par-forms
-         (walk/postwalk
-          (fn [form]
-            (if (par-ir/par-reduce-into-form? form)
-              (let [{:keys [out-buf reduce-form]} (par-ir/extract-par-reduce-into-info form)
-                    destination (gensym "resident_source_out__")
-                    result-dtype (dtype/canon (get-in program [:values out-buf :dtype]))
-                    cast (symbol "clojure.core"
-                                 (name (dtype/scalar-tag-for-dtype result-dtype)))]
-                (list 'let* [destination out-buf]
-                      (list 'clojure.core/aset destination 0 (list cast reduce-form))
-                      destination))
-              form))
-          (:source program)))]
+  (let [expanded (par-ir/expand-par-forms (:source program))]
     ;; Typed compiler hints remain available as :raster.type/tag. JVM reference eval must not
     ;; reinterpret a retained primitive binder hint after the sequential expansion changes the
     ;; initializer's host representation; explicit checked cast forms above remain untouched.
@@ -3564,7 +3546,9 @@
         "explicit storage does not turn an ordinary reduction into a synthetic contraction")
     (is (= 1 (:resident-reductions stats)))
     (is (= [{:destination 'out :access :write :host-return :buffer}] storage))
-    (is (some #{'raster.par/reduce-into} (flatten (:source program))))
+    (is (some #{'raster.par/reduce} (flatten (:source program))))
+    (is (some #{'clojure.core/aset} (flatten (:source program))))
+    (is (not-any? #{'raster.par/reduce-into} (flatten (:source program))))
     (is (= 1 (count (filter #{'clojure.core/double-array} (flatten (:source program)))))
         "resident realization reuses the caller allocation")
     (is (contains? scheduled-outputs 'out))
@@ -3626,7 +3610,9 @@
       (is (= :resident-scalar-buffer
              (get-in program [:values output :representation :kind])))
       (is (= (if tuple? 2 1) (count (:outputs program))))
-      (is (some #{'raster.par/reduce-into} (flatten (:source program)))))))
+      (is (some #{'raster.par/reduce} (flatten (:source program))))
+      (is (some #{'clojure.core/aset} (flatten (:source program))))
+      (is (not-any? #{'raster.par/reduce-into} (flatten (:source program)))))))
 
 (deftest public-reduction-reused-on-device-keeps-a-scalar-source-return
   (let [source
@@ -3667,7 +3653,9 @@
     (is (< (Math/abs (- expected actual)) 1.0e-12)
         "checked interpretation proves the routed fused transform precedes the resident store")
     (is (= (vec (repeat 3 (float expected))) (vec out)))
-    (is (some #{'raster.par/reduce-into} (flatten (:source program))))
+    (is (some #{'raster.par/reduce} (flatten (:source program))))
+    (is (some #{'clojure.core/aset} (flatten (:source program))))
+    (is (not-any? #{'raster.par/reduce-into} (flatten (:source program))))
     (is (= [resident-output]
            (get-in (dialect/facts inner)
                    [:attributes :public-resident-reduction-outputs])))))

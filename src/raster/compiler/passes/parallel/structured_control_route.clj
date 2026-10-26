@@ -151,11 +151,18 @@
     equation))
 
 (defn- host-invocation-equation?
-  [available program-outputs required-shape-scalars source-prefix? equation]
-  (let [expression (invocation-source/scalar-equation-expression equation)]
+  [available program-values program-outputs required-shape-scalars source-prefix? equation]
+  (let [expression (invocation-source/scalar-equation-expression equation)
+        shape-source (invocation-source/shape-projection-source expression)]
     (and expression
          (not-any? (set (:results equation)) program-outputs)
          (set/subset? (set (:operands equation)) available)
+         ;; Availability is not a host scalar contract. Ordinary ScalarCompute accepts only
+         ;; rank-zero operands; a buffer element read remains numerical work. The existing
+         ;; exact alength grammar instead constructs ShapeProjection, whose operand is a buffer.
+         (or (every? #(scalar-value? (get program-values %)) (:operands equation))
+             (and shape-source (= [shape-source] (:operands equation))
+                  (seq (:shape (get program-values shape-source)))))
          ;; Invocation-prefix construction is dependency-pruned and executes before all device
          ;; equations. Even a shape projection may not cross that boundary when a checked cast
          ;; still carries exceptional control. A checked scalar which really precedes device work
@@ -210,7 +217,7 @@
                         required-shape? (some shape-scalars (:results equation))
                         exceptional-shape? (and required-shape?
                                                 (not (effects/removable-expr? expression)))
-                        host? (host-invocation-equation? available program-outputs
+                        host? (host-invocation-equation? available (:values parallel-program) program-outputs
                                                            shape-scalars source-prefix?
                                                            equation)
                         ;; Required shape membership authorizes the exceptional one-shot branch;

@@ -970,11 +970,10 @@
     [(dialect/validate! result) stats]))
 
 (defn- ordered-uniform-scalar-islands
-  "Recognize exactly one late contiguous scalar island depending on an earlier uniform root.
+  "Recognize source-ordered contiguous scalar islands depending on one earlier uniform root.
 
-   The equations between root and island are never moved or absorbed. External scalar captures
-   are either program inputs or uniquely produced by an earlier pristine scalar equation; their
-   producers stay in place."
+   Intervening equations are never moved or absorbed. A later island may explicitly load an
+   earlier island's frontier. Other captures remain independently audited host scalar prefixes."
   [facts infos uses position-by-id outputs host-reads root]
   (let [root-info (:info root)
         root-value (:result root)
@@ -994,10 +993,11 @@
         island-values (set (mapcat :results dependent-infos))
         island-equations (set (map :id dependent-infos))
         positions (mapv #(get position-by-id (:id %)) dependent-infos)
-        island-position (first positions)
-        contiguous? (and (seq positions)
-                         (= positions (vec (range island-position
-                                                  (+ island-position (count positions))))))
+        island-groups
+        (mapv (fn [group] (mapv second group))
+              (partition-by (fn [[ordinal info]]
+                              (- (get position-by-id (:id info)) ordinal))
+                            (map-indexed vector dependent-infos)))
         info-by-id (into {} (map (juxt :id identity)) infos)
         producer-position (into {}
                                 (mapcat (fn [info]
@@ -1020,22 +1020,35 @@
         root-sites (get uses root-value [])
         island-sites (mapcat #(get uses % []) island-values)
         terminal-sites (filter terminal-site? island-sites)
-        frontier (->> island-values
-                      (filter #(some terminal-site? (get uses % [])))
-                      (sort-by producer-position) vec)
-        external-captures
-        (set (mapcat (fn [info]
-                       (remove #(or (= root-value %) (contains? island-values %))
-                               (:captures info)))
-                     dependent-infos))
         forbidden-prefix-values (conj island-values root-value)
-        eligible-external?
-        (fn [value]
-          (retained-host-scalar-prefix?
-           facts producers position-by-id outputs host-reads forbidden-prefix-values
-           value island-position))]
-    (when (and contiguous?
-               (< (inc root-position) island-position)
+        stages
+        (mapv (fn [group]
+                (let [values (set (mapcat :results group))
+                      equations (set (map :id group))
+                      external-captures (set (mapcat #(remove values (:captures %)) group))
+                      staged-captures (set/intersection forbidden-prefix-values external-captures)
+                      host-captures (set/difference external-captures staged-captures)
+                      position (get position-by-id (:id (first group)))
+                      frontier (->> values
+                                    (filter (fn [value]
+                                              (some #(not (contains? equations (get-in % [1 :equation])))
+                                                    (get uses value []))))
+                                    (sort-by producer-position) vec)
+                      terminals (filter terminal-site? (mapcat #(get uses % []) values))]
+                  {:root root :infos group :values values :equations equations
+                   :frontier frontier :staged-captures staged-captures
+                   :external-captures host-captures
+                   :terminal-equations (set (map #(get-in % [1 :equation]) terminals))
+                   :eligible-external?
+                   (every? #(retained-host-scalar-prefix?
+                             facts producers position-by-id outputs host-reads forbidden-prefix-values
+                             % position)
+                           host-captures)}))
+              island-groups)]
+    (when (and (seq positions)
+               ;; Preserve the existing separated-island path; the one-stage admission
+               ;; continues to own a wholly contiguous root/closure.
+               (or (< 1 (count stages)) (< (inc root-position) (first positions)))
                (every? #(pristine-scalar-equation? facts % false) dependent-infos)
                (every? #(exact-plain-tensor? (get-in facts [:values (first (:results %))]) [])
                        dependent-infos)
@@ -1045,16 +1058,12 @@
                (every? scalar-site? root-sites)
                (seq terminal-sites)
                (every? #(or (scalar-site? %) (terminal-site? %)) island-sites)
-               (every? eligible-external? external-captures))
+               (every? #(and (seq (:frontier %)) (:eligible-external? %)) stages))
       {:root root
        :root-stage {:root root :infos [root-info] :values #{root-value}
                     :equations #{(:id root-info)} :frontier [root-value]
                     :terminal-equations #{}}
-       :island-stage {:root root :infos dependent-infos :values island-values
-                      :equations island-equations :frontier frontier
-                      :terminal-equations
-                      (set (map #(get-in % [1 :equation]) terminal-sites))}
-       :external-captures external-captures})))
+       :island-stages stages})))
 
 (defn- materialize-ordered-uniform-scalar-islands
   [program infos candidate reserved]
@@ -1069,32 +1078,44 @@
         root-generated (singleton-scalar-stage facts root-stage reserved)
         root-value (get-in candidate [:root :result])
         root-buffer (get (:frontier-map root-generated) root-value)
-        island-stage
-        (assoc (:island-stage candidate)
-               :capture-descriptors
-               (into [{:logical root-value :value root-buffer :load? true}]
-                     (map (fn [value] {:logical value :value value :load? false}))
-                     (sort-by pr-str (:external-captures candidate)))
-               :stable-captures #{root-buffer}
-               :capture-values (:values root-generated)
-               :pass :ordered-uniform-scalar-island)
-        island-generated
-        (singleton-scalar-stage facts island-stage (:reserved root-generated))
-        stages [root-stage island-stage]
-        generated [root-generated island-generated]
-        terminal-frontier (mapv (:frontier-map island-generated) (:frontier island-stage))]
+        {:keys [stages generated]}
+        (reduce
+         (fn [{:keys [stages generated replacements capture-values reserved]} island]
+           (let [stage
+                 (assoc island
+                        :capture-descriptors
+                        (into (mapv (fn [logical]
+                                      {:logical logical :value (get replacements logical) :load? true})
+                                    (sort-by pr-str (:staged-captures island)))
+                              (map (fn [logical] {:logical logical :value logical :load? false}))
+                              (sort-by pr-str (:external-captures island)))
+                        :stable-captures (set (vals replacements))
+                        :capture-values capture-values
+                        :pass :ordered-uniform-scalar-island)
+                 item (singleton-scalar-stage facts stage reserved)]
+             {:stages (conj stages stage) :generated (conj generated item)
+              :replacements (merge replacements (:frontier-map item))
+              :capture-values (merge capture-values (:values item)) :reserved (:reserved item)}))
+         {:stages [root-stage] :generated [root-generated]
+          :replacements (:frontier-map root-generated) :capture-values (:values root-generated)
+          :reserved (:reserved root-generated)}
+         (:island-stages candidate))
+        terminal-frontier (vec (mapcat (fn [item]
+                                        (mapv (:frontier-map item) (get-in item [:stage :frontier])))
+                                      (rest generated)))
+        stage-descriptors (mapv (fn [ordinal stage item]
+                                  {:kind (if (zero? ordinal) :root :island)
+                                   :equation (get-in stage [:infos 0 :id])
+                                   :frontier (mapv (:frontier-map item) (:frontier stage))})
+                                (range) stages generated)]
     (rebuild-uniform-scalar-stages
      program infos stages generated
      [{:root root-value :input (get-in candidate [:root :array])
        :root-frontier [root-buffer] :frontier terminal-frontier
-       :stages [{:kind :root :equation (get-in root-stage [:infos 0 :id])
-                 :frontier [root-buffer]}
-                {:kind :island :equation (get-in island-stage [:infos 0 :id])
-                 :frontier terminal-frontier}]}]
+       :stages stage-descriptors}]
      {:resident-uniform-input-closures 1
-      :resident-uniform-input-scalar-islands 1
-      :resident-uniform-input-scalars
-      (+ (count (:values root-stage)) (count (:values island-stage)))})))
+      :resident-uniform-input-scalar-islands (dec (count stages))
+      :resident-uniform-input-scalars (reduce + (map (comp count :values) stages))})))
 
 (defn- materialize-uniform-scalar-closure-candidate
   [program]
@@ -1124,8 +1145,8 @@
                        (filter symbol? (tree-seq coll? seq equations)))
         miss [program {:resident-uniform-input-closures 0
                        :resident-uniform-input-scalars 0}]]
-    ;; Preserve the established one-stage admission. The new two-island route additionally audits
-    ;; every exact root and activates only when there is exactly one, never coordinating roots.
+    ;; Preserve the established one-stage admission. Ordered islands additionally audit every
+    ;; exact root and activate only when there is exactly one, never coordinating roots.
     (try
       (cond
         (and (= 1 (count roots)) (= 1 (count closures)))

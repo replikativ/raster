@@ -80,6 +80,48 @@ Its unit job has 15 completed shards (7,093 tests, 31 failures, 38 errors,
 Vars are not a completed-suite denominator. CPU-OpenCL has all four completed
 shards: 650 tests, 8,145 passing assertions, 7 failures and 30 errors.
 
+The next training-entry bundle distinguishes available source values from host
+scalar operands: ordinary `ScalarCompute` hoisting requires rank-zero values;
+the existing exact `alength` grammar still constructs `ShapeProjection`. Stable
+uniform array reads remain numerical work. The existing singleton scalar-stage
+constructor now composes maximal contiguous dependent groups at their original
+positions, with explicit prior-frontier loads between groups. Whole-program
+write/alias exclusions, source order, eager evaluation for zero traversal extents,
+private complete writes and transactional refusal remain unchanged. This is still
+a single-root optimization with audited map/effect-map terminal captures, not
+permission to stage arbitrary effects, output escapes or multiple roots.
+
+Resident reduction source reconstruction now uses one executable typed
+reduction-plus-store grammar both with and without a final transform. The
+numerical TypedSOAC/result-storage/SegRed boundary does not change. An internal
+`reduce-into` marker is not a runtime function in the owned final-source witness;
+the marker-specific test interpreter was removed rather than duplicated in the
+JVM backend. Public buffered Adam observes semantic stage certificates during
+preparation and physical completion through actual invocation, not a fabricated
+preparation-time resident plan.
+
+Warm checks: structured route 76 tests / 730 assertions; resident reductions
+37 / 396; canonical source subset 17 / 218; actual two-step public buffered Adam
+2 / 130 with changed clocks, persistent moments, independent numerical recurrence
+and lease invalidation on both required local backends. Independent review found
+no blockers; a root evaluation-metadata ratchet was added. The combined capped
+clean-process gate passes 210 tests / 2,562 assertions, zero failures/errors,
+with both local backends required. Remaining C-family witness/phase mismatches,
+deferred composition and full CI qualification are not waived by these results.
+
+The reviewed continuation separates scratch entry support from composition.
+Scratch must retain the original parameter's Class/capacity/alias evidence but
+project owned storage with `source nil`, unspecified contents and no initial
+readiness; its exact role must survive every intermediate stage. Existing
+relative-entry/complete-write contracts, not allocation or a `program-input`
+label, establish post-success readiness. A role-only relaxation is insufficient.
+Then close a local deferred composition vertical: one exact ordered root plus
+source-free resident suffix programs rebound under the same owner through
+`bind-resident-program`, with no child host staging, session or fabricated child
+LinkPlan. Distributed plan/capture certification must remain post-realization
+where it requires concrete views and readiness. Keep the failing semantic-value
+version witness checks load-bearing while explaining the new backing-root facts.
+
 The result-import implementation separates four authorities: final-source
 ownership, emitted numerical producer correspondence, successful execution in the
 current replay, and source snapshot adaptation. All four now pass the local public

@@ -1,5 +1,6 @@
 (ns raster.compiler.passes.parallel.typed-soac-resident-test
   (:require [clojure.set :as set]
+            [clojure.walk :as walk]
             [clojure.test :refer [deftest is]]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.backend.gpu.segop-opencl :as segop-opencl]
@@ -837,12 +838,14 @@
       (is (= device-prefix result)
           "a scalar-looking capture backed by a reduction is not a retained host prefix"))))
 
-(deftest ordered-island-refuses-two-dependent-scalar-islands
-  (let [program
-        (first
+(defn- multiple-island-program
+  [{:keys [n dependent?] :or {n 'n}}]
+  (first
          (fusion/fusion-fixpoint
           (frontend/form->program
-           '(let* [clock-value (clojure.core/long (clojure.core/aget time-buffer 0))
+           (walk/postwalk-replace
+            (cond-> {'n n 'second-input 'clock-value} dependent? (assoc 'second-input 'first-step))
+            '(let* [clock-value (clojure.core/long (clojure.core/aget time-buffer 0))
                    gap-a (raster.par/map-void! i n
                            (clojure.core/aset scratch i
                              (clojure.core/float
@@ -859,23 +862,137 @@
                              (clojure.core/float
                               (clojure.core/+ (clojure.core/aget scratch i) 1.0))))
                    second-step (clojure.core/double
-                                (clojure.core/* (clojure.core/double clock-value)
+                                (clojure.core/* (clojure.core/double second-input)
                                                 (clojure.core/double bias)))
                    effect-b (raster.par/map-void! i n
                               (clojure.core/aset out-b i
                                 (clojure.core/float
                                  (clojure.core/+ (clojure.core/aget out-b i) second-step))))]
-              [gap-a effect-a gap-b effect-b])
+              [gap-a effect-a gap-b effect-b]))
            {:dtype :float
             :array-types {'time-buffer :long 'scratch :float 'out-a :float 'out-b :float}
-            :scalar-types {'n :long 'bias :double}
+            :scalar-types (cond-> {'bias :double} (symbol? n) (assoc n :long))
             :values {'time-buffer (av/tensor
-                                   {:dtype :long :shape '[(extent time-buffer)]})}})))
-        _fixture (is (some? program) "multi-island fixture must enter TypedSOAC")
-        [result stats] (when program (resident/inline-uniform-input-loads program))]
+                                   {:dtype :long :shape '[(extent time-buffer)]})}}))))
+
+(deftest ordered-islands-stage-separate-dependent-blocks-without-moving-effects
+  (doseq [n ['n 0] dependent? [false true]]
+    (let [program (multiple-island-program {:n n :dependent? dependent?})
+          _fixture (is (some? program) "multi-island fixture must enter TypedSOAC")
+          [result stats] (resident/inline-uniform-input-loads program)
+          facts (dialect/facts result)
+          certificate (get-in facts [:attributes :resident-uniform-input-scalar-closures 0])
+          stages (:stages certificate)
+          equations (into {} (map (juxt second identity)) (dialect/equations result))
+          positions (into {} (map-indexed (fn [i equation] [(second equation) i]))
+                          (dialect/equations result))
+          original-position (into {} (map-indexed (fn [i equation] [(second equation) i]))
+                                  (dialect/equations program))
+          effects (filter #(contains? #{:map :effect-map}
+                                      (:kind (fusion/equation-info %)))
+                          (dialect/equations program))
+          [root first-stage second-stage] stages
+          second-info (some-> (equations (:equation second-stage)) fusion/equation-info)
+          incoming (first (:frontier (if dependent? first-stage root)))]
+      (is (= 1 (:resident-uniform-input-closures stats)))
+      (is (= 2 (:resident-uniform-input-scalar-islands stats)))
+      (is (= 3 (:resident-uniform-input-scalars stats)))
+      (is (= [:root :island :island] (mapv :kind stages)))
+      (is (some #{incoming} (:captures second-info))
+          "a dependent later island captures the earlier frontier instead of recomputing it")
+      (when second-info
+        (let [capture-index (.indexOf ^java.util.List (:captures second-info) incoming)
+              parameter (when (<= 0 capture-index) (nth (:parameters second-info) capture-index))]
+          (is (some #{(list 'clojure.core/aget parameter 0)}
+                    (tree-seq coll? seq (mapv :init (:locals second-info)))))))
+      (doseq [stage stages
+              :let [equation (equations (:equation stage))]]
+        (is (= (set (:frontier stage)) (set (nth equation 2))))
+        (is (= (:equation stage)
+               (get-in facts [:equations (:equation stage) :provenance :source-binding-id])))
+        (doseq [value (:frontier stage)]
+          (is (= [1] (get-in facts [:values value :shape])))))
+      (doseq [equation effects
+              :let [id (second equation)]]
+        (is (= (original-position id) (positions id))
+            "replacing one scalar at each site preserves every intervening effect position")
+        (is (= (get-in (dialect/facts program) [:equations id :effects])
+               (get-in facts [:equations id :effects]))))
+      (is (= result (dialect/validate! result))))))
+
+(deftest multiple-islands-retain-the-root-evaluation-obligation
+  (let [original (multiple-island-program {})
+        equations (mapv (fn [equation]
+                          (if (= ['clock-value] (nth equation 2))
+                            (walk/postwalk
+                             #(if (and (seq? %) (descriptor/aget-call? %))
+                                (vary-meta % assoc :raster.effect/preserve-evaluation true) %)
+                             equation)
+                            equation))
+                        (dialect/equations original))
+        program (dialect/make (dialect/facts original) equations (dialect/outputs original))
+        [result stats] (resident/inline-uniform-input-loads program)
+        root-id (get-in (dialect/facts result)
+                        [:attributes :resident-uniform-input-scalar-closures 0 :stages 0 :equation])
+        root (some #(when (= root-id (second %)) (fusion/equation-info %))
+                   (dialect/equations result))]
+    (is (= 1 (:resident-uniform-input-closures stats)))
+    (is (some #(true? (:raster.effect/preserve-evaluation (meta %)))
+              (tree-seq coll? seq (:locals root)))
+        "the eager root load retains its source evaluation obligation in the generated local")))
+
+(deftest multiple-islands-refuse-escaping-values-and-unstable-root-inputs-atomically
+  (let [program (multiple-island-program {:dependent? true})
+        facts (dialect/facts program)
+        equations (dialect/equations program)
+        candidates
+        [(dialect/make facts equations ['first-step])
+         (dialect/make (assoc-in facts [:attributes :host-read-values] ['second-step])
+                       equations (dialect/outputs program))
+         (dialect/make (assoc-in facts [:values 'time-buffer :memory-space] :host)
+                       equations (dialect/outputs program))]]
+    (doseq [candidate candidates]
+      (let [[result stats] (#'resident/materialize-uniform-scalar-closure candidate)]
+        (is (zero? (:resident-uniform-input-closures stats)))
+        (is (= candidate result)
+            "no root or earlier island escapes a declined whole-program transaction")))))
+
+(deftest multiple-islands-retain-whole-program-input-write-and-alias-exclusions
+  (let [program
+        (first
+         (fusion/fusion-fixpoint
+          (frontend/form->program
+           '(let* [clock-value (clojure.core/float (clojure.core/aget time-buffer 0))
+                   mutation (raster.par/map-void! i n
+                              (clojure.core/aset time-buffer i
+                                (clojure.core/float
+                                 (clojure.core/+ (clojure.core/aget time-buffer i) 1.0))))
+                   first-step (clojure.core/double
+                               (clojure.core/+ (clojure.core/double clock-value) 1.0))
+                   effect-a (raster.par/map-void! i n
+                              (clojure.core/aset out-a i (clojure.core/float first-step)))
+                   second-step (clojure.core/double
+                                (clojure.core/+ (clojure.core/double first-step) 1.0))
+                   effect-b (raster.par/map-void! i n
+                              (clojure.core/aset out-b i (clojure.core/float second-step)))]
+              [mutation effect-a effect-b])
+           {:dtype :float :array-types {'time-buffer :float 'out-a :float 'out-b :float}
+            :scalar-types {'n :long}
+            :values {'time-buffer (av/tensor
+                                   {:dtype :float :shape '[(extent time-buffer)]})}})))
+        [result stats] (#'resident/materialize-uniform-scalar-closure program)
+        pristine (multiple-island-program {})
+        facts (dialect/facts pristine)
+        root (some (fn [equation]
+                     (let [info (fusion/equation-info equation)]
+                       (when (= ['clock-value] (:results info)) info)))
+                   (dialect/equations pristine))]
     (is (zero? (:resident-uniform-input-closures stats)))
-    (is (= program result)
-        "dependent scalar blocks separated by device equations are not merged or reordered")))
+    (is (= program result) "an input write anywhere excludes snapshot staging")
+    (is (nil? (#'resident/exact-uniform-root
+               facts root (set (:inputs facts)) #{'written-alias}
+               [['time-buffer 'middle-alias] ['middle-alias 'written-alias]] #{} #{}))
+        "the whole certified alias component participates in input stability")))
 
 (deftest singleton-stage-private-ids-share-one-collision-proof
   (let [reserved '#{uniform-index__uniform_scalar_buffer_0

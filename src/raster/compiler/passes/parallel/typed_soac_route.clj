@@ -504,20 +504,17 @@
             result-cast (nth (get invocation-source/dtype->allocation result-dtype) 2 nil)
             source
             (cond
-              (and resident? transform)
+              resident?
               ;; GPU scheduling applies this same checked transform in the terminal reduction
               ;; phase. Source/JVM materialization must not write the raw accumulator into the
               ;; resident result: reduce to a scalar, apply the authoritative transform (including
-              ;; its explicit singleton operand loads), then store the transformed value once.
+              ;; its explicit singleton operand loads), then store the finalized value once.
+              ;; The identity case uses the same executable source grammar; reduce-into is an
+              ;; internal numerical IR marker, not a runtime function in a source witness.
               (list 'clojure.core/aset resident-target 0
                     (invocation-source/typed-store-value
                      result-cast
                      (materialize-functional-result-transform scalar-reduction-source transform)))
-
-              resident?
-              (list 'raster.par/reduce-into resident-target accumulator
-                    (first (:identities attributes)) (:index attributes)
-                    (:extent attributes) body)
 
               :else
               (materialize-functional-result-transform scalar-reduction-source transform))]
