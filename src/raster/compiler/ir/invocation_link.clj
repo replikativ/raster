@@ -3,8 +3,8 @@
 
    MaterializedInvocation owns public argument/scalar semantics. EmittedParallelProgram owns the
    numerical program. This namespace realizes their shared storage boundary exactly once: caller
-   arrays become initialized LinkNodes, physical equation results and loop carry rotations become
-   owned nodes, and the emitted call enters LinkPlan as a ProgramLinkInstance. No driver object,
+   arrays become checked entry LinkNodes (explicit scratch has no initializer), results and carry
+   rotations become owned nodes, and the emitted call enters LinkPlan as a ProgramLinkInstance. No driver object,
    kernel name, or legacy resident descriptor participates."
   (:require [clojure.set :as set]
             [raster.compiler.core.op-descriptor :as descriptor]
@@ -494,7 +494,7 @@
   [{:keys [storage buffers]} scalars target output-tokens tokens]
   {:nodes
    (mapv (fn [token]
-           (let [{:keys [shape source abstract backing]} (get storage token)]
+           (let [{:keys [shape source abstract backing role]} (get storage token)]
              (link/node {:id token :dtype (:dtype abstract) :shape shape :device target
                          :allocation-id (or backing token)
                          :byte-size (when backing
@@ -502,6 +502,7 @@
                                         (bview/required-byte-span (:dtype abstract) base-shape
                                                                   (bview/dense-strides base-shape))))
                          :role (cond
+                                 (= :scratch role) :scratch
                                  (and source (contains? output-tokens token)) :state
                                  source :state
                                  (contains? output-tokens token) :output
@@ -562,12 +563,13 @@
 (defn ^:no-doc ordered-entry-roles
   "Derive conservative semantic entry roles from checked graph accesses plus caller intent.
    This establishes no storage placement, initialization or completion. Written public buffers
-   default to resident state; complete-overwrite specialization may refine them separately."
+   default to resident state. Explicit scratch intent retains the checked public allocation
+   contract but discards its host contents; allocation alone never establishes readiness."
   [state requested-roles]
   (let [requested-roles (or requested-roles {})
         buffers (ordered-entry-buffers state)
         public (set (keys buffers))
-        allowed (disj link/binder-roles :scratch)
+        allowed link/binder-roles
         _ (when-not (and (map? requested-roles) (every? allowed (vals requested-roles))
                          (set/subset? (set (keys requested-roles)) public))
             (fail! :invocation-ordered-entry-roles "entry intent must name public buffers with public roles"
@@ -597,23 +599,88 @@
            "mutable host aliases require one explicit resident storage identity, not independent copies"
            {:values #{(:value left) (:value right)}})))
 
+(defn- checked-ordered-entry-root-roles
+  "Relate owner intent to exact checked public storage roots, never to numerical port spelling.
+   Legacy pure realization callers without owner roles retain their existing default policy."
+  [state]
+  (if-not (or (contains? state :entry-roles) (contains? state :entry-refresh))
+    (do
+      (when (some #(= :scratch (:role %)) (vals (get-in state [:realized :storage])))
+        (fail! :invocation-ordered-entry-role-root
+               "realized public scratch storage cannot lose its exact owner entry intent" {}))
+      {})
+    (let [buffers (ordered-entry-buffers state)
+          roles (:entry-roles state)
+          refresh (:entry-refresh state)
+          expected
+          (reduce-kv (fn [result id buffer]
+                       (let [role (get roles id) token (:id buffer)]
+                         (when-not (and (contains? link/binder-roles role)
+                                        (or (not (contains? result token))
+                                            (= role (get result token))))
+                           (fail! :invocation-ordered-entry-role-root
+                                  "owner entry intent requires one role per exact public storage root"
+                                  {:value id :storage token :role role}))
+                         (assoc result token role))) {} buffers)]
+      (when-not (and (map? roles) (= (set (keys buffers)) (set (keys roles)))
+                     (= expected refresh))
+        (fail! :invocation-ordered-entry-role-root
+               "owner entry roles and refresh policy must name the same checked public roots"
+               {:roles roles :expected expected :refresh refresh}))
+      (doseq [[token storage] (get-in state [:realized :storage])
+              :when (= :scratch (:role storage))]
+        (when-not (= :scratch (get expected token))
+          (fail! :invocation-ordered-entry-role-root
+                 "realized public scratch storage must retain its exact owner entry intent"
+                 {:storage token :role (get expected token)})))
+      (doseq [[token role] expected
+              :let [storage (get-in state [:realized :storage token])]
+              :when (and (= :scratch role) storage)]
+        (when-not (and (= :scratch (:role storage)) (nil? (:source storage))
+                       (= :unspecified (:initialization storage)))
+          (fail! :invocation-ordered-entry-role-root
+                 "realized scratch cannot change role or acquire a host initializer"
+                 {:storage token :role (:role storage) :initialization (:initialization storage)})))
+      expected)))
+
+(defn- retain-ordered-scratch-storage
+  [realized root-roles]
+  (update realized :storage
+          (fn [storage]
+            (reduce-kv (fn [storage token role]
+                         (if (and (= :scratch role) (contains? storage token))
+                           (update storage token assoc :role :scratch :source nil
+                                   :initialization :unspecified)
+                           storage)) storage root-roles))))
+
 (defn ^:no-doc ordered-entry-layout
   "Describe captured entry buffers without evaluating a source action or granting completion.
-   Dynamic inputs remain unacquired; source-created arrays are not captured entry storage."
+   Dynamic inputs remain unacquired; source-created arrays are not captured entry storage.
+   Scratch parameters retain their original checked host evidence, but their owned projection
+   has no source or initializer and receives no acquisition-time initialization credit."
   [state roles]
   (let [available (materialization/prefix-bindings (:materialization state))
         buffers (ordered-entry-buffers state)
+        _ (when-not (and (map? roles) (= (set (keys buffers)) (set (keys roles))))
+            (fail! :invocation-public-role-alias
+                   "entry storage requires exact public root roles"
+                   {:available (set (keys buffers)) :roles roles}))
         _ (validate-ordered-entry-aliases! buffers roles)
         captured (into #{} (keep (fn [[id role]] (when (not= :input role) id))) roles)
+        ;; Alias checks above observe the original exact host arrays BEFORE contents are erased.
+        projected (into {} (map (fn [[id buffer]]
+                                 [id (if (= :scratch (get roles id))
+                                       (assoc buffer :source nil :initialization :unspecified)
+                                       buffer)])) buffers)
         realized (add-materialized-inputs {:buffers {} :storage {} :loop-scratch {}}
-                                          {:program-buffers buffers}
+                                          {:program-buffers projected}
                                           (into {} (map (fn [[id buffer]] [id (:value buffer)])) buffers)
                                           #{} captured)
         scalars (merge (invocation-shape-scalars (:materialization state)) (:program-scalars available))
         refresh (reduce-kv
                  (fn [result id buffer]
                    (let [token (:id buffer) role (get roles id)]
-                     (when (or (nil? role)
+                     (when (or (not (contains? link/binder-roles role))
                                (and (contains? result token) (not= role (get result token))))
                        (fail! :invocation-public-role-alias
                               "entry storage requires one consistent role for all its public aliases"
@@ -926,7 +993,7 @@
         input-ids (into #{} (keep (fn [[id role]] (when (= :input role) id))) roles)
         _ (when-not (set/subset? (set (keys replacements)) input-ids)
             (fail! :invocation-ordered-input-role
-                   "only dynamic public inputs may be replaced; state and constants are captured"
+                   "only dynamic public inputs may be replaced; other public roles are captured"
                    {:inputs input-ids :supplied (set (keys replacements))}))
         slots (into {} (map-indexed (fn [index parameter] [(:id parameter) index])) (:parameters plan))
         arguments (reduce-kv
@@ -1199,6 +1266,7 @@
                     boundaries)
           overwrite (write-before-read-inputs boundaries available scalars)
           acquired (:acquired-storage state)
+          root-roles (checked-ordered-entry-root-roles state)
           unacquired (update available :program-buffers
                              (fn [buffers]
                                (into {} (remove (fn [[id buffer]]
@@ -1211,6 +1279,7 @@
                                                     true))) buffers)))
           realized (add-materialized-inputs (:realized state) unacquired (:values program)
                                             overwrite required)
+          realized (retain-ordered-scratch-storage realized root-roles)
           realized (lower-equation-storage realized (get-in materialization [:plan :id]) equation
                                             (:values program) scalars (:projections (checked-ordered-validation state))
                                             caller-options)
@@ -1243,11 +1312,15 @@
                                        outputs)))
           layout (storage-link-layout realized scalars (:target state) (set outputs) tokens)
           nodes (mapv (fn [node]
-                        (if (contains? acquired (get-in node [:view :allocation :id]))
+                        (if (or (contains? acquired (get-in node [:view :allocation :id]))
+                                (= :scratch (get root-roles (get-in node [:view :allocation :id]))))
                           ;; Existing roots are conditional inputs to this stage. Retaining
                           ;; their old host initializer would silently overwrite earlier work.
-                          ;; Retain writability for already-acquired invariant/carry storage;
-                          ;; the stage's ordinary effect proof still checks every actual access.
+                          ;; :state HERE is only the existing conditional stage assumption, not
+                          ;; owner intent or readiness. The independently derived relative entry
+                          ;; contract requires every read/partial write, and the common runtime
+                          ;; checks those views before preparing/submitting this stage. Scratch
+                          ;; stays source-free :scratch in owner storage and the final whole plan.
                           (assoc node :source nil
                                  :role (let [role (get (:entry-refresh state)
                                                       (get-in node [:view :allocation :id]))]
@@ -1733,6 +1806,7 @@
                                     {:equation (:id equation)}))
                            (:results step)))
          entry-refresh (:entry-refresh state)
+         _ (checked-ordered-entry-root-roles state)
          captured (into #{} (keep (fn [[token role]] (when (not= :input role) token))) entry-refresh)
          project
          (fn [candidate]

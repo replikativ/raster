@@ -112,7 +112,11 @@ deferred composition and full CI qualification are not waived by these results.
 The reviewed continuation separates scratch entry support from composition.
 Scratch must retain the original parameter's Class/capacity/alias evidence but
 project owned storage with `source nil`, unspecified contents and no initial
-readiness; its exact role must survive every intermediate stage. Existing
+readiness; its exact role must survive in the owner, refresh policy and final
+whole-program plan. A separately checked source-free stage may retain the existing
+conditional `:state` projection: it expresses an initialization requirement,
+not owner identity or completion credit. Runtime must discharge that requirement
+before preparing/submitting the stage. Existing
 relative-entry/complete-write contracts, not allocation or a `program-input`
 label, establish post-success readiness. A role-only relaxation is insufficient.
 Then close a local deferred composition vertical: one exact ordered root plus
@@ -121,6 +125,17 @@ source-free resident suffix programs rebound under the same owner through
 LinkPlan. Distributed plan/capture certification must remain post-realization
 where it requires concrete views and readiness. Keep the failing semantic-value
 version witness checks load-bearing while explaining the new backing-root facts.
+
+Standalone ordered scratch entry support is now locally qualified: 24 tests /
+383 assertions warm; capped clean-process gate 27 / 581 with OpenCL and Level
+Zero both required, including the public mixed-storage gradient and two-step
+buffered Adam. Original parameter Class/dtype/capacity and host-alias evidence
+survives; scratch owners have no source, upload or acquisition-time initialization
+credit. Stage preparation/submission is blocked by unmet relative requirements;
+successful complete-child writes credit only those views. Failed writes grant no
+readiness/replay credit. Existing realized scratch roles/initializers cannot be
+tampered and silently repaired. This does not qualify deferred composition or
+the remaining semantic-value witness and full-CI failures.
 
 The result-import implementation separates four authorities: final-source
 ownership, emitted numerical producer correspondence, successful execution in the
