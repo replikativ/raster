@@ -42,6 +42,12 @@
         late-written (par/map! late j n double 0.0)]
     [written late-written]))
 
+(deftm ordered-unused-constructor-return
+  [out :- (Array double), n :- Long] :- (Array double)
+  (let [written (par/map! out i 2 double (+ 1.0 (double i)))
+        unused (double-array n)]
+    written))
+
 (deftm ordered-prefix-zero-buffer-return
   [early :- (Array double), n :- Long] :- Object
   (let [first-write (par/map! early i 2 double (+ 1.0 (double i)))

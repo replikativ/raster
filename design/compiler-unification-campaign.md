@@ -183,6 +183,47 @@ regression passes four assertions on changed inputs. Fresh-process and branch-wi
 qualification remain separate. Constructor omission is not fixed by this change;
 more precise read/version and totality proofs remain later refinements.
 
+### Source constructor evaluation (October 25, pending branch qualification)
+
+An unused dynamic core array constructor after a numerical prefix previously
+disappeared during scalar DCE. A negative count then returned successfully instead
+of throwing after the prefix. Shared source-evaluation flags now retain recognized
+allocation evaluations unless the existing exact core constructor identity and
+a raw integral literal establish a count in `[0, Integer/MAX_VALUE]`.
+Initializer/copy overloads, lexical callees, unknown helpers, negative/overflowing
+counts and failing source casts receive no positive omission permission. No new
+allocator registry, speculative helper evaluation or DCE-only exception is added.
+The existing intrinsic-source owner authenticates bootstrap Var/root/inline
+metadata and retains observations under the active compiler owner. Cache hits
+revalidate source obligations too; replacing a warmed constructor's inline denies
+omission until its original definition is restored. Nested cast counts remain
+conservative until their own source implementation is authenticated.
+
+This proof discharges deterministic count checks, not allocation exhaustion.
+Existing valid-constant dead-allocation elimination continues to disregard resource
+exhaustion differences. Broader bounds/null/type failures of reads and writes,
+ordinary arithmetic partiality and divergence are not closed by this change.
+
+Mandatory reference results still conservatively seed DCE value liveness: an
+unknown helper may return caller-owned storage. A direct probe confirms that a
+dynamic dead constructor plus its dead write are both retained (zero bindings
+removed). This is a known optimization cost, not a freshness/escape proof; safe
+constant dead local buffers/writes still disappear. Separate required evaluations
+from content liveness only with actual fresh/non-escape authority and partial-write
+semantics, not nominal allocation names.
+
+The warm five-namespace scalar/JIT-AOT gate passes 57 tests / 689 assertions.
+Public ordered OpenCL and Level Zero tests pass 2 tests / 14 assertions: negative
+counts throw after the earlier resident write, preserve the untouched tail, poison
+publication and do not complete a replay; zero/positive counts return the full
+buffer. Fresh qualification and the wider affected gate are recorded separately.
+
+Exact-head CI at `2473d88d3`, before this constructor change, remains unqualified:
+job 34947 has 15 completed artifacts and missing shard 3, with 6,978 tests, 86,365
+passing assertions, 30 failures and 42 errors across 53 failing Vars. Public-source
+emission and OpenCL gates also fail. This incomplete denominator is not a coverage
+trend and does not authorize merging PR #1566.
+
 ### Current source-context qualification (October 25)
 
 The source-completion continuation separates three obligations: the source cast's

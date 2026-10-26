@@ -257,6 +257,43 @@
                 (is (= (vec (repeat n 0.0)) (vec (link/download executable late))))))
             (finally (link/close! executable))))))))
 
+(defn- check-unused-constructor! [target]
+  (let [compilation (equation-first/compile
+                     #'allocation-fixture/ordered-unused-constructor-return
+                     {:target target :dtype :double
+                      :values {'out (av/tensor {:dtype :double :shape [8]})}})]
+    (is (true? (:required? (invocation-link/ordered-preparation-requirement compilation))))
+    (doseq [n [-1 0 3]]
+      (let [input (double-array [10 11 12 13 14 15 16 17])
+            executable (link/instantiate-ordered-invocation! compilation [input n] {})]
+        (try
+          (if (neg? n)
+            (do
+              (is (thrown? NegativeArraySizeException (link/run! executable)))
+              (let [runtime (:ordered @(:execution-state executable))
+                    token (get-in runtime [:current :realized :buffers 'out])
+                    actual (double-array 8)]
+                (gpu/download-range! (:session executable) (get-in runtime [:node-views token])
+                                     actual {:elements 8})
+                (is (= [1.0 2.0 12.0 13.0 14.0 15.0 16.0 17.0] (vec actual))
+                    "the earlier resident write survives a dead constructor's failure"))
+              (is (zero? @(:completed-replays executable)))
+              (is (= :link-execution-poisoned (reason #(link/outputs executable)))))
+            (let [output (first (keys (link/run! executable)))]
+              (is (= [1.0 2.0 12.0 13.0 14.0 15.0 16.0 17.0]
+                     (vec (link/download executable output))))))
+          (finally (link/close! executable)))))))
+
+(deftest opencl-unused-constructor-still-executes-at-source-position
+  (if @ocl-probe/opencl-available?
+    (check-unused-constructor! :ocl:0)
+    (ocl-probe/opencl-skip! "unused source constructor failure")))
+
+(deftest level-zero-unused-constructor-still-executes-at-source-position
+  (if @ze-probe/gpu-available?
+    (check-unused-constructor! :ze:0)
+    (ze-probe/gpu-skip! "unused source constructor failure")))
+
 (deftest opencl-ordered-prefix-returns-preserve-whole-source-buffers
   (if @ocl-probe/opencl-available?
     (check-ordered-prefix-returns! :ocl:0)

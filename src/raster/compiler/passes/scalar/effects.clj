@@ -6,8 +6,8 @@
    effectful (:io). Only expressions beichte proves pure get :pure.
 
    Source operations may additionally carry semantic obligations which are not
-   external effects. In particular, op-descriptor's checked integral casts can
-   throw. Such expressions retain Beichte's effect level but carry a flag so
+   external effects. Checked integral casts and array constructors can throw.
+   Such expressions retain Beichte's effect level but carry a flag so
    DCE, CSE and algebraic simplification cannot erase or duplicate the possible
    exceptional control transfer.
 
@@ -18,6 +18,8 @@
             [beichte.registry :as beichte-registry]
             [clojure.walk :as walk]
             [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.intrinsic-source :as intrinsic-source]
+            [raster.compiler.core.method-entry :as method-entry]
             [raster.compiler.core.numeric-constant :as numeric-constant]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.scalar-conversion :as scalar-conversion]
@@ -191,10 +193,30 @@
           (and source target
                (= [:exact :exact] (scalar-conversion/policy source target)))))))
 
-(defn- source-evaluation-flags
-  "Existing checked conversion obligations and explicit source-owner denials.
+(defn- bounded-source-allocation?
+  "Discharge deterministic size checks only for an exact core constructor.
+   Only raw integral literals are admitted: neither a type tag nor a nested
+   conversion's numeric value authenticates its source implementation. A
+   one-argument constructor may instead consume initializer data.
+   As with existing dead-allocation elimination, resource exhaustion is outside
+   this permission: a valid count is not a proof that allocation can succeed."
+  [expression]
+  (when-let [size (descriptor/array-allocation-size expression)]
+    (when (and (integer? size) (<= 0 size Integer/MAX_VALUE))
+      (let [lookup (first expression)
+            operation (symbol "clojure.core" (name lookup))]
+        (try
+          (intrinsic-source/assert-original! (resolve lookup) operation
+                                             :source-constructor-definition-mismatch)
+          (when method-entry/*emission-inputs*
+            (intrinsic-source/observe-original! *ns* lookup operation))
+          true
+          (catch clojure.lang.ExceptionInfo _ false))))))
 
-   This deliberately derives from op-descriptor's closed conversion contract;
+(defn- source-evaluation-flags
+  "Checked conversion/constructor obligations and explicit source-owner denials.
+
+   This deliberately derives from op-descriptor's existing operation contracts;
    it is not another function registry. Without retained operand dtypes here,
    checked integral casts remain conservatively non-removable. This reader does
    not globally reinterpret arithmetic purity as source totality. New local
@@ -213,6 +235,14 @@
                              (= :reject (descriptor/cast-integral-narrowing operation))
                              (contains? '#{byte int long} (descriptor/cast-result-tag operation)))
                         (conj :checked-source-cast)
+                        ;; Allocation purity says nothing about a negative/overflowing
+                        ;; count, unsupported initializer overload or helper failure.
+                        ;; Nominal allocation recognition is denial-only; only the
+                        ;; exact constructor/count proof above discharges it.
+                        (and (seq? node)
+                             (descriptor/alloc-op? (form/effective-op node))
+                             (not (bounded-source-allocation? node)))
+                        (conj :source-allocation-evaluation)
                         ;; This is denial-only evidence from the source factory:
                         ;; no optimizer may erase its conversion merely because
                         ;; the projected field is not otherwise used.
@@ -297,7 +327,10 @@
     {:effect :pure :flags (source-evaluation-flags expr)}
     (if-let [k (try
                  (when-let [proof (closed-registry-proof expr)]
-                   [(descriptor-key expr) proof])
+                   ;; Revalidate source obligations even on cache hits. Core
+                   ;; Var identity alone survives root/inline replacement and
+                   ;; must not preserve yesterday's constructor permission.
+                   [(descriptor-key expr) proof (source-evaluation-flags expr)])
                  (catch Exception _ nil)
                  (catch StackOverflowError _ nil))]
       (or (.get ^java.util.Map descriptor-cache k)
@@ -345,8 +378,8 @@
 (defn cse-properties
   "Project sharing eligibility and observation invalidation from one effect query.
 
-   External purity is necessary but not sufficient: an allocator is removable
-   when its result is dead, yet two live allocations have distinct mutable
+   External purity is necessary but not sufficient: an allocator may be removable
+   when its result is dead and its checks discharged, yet two live allocations have distinct mutable
    identities and must never be coalesced.  Keep that distinction here rather
    than teaching individual compiler markers or consumers to protect their
    operands. Declared storage writes, mutation and allocation also rule out CSE

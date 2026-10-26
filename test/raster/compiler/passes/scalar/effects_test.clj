@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest is]]
             [beichte.analyze :as beichte-analyze]
             [raster.compiler.passes.scalar.effects :as effects]
+            [raster.compiler.core.method-entry :as method-entry]
             [raster.compiler.core.scalar-conversion :as conversion]
             [raster.compiler.core.op-descriptor :as descriptor]))
 
@@ -142,10 +143,63 @@
           '(.invk raster.arrays/zeros-like_m_floats_long-impl exemplar n)
           {:raster.op/original 'raster.arrays/zeros-like
            :raster.type/tag 'floats :tag 'floats})]
-    (is (effects/removable-expr? allocation)
-        "an unused local allocation may be eliminated")
+    (is (not (effects/removable-expr? allocation))
+        "external purity does not discharge a dynamic constructor's failures")
+    (is (empty? (:flags (effects/descriptor '(clojure.core/double-array 8))))
+        "closed valid size adds no denial; DCE still checks its effect policy")
     (is (not (effects/cse-safe-expr? allocation))
         "two live allocations may not share mutable identity")))
+
+(deftest allocation-evaluation-requires-a-closed-valid-size
+  (doseq [expression ['(clojure.core/double-array -1)
+                      '(clojure.core/double-array n)
+                      '(clojure.core/double-array 2147483648)
+                      '(clojure.core/double-array (clojure.core/int 2147483648))
+                      '(clojure.core/long-array (clojure.core/int 8))
+                      '(clojure.core/double-array [1.0 2.0])
+                      '(clojure.core/double-array 2 (effectful-initializer))
+                      '(clojure.core/aclone source)
+                      (with-meta '(clojure.core/double-array 2)
+                        {:raster.op/lexical-callee true})]]
+    (is (contains? (:flags (effects/descriptor expression)) :source-allocation-evaluation)
+        (pr-str expression))
+    (is (not (effects/removable-expr? expression))))
+  (doseq [expression ['(clojure.core/double-array 0)
+                      '(clojure.core/float-array 8)
+                      '(clojure.core/long-array 8)]]
+    (is (not (contains? (:flags (effects/descriptor expression))
+                       :source-allocation-evaluation))))
+  (is (effects/removable-expr? '(quote (clojure.core/double-array -1)))
+      "constructor-shaped quoted data is not an evaluation"))
+
+(deftest constructor-permission-does-not-survive-replaced-core-inline
+  (let [constructor #'clojure.core/double-array
+        original (meta constructor)
+        expression '(clojure.core/double-array 17)
+        denied? #(contains? (:flags (effects/descriptor expression))
+                            :source-allocation-evaluation)]
+    ;; Exercise a cache hit independently of Beichte registry version/details.
+    ;; The expression and resolved Var remain identical throughout the test.
+    (with-redefs-fn {#'effects/closed-registry-proof (constantly [constructor])}
+      (fn []
+        (is (not (denied?)))
+        (is (not (denied?)))
+        (doseq [[key replacement] [[:inline (fn [& _] '(throw (Exception. "replaced inline")))]
+                                   [:inline-arities (constantly false)]]]
+          (try
+            (alter-meta! constructor assoc key replacement)
+            (is (denied?))
+            (finally (reset-meta! constructor original))))
+        (with-redefs-fn {constructor (fn [& _] (throw (Exception. "replacement must not run")))}
+          #(is (denied?)))
+        (is (not (denied?)) "restoration reinstates the original constructor contract")))))
+
+(deftest constructor-omission-retains-the-existing-source-owner
+  (let [inputs (atom {})]
+    (binding [method-entry/*emission-inputs* inputs]
+      (is (empty? (:flags (effects/descriptor '(clojure.core/double-array 8)))))
+      (is (contains? (:definition-proofs @inputs) #'clojure.core/double-array))
+      (is (true? (method-entry/assert-definition-inputs-current! @inputs))))))
 
 (deftest total-conversion-evidence-does-not-invent-an-exception
   (let [int-value (with-meta 'x {:raster.type/tag 'int})

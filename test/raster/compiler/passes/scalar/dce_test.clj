@@ -7,6 +7,32 @@
 ;; Dead binding removal
 ;; ================================================================
 
+(deftest dead-constructor-retains-source-failure-and-effect-order
+  (let [source '(let* [before (clojure.core/aset output 0 7.0)
+                      unused (clojure.core/double-array n)
+                      after (clojure.core/aset output 1 9.0)]
+                 output)
+        lowered (:form (dce/eliminate-dead-bindings source))
+        run (fn [body n]
+              (let [output (double-array 2)
+                    failure (try
+                              ((eval (list 'fn '[output n] body)) output n)
+                              nil
+                              (catch Exception e (class e)))]
+                [failure (vec output)]))]
+    (is (= source lowered))
+    (doseq [n [-1 0 3]]
+      (is (= (run source n) (run lowered n))))
+    (is (= [NegativeArraySizeException [7.0 0.0]] (run lowered -1)))
+    (is (= [nil [7.0 9.0]] (run lowered 3)))))
+
+(deftest required-reference-evaluation-still-roots-possibly-aliased-writes
+  ;; Do not split mandatory evaluation from result liveness without a genuine
+  ;; freshness/non-escape proof: this unknown helper can return caller memory.
+  (let [source '(let* [leaf (opaque-helper input)
+                      write (clojure.core/aset leaf 0 9.0)] 0)]
+    (is (= source (:form (dce/eliminate-dead-bindings source))))))
+
 (deftest per-binding-syntactic-free-symbols-are-derived-once
   (let [store '(clojure.core/aset buf 0 1.0)
         compute '(+ x 2)
