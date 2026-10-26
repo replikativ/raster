@@ -162,6 +162,72 @@
             #(materialization/initial-parameter-arguments
               (materialization/materialize-next initial evaluate-scalar)))))))
 
+(deftest source-free-parameters-are-exact-structural-descriptors-not-readiness
+  (let [array (array-value :double 3)
+        plan (invocation/from-prefix
+              {:id :source-free-parameter
+               :parameters '[x scale]
+               :parameter-values {'x array 'scale (scalar :long)}
+               :bindings '[[n (clojure.core/alength x)] [alias x]]
+               :binding-values {'n (scalar :int) 'alias array}
+               :program-values {'n (scalar :int) 'alias array 'scale (scalar :long)}
+               :program-inputs '[n alias scale] :program-outputs '[alias]})
+        initial (materialization/begin-materialization plan [(double-array 3) 1])
+        parameter-id (:id (first (:parameters plan)))
+        source-free (materialization/source-free-parameter-state initial #{parameter-id})
+        descriptor (get-in source-free [:values parameter-id])
+        scalar-id (:id (second (:parameters plan)))
+        step-id (:id (first (:steps plan)))
+        marker :raster.compiler.ir.invocation-materialization/source-free-parameters]
+    (is (= [3] (:shape descriptor)))
+    (is (nil? (:source descriptor)))
+    (is (= :unspecified (:initialization descriptor)))
+    (is (= source-free (materialization/validate-state! source-free)))
+    (is (= :invocation-materialization-source-free-arguments
+           (materialization-reason #(materialization/initial-parameter-arguments source-free))))
+    (let [projected (materialization/materialize-next source-free nil)
+          aliased (materialization/materialize-next projected nil)
+          complete (materialization/finish-materialization aliased)]
+      (is (= {:type :int :value 3} (get-in projected [:values (:id (first (:steps plan)))])))
+      (is (= descriptor (get-in complete [:program-buffers 'alias])))
+      (is (nil? (get-in complete [:program-buffers 'alias :source]))))
+    (doseq [forged [(dissoc source-free marker)
+                    (assoc source-free marker #{parameter-id :foreign})
+                    (assoc source-free marker #{scalar-id})
+                    (assoc source-free marker #{step-id})
+                    (assoc-in source-free [:values parameter-id :shape] [2])
+                    (assoc-in source-free [:values parameter-id :value]
+                              (array-value :float '(extent x)))
+                    (assoc-in source-free [:values parameter-id :source] (double-array 3))
+                    (assoc-in source-free [:values parameter-id :initialization] :copy)]]
+      (is (some? (materialization-reason #(materialization/validate-state! forged)))))
+    (is (= :invocation-materialization-source-free-parameters
+           (materialization-reason
+            #(materialization/source-free-parameter-state initial #{:foreign}))))
+    (is (= :invocation-materialization-position
+           (materialization-reason
+            #(materialization/source-free-parameter-state
+              (materialization/materialize-next initial nil) #{parameter-id})))))
+  (let [plan (fixture-plan)
+        initial (materialization/begin-materialization plan [(double-array 3) 0.25 7])
+        parameter-id (:id (first (:parameters plan)))
+        source-free (materialization/source-free-parameter-state initial #{parameter-id})
+        projected (materialization/materialize-next source-free nil)]
+    (is (= :invocation-materialization-clone-source
+           (materialization-reason #(materialization/materialize-next projected nil)))))
+  (let [value (array-value :double '(extent x))
+        plan (invocation/from-prefix
+              {:id :conditional-self-extent :parameters '[x] :parameter-values {'x value}
+               :bindings [] :binding-values {} :program-values {'x value}
+               :program-inputs '[x] :program-outputs '[x]})
+        initial (materialization/begin-materialization plan [(double-array 3)])
+        parameter-id (:id (first (:parameters plan)))
+        source-free (materialization/source-free-parameter-state initial #{parameter-id})
+        resized (assoc-in source-free [:values parameter-id :shape] [2])]
+    ;; A self extent is conditional descriptor metadata. No copied baseline or readiness proof is
+    ;; invented after source erasure; the runtime owner must compare its original specialization.
+    (is (= resized (materialization/validate-state! resized)))))
+
 (defn- staged-invocation-plan []
   (invocation/from-prefix
    {:id :deferred-square

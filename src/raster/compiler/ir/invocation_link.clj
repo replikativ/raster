@@ -982,21 +982,228 @@
         (validate-source-result-allocation! state entry action))))
   state)
 
-(defn ^:no-doc ordered-input-arguments
-  "Preflight primitive host-array replacements without evaluating source steps or mutating an
-   owner. Arguments are the owning entry's physical baseline, never logical aggregate roots.
-   Only dynamic buffer inputs may change; scalar slots and storage specialization remain fixed.
-   Whole-root projection belongs to the public adapter; resident-device replacement is separate."
-  [state arguments roles replacements]
+(defn- resident-parameter-value-closure!
+  "Return exact buffer parameter/alias IDs that may be represented without host bytes.
+   Shape projections consume descriptor metadata only. Every other invocation consumer is a
+   content dependency and therefore refuses this bounded resident-input projection."
+  [plan parameter-ids]
+  (reduce
+   (fn [reachable step]
+     (let [operand-values (set (map :value (:operands step)))
+           uses (set/intersection reachable operand-values)]
+       (cond
+         (and (invocation/value-alias? step) (contains? reachable (:source step)))
+         (conj reachable (:id step))
+
+         (and (invocation/shape-projection? step) (contains? reachable (:source step)))
+         reachable
+
+         (seq uses)
+         (fail! :invocation-ordered-resident-host-use
+                "resident input metadata cannot replace bytes consumed by a host invocation step"
+                {:parameters parameter-ids :step (:id step) :values uses})
+
+         :else reachable)))
+   parameter-ids (:steps plan)))
+
+(defn- attributes-host-read-values
+  [attributes]
+  (into (set (:host-read-values attributes))
+        (concat (:native-initialization-providers attributes)
+                (mapcat :values (:host-read-sites attributes)))))
+
+(defn- algorithm-host-read-values
+  [algorithm]
+  (when (soac/program-form? algorithm)
+    (attributes-host-read-values (:attributes (soac/facts algorithm)))))
+
+(defn- invocation-descriptor-buffers
+  "Relate exact parameter/ValueAlias IDs and symbols to the same checked parameter descriptor."
+  [plan buffers]
+  (let [roots (into {} (keep (fn [{:keys [id symbol]}]
+                               (when-let [buffer (get buffers symbol)] [id buffer])))
+                    (:parameters plan))]
+    (reduce (fn [{:keys [ids] :as state} step]
+              (if (invocation/value-alias? step)
+                (if-let [buffer (get ids (:source step))]
+                  (-> state
+                      (assoc-in [:ids (:id step)] buffer)
+                      (assoc-in [:symbols (:symbol step)] buffer))
+                  state)
+                state))
+            {:ids roots
+             :symbols (into {} (keep (fn [{:keys [id symbol]}]
+                                       (when-let [buffer (get roots id)] [symbol buffer])))
+                            (:parameters plan))}
+            (:steps plan))))
+
+(defn- metadata-only-resident-shape-source
+  "Return the source symbol only when one host equation is the canonical ShapeProjection already
+   admitted by the exact InvocationPlan. It observes descriptor shape and never resident contents."
+  [plan equation values buffers]
+  (let [{:keys [ids symbols]} (invocation-descriptor-buffers plan buffers)
+        source-symbol (program-call/metadata-only-buffer-source equation values symbols)
+        result-symbol (when (= 1 (count (:results equation))) (first (:results equation)))
+        step (some #(when (= result-symbol (:symbol %)) %) (:steps plan))
+        source-id (:source step)]
+    (when (and source-symbol (invocation/shape-projection? step) (= 0 (:axis step))
+               (= [{:symbol source-symbol :value source-id}] (:operands step))
+               (some? (get ids source-id))
+               (= (get symbols source-symbol) (get ids source-id)))
+      source-symbol)))
+
+(defn- refuse-resident-program-host-uses!
+  [state buffers invocation-values]
+  (let [plan (get-in state [:materialization :plan])
+        program-values
+        (into #{}
+              (keep (fn [{:keys [program-value invocation-value]}]
+                      (when (contains? invocation-values invocation-value) program-value)))
+              (concat (:bindings plan) (:storage-bindings plan)))]
+    (doseq [program (distinct (keep identity [(:source-program state) (:program state)]))]
+      (let [attributes (:attributes program)
+            metadata-equations
+            (into []
+                  (keep (fn [equation]
+                          (when-let [source (metadata-only-resident-shape-source
+                                             plan equation (:values program) buffers)]
+                            {:equation (:id equation) :source source
+                             ;; Source-analysis positions, not equation IDs or binding names,
+                             ;; own host-read-site provenance. Numeric coincidence is no proof.
+                             :sites (let [source-binding-id
+                                          (get-in equation [:provenance :source-binding-id])]
+                                      (if (and (integer? source-binding-id)
+                                               (not (neg? source-binding-id)))
+                                        #{source-binding-id} #{}))})))
+                  (:equations program))
+            host-read-sites (:host-read-sites attributes)
+            allowed-site-values
+            (into #{}
+                  (mapcat (fn [{:keys [source-binding-id values]}]
+                            (filter (fn [value]
+                                      (some #(and (= value (:source %))
+                                                  (contains? (:sites %) source-binding-id))
+                                            metadata-equations))
+                                    values)))
+                  host-read-sites)
+            site-content-values
+            (into #{}
+                  (mapcat (fn [{:keys [source-binding-id values]}]
+                            (remove (fn [value]
+                                      (some #(and (= value (:source %))
+                                                  (contains? (:sites %) source-binding-id))
+                                            metadata-equations))
+                                    values)))
+                  host-read-sites)
+            aggregate-host-reads (set (:host-read-values attributes))
+            explicit-attribute-content
+            (into (set/difference aggregate-host-reads allowed-site-values)
+                  (concat (:native-initialization-providers attributes)
+                          site-content-values))
+            equation-content
+            (into #{}
+                  (mapcat (fn [equation]
+                            (concat
+                             (when (and (true? (get-in equation [:attributes :host-only]))
+                                        (not (some #(= (:id equation) (:equation %))
+                                                   metadata-equations)))
+                               (:operands equation))
+                             (algorithm-host-read-values (:algorithm equation)))))
+                  (:equations program))
+            content-values (into explicit-attribute-content equation-content)]
+        (when-let [uses
+                   (seq (set/intersection program-values content-values))]
+          (fail! :invocation-ordered-resident-host-use
+                 "resident input bytes are captured by the retained host program boundary"
+                 {:values (set uses)}))))
+    program-values))
+
+(defn- checked-resident-input-parameter-ids!
+  [state buffers resident-values]
+  (let [parameter-ids (into #{} (map (comp :id buffers)) resident-values)
+        reachable (resident-parameter-value-closure!
+                   (get-in state [:materialization :plan]) parameter-ids)]
+    (refuse-resident-program-host-uses! state buffers reachable)
+    parameter-ids))
+
+(defn- assert-resident-input-state-pristine!
+  [state]
+  (let [materialized (materialization/validate-state! (:materialization state))]
+    (when-not (and (zero? (:next-step materialized))
+                   (integer? (:source-cursor state))
+                   (zero? (:source-cursor state))
+                   (nil? (:pending state))
+                   (empty? (:acquired-storage state)))
+      (fail! :invocation-ordered-resident-position
+             "resident input handoff requires an unadvanced, unacquired ordered source state"
+             {:next-step (:next-step materialized) :source-cursor (:source-cursor state)
+              :pending? (some? (:pending state))
+              :acquired-storage (:acquired-storage state)}))
+    state))
+
+(defn- resident-input-descriptors
+  [state buffers resident-values]
+  (let [selected (select-keys buffers resident-values)
+        realized (add-materialized-inputs {:buffers {} :storage {} :loop-scratch {}}
+                                          {:program-buffers selected}
+                                          (into {} (map (fn [[id buffer]] [id (:value buffer)])) selected)
+                                          #{} resident-values)
+        scalars (merge (invocation-shape-scalars (:materialization state))
+                       (:program-scalars (materialization/prefix-bindings
+                                          (:materialization state))))
+        tokens (vec (distinct (map (comp :id val) selected)))
+        layout (storage-link-layout realized scalars (:target state) #{} tokens)
+        nodes (into {} (map (juxt :id #(assoc % :role :input))) (:nodes layout))]
+    (into {}
+          (map (fn [token]
+                 (let [entries (filterv (fn [[_ buffer]] (= token (:id buffer))) selected)
+                       buffers (mapv val entries)
+                       buffer (first buffers)]
+                   (when-not (and buffer (every? #(= buffer %) buffers) (contains? nodes token))
+                     (fail! :invocation-ordered-resident-descriptor
+                            "resident aliases require one exact source-free storage descriptor"
+                            {:storage token :values (mapv first entries)}))
+                   [token {:storage token :values (mapv first entries)
+                           :parameter (:id buffer) :buffer buffer :node (get nodes token)}]))
+          tokens))))
+
+(defn- checked-ordered-input-preflight
+  [state arguments roles replacements resident-values]
   (when-not (map? replacements)
     (fail! :invocation-ordered-inputs "ordered input replacement requires a map" {}))
+  (when-not (set? resident-values)
+    (fail! :invocation-ordered-resident-inputs
+           "resident input projection requires a set of exact public value IDs"
+           {:values resident-values}))
   (let [plan (get-in state [:materialization :plan])
         buffers (ordered-entry-buffers state)
+        _ (when-not (and (map? roles) (= (set (keys buffers)) (set (keys roles)))
+                         (every? link/binder-roles (vals roles)))
+            (fail! :invocation-ordered-input-role
+                   "ordered input refresh requires exact checked public entry roles"
+                   {:available (set (keys buffers)) :roles roles}))
         input-ids (into #{} (keep (fn [[id role]] (when (= :input role) id))) roles)
-        _ (when-not (set/subset? (set (keys replacements)) input-ids)
+        supplied (into (set (keys replacements)) resident-values)
+        _ (when-not (and (empty? (set/intersection (set (keys replacements)) resident-values))
+                         (set/subset? supplied input-ids))
             (fail! :invocation-ordered-input-role
                    "only dynamic public inputs may be replaced; other public roles are captured"
-                   {:inputs input-ids :supplied (set (keys replacements))}))
+                   {:inputs input-ids :supplied supplied}))
+        _ (when-not (set/subset? resident-values (set (keys buffers)))
+            (fail! :invocation-ordered-resident-descriptor
+                   "resident input projection requires an exact checked public entry buffer"
+                   {:available (set (keys buffers)) :values resident-values}))
+        _ (validate-ordered-entry-aliases! buffers roles)
+        token-modes
+        (reduce (fn [modes id]
+                  (let [token (:id (get buffers id))
+                        mode (if (contains? resident-values id) :resident :host)]
+                    (update modes token (fnil conj #{}) mode))) {} input-ids)
+        _ (when-let [[token modes] (some (fn [[token modes]]
+                                          (when (< 1 (count modes)) [token modes])) token-modes)]
+            (fail! :invocation-ordered-resident-alias-mode
+                   "one aliased public storage root cannot mix host and resident refresh modes"
+                   {:storage token :modes modes}))
         slots (into {} (map-indexed (fn [index parameter] [(:id parameter) index])) (:parameters plan))
         arguments (reduce-kv
                    (fn [arguments id source]
@@ -1006,9 +1213,19 @@
                                 "dynamic input requires an exact public parameter slot" {:value id}))
                        (assoc arguments slot source)))
                    (vec arguments) replacements)
-        checked (ordered-entry-buffers
-                 (assoc state :materialization
-                        (materialization/begin-parameter-materialization plan arguments)))]
+        host-state (assoc state :materialization
+                          (materialization/begin-parameter-materialization plan arguments))
+        host-buffers (ordered-entry-buffers host-state)
+        parameter-ids (when (seq resident-values)
+                        (checked-resident-input-parameter-ids!
+                         host-state host-buffers resident-values))
+        checked-state
+        (if (seq parameter-ids)
+          (assoc host-state :materialization
+                 (materialization/source-free-parameter-state
+                  (:materialization host-state) parameter-ids))
+          host-state)
+        checked (ordered-entry-buffers checked-state)]
     (validate-ordered-entry-aliases! checked roles)
     (doseq [[id buffer] buffers
             :let [actual (get checked id)]]
@@ -1016,7 +1233,32 @@
                      (av/storage-contract-compatible? (:value buffer) (:value actual)))
         (fail! :invocation-ordered-input-specialization
                "input replacement cannot change the prepared storage specialization" {:value id})))
-    arguments))
+    {:state checked-state :parameter-arguments arguments
+     :resident-inputs (if (seq resident-values)
+                        (resident-input-descriptors checked-state checked resident-values)
+                        {})}))
+
+(defn ^:no-doc ordered-input-initial-state
+  "Preflight host replacements plus a set of separately owned resident public inputs.
+
+   The returned state contains source-free MaterializedBuffer descriptors for resident entries and
+   must be consumed directly, once, by its runtime owner. `:resident-inputs` contains only exact
+   backend-neutral storage/LinkNode descriptors. It carries no DeviceArray, native handle, source
+   bytes, readiness, initialization credit or lifetime proof. The runtime must independently
+   validate and refresh every resident descriptor before executing this state."
+  [state arguments roles replacements resident-values]
+  (assert-resident-input-state-pristine! state)
+  (select-keys (checked-ordered-input-preflight state arguments roles replacements resident-values)
+               [:state :resident-inputs]))
+
+(defn ^:no-doc ordered-input-arguments
+  "Preflight primitive host-array replacements without evaluating source steps or mutating an
+   owner. Arguments are the owning entry's physical baseline, never logical aggregate roots.
+   Only dynamic buffer inputs may change; scalar slots and storage specialization remain fixed.
+   Whole-root projection belongs to the public adapter; resident input state uses the separate
+   source-free ordered-input-initial-state contract."
+  [state arguments roles replacements]
+  (:parameter-arguments (checked-ordered-input-preflight state arguments roles replacements #{})))
 
 (defn ^:no-doc advance-host-source
   "Advance the next host source definition once, including validated value aliases and shared

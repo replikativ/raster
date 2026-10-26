@@ -357,7 +357,7 @@
              "device-produced storage cannot be supplied as an evaluated host scalar"
              {:values (set shadowed)}))))
 
-(defn- metadata-only-buffer-source
+(defn ^:no-doc metadata-only-buffer-source
   "Classify an exact shape query, not its value or permission to execute it early.
    Actual length still comes from the checked runtime buffer view at its source position."
   [equation values buffers]

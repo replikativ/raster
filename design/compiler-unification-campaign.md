@@ -4,14 +4,16 @@
 
 ### Current boundary ledger
 
-Latest exact-head CI accounting, `48ed47b17` (October 26): setup, build,
-emitted-source fixtures, CUDA compilation and HIP compilation pass. Unit job
-35070 and CPU-OpenCL job 35074 fail; this branch is not merge-ready. Unit has
-15 completed shards: 7,117 tests, 90,772 passing assertions, 21 failures and
-41 errors across 50 failing Vars. Shard 3 remains incomplete with 316 observed
-Vars, so these are not full-suite totals. CPU-OpenCL has all four completed
-shards: 674 tests, 8,476 passing assertions, 9 failures and 30 errors across
-37 failing Vars. The current artifacts supersede the older checkpoint counts
+Latest completed-job accounting, `f302c69c8` (October 26): unit job 35077 and
+CPU-OpenCL job 35078 fail; this branch is not merge-ready. The newer
+`ee4564262` checks remain in progress. Unit has 15 completed shards: 7,057
+tests, 89,508 passing assertions, 19 failures and 27 errors across 36 failing
+Vars. Shard 3 remains incomplete with 431 observed Vars, so these are not
+full-suite totals. CPU-OpenCL has all four completed shards: 674 tests,
+8,528 passing assertions, 6 failures and 27 errors across 31 failing Vars.
+The invocation/source-region/source-prefix failures from the preceding guard
+bundle no longer occur; AMR instead reaches the resident-input boundary below.
+The current artifacts supersede the older checkpoint counts
 below without waiving any remaining failure. Coverage counts vary with shard
 completion and are not evidence that tests were removed.
 
@@ -67,6 +69,23 @@ suites pass: 34 tests / 309 assertions. Independent review found and corrected
 the duplicate-destination hole; final review found no remaining blocker. The
 ordered path still needs to supply prospective entry-range facts and actual
 single-replay transfer receipts to this same rule before AMR restart can pass.
+
+The backend-neutral portion of that handoff now has a conditional source-free
+parameter projection. It reuses MaterializedBuffer and the existing incremental
+state rather than adding a resident IR or embedding backend values. Descriptors
+retain declared storage metadata but carry neither a host initializer nor byte,
+readiness, lifetime or historical-shape authority. The runtime must compare its
+prepared specialization and actual source independently. A self-extent remains
+conditional; a fixed declared extent must match. The new state-returning entry
+requires an unadvanced outer/source prefix and refuses captured/content-dependent
+inputs, clones, mixed alias modes and invalid roles. Exact metadata-only shape
+queries remain allowed through ValueAlias chains. Host-read exemptions use
+retained source-binding provenance per site, never coincidentally equal numerical
+IDs or binding names; another content read of the same buffer still refuses.
+The complete affected pure suites pass 22 tests / 194 assertions. Existing
+ordered root/device suites separately pass 13 tests / 632 assertions on the local
+backends. These gates qualify the descriptor seam and preserve host behavior;
+the actual resident transfer/replay integration remains unfinished.
 
 The next address-proof repair must transport exact integral InvocationPlan
 producer relationships into sliced scheduled bodies as executable equality
