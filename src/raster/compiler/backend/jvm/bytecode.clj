@@ -7402,6 +7402,62 @@
   [emission input-body original]
   (compile-source-completion-region emission input-body original :source-floating-cast))
 
+(defn ^:no-doc compile-planned-source-floating-completion-region
+  "Compile a NEW lexical Object -> Float source recipe under its construction owner.
+   This does not outline or claim an observed occurrence in owner-emission. The chosen
+   Object input ABI preserves source Number conversion; it is not payload-Class evidence.
+   The caller guard owns exact source/plan correspondence, freshness and use permission.
+   No numerical-result transfer or runtime completion is authorized by this constructor."
+  [owner-emission expression operand-policy owner-guard]
+  (let [{:keys [contract operand]} (completion/canonical-parts expression)]
+    (when-not (and (= :source-floating-cast (:source-context contract))
+                   (completion/canonical-contract? contract)
+                   (= 'float (completion/source-cast-result-tag contract))
+                   (symbol? operand) (source-policy/valid? operand-policy)
+                   (ifn? owner-guard))
+      (throw (ex-info "Planned Float completion requires one canonical lexical Object input"
+                      {:reason :planned-source-floating-completion-form})))
+    (let [observations (atom {:static [] :values []})
+          child-lineage (atom nil)
+          token (Object.)
+          recipe (vary-meta expression assoc ::completion-occurrence token)
+          ;; This closed grammar has exactly one lexical operand and a canonical
+          ;; conversion. Unlike arbitrary source, it cannot contain sibling calls.
+          input {:ports {operand {:slot 0 :type :ref :reference-class Object :verified false}}
+                 :unretained-sibling-calls? false}
+          guard (fn []
+                  (owner-guard)
+                  (me/assert-emission-inputs-current! owner-emission)
+                  (me/assert-definition-inputs-current! @observations)
+                  (when-let [lineage @child-lineage]
+                    (me/assert-emission-inputs-current! lineage)))
+          region
+          (binding [me/*emission-inputs* observations]
+            (let [dependencies (prepare-emission-input-snapshots!
+                                [recipe] (:source-ns owner-emission) [operand])
+                  revision (dispatch/compiler-definition-revision)
+                  region (compile-owned-input-region
+                          owner-emission input Float/TYPE
+                          {:return-tag 'float :walked-body [recipe]
+                           :source-policy operand-policy} guard)]
+              (reset! child-lineage
+                      {:dependency-snapshots (into dependencies (:values @observations))
+                       :static-inputs (:static @observations)
+                       :producer-inputs (:producer-inputs @observations)
+                       :definition-revision revision
+                       :completed-definition-revision (dispatch/compiler-definition-revision)})
+              region))
+          actual (get-in @observations [:completion-contexts token])]
+      (when-not (and (= :known (:status actual))
+                     (= contract (:contract actual))
+                     (= :ref (:input-carrier actual))
+                     (= :float (:completion-carrier actual))
+                     (= operand-policy (:operand-source-policy actual)))
+        (throw (ex-info "Planned source completion emitted a different conversion ABI"
+                        {:reason :planned-source-floating-completion-carrier})))
+      (guard)
+      (assoc region :completion-contract contract))))
+
 (defn- compile-raw-int-input-region
   [emission input input-type element-type guard]
   (compile-owned-input-region

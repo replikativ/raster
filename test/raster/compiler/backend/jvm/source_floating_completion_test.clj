@@ -50,6 +50,64 @@
       (apply (:invoke region)
              (map {'value value 'effects effects} (:parameters region))))))
 
+(deftest planned-float-completion-chooses-an-object-port-without-fabricating-an-occurrence
+  (let [{:keys [emission]} (fixture 'Object :float false true 'value)
+        operand (with-meta 'input {:tag 'Object :raster.type/tag 'double})
+        expression (completion/complete-value
+                    (completion/source-floating-cast-contract :float {:unchecked-math false}) operand)
+        stale? (atom false)
+        failure (ex-info "planned owner retired" {:reason :test-owner-retired})
+        guard #(when @stale? (throw failure))
+        region (bytecode/compile-planned-source-floating-completion-region
+                emission expression {:unchecked-math true} guard)
+        method ^java.lang.reflect.Method (:method region)
+        source-cast (binding [*unchecked-math* false]
+                      (eval '(fn [^Object input] (clojure.core/float input))))
+        result (fn [f value]
+                 (try [:value (Float/floatToRawIntBits (f value))]
+                      (catch Throwable error [:error (class error)])))]
+    (is (= [Object] (vec (.getParameterTypes method))))
+    (is (identical? Float/TYPE (.getReturnType method)))
+    (doseq [value [(double -0.0) 0.25 Double/MAX_VALUE Double/MIN_VALUE Double/NaN
+                   Double/POSITIVE_INFINITY Double/NEGATIVE_INFINITY nil true \a]]
+      (is (= (result source-cast value) (result (:invoke region) value))))
+    (let [calls (atom 0)
+          value (proxy [Number] []
+                  (intValue [] (throw (AssertionError. "wrong conversion")))
+                  (longValue [] (throw (AssertionError. "wrong conversion")))
+                  (doubleValue [] (swap! calls inc) (double 0.25))
+                  (floatValue [] (swap! calls inc) (float 0.25)))
+          expected (result source-cast value)
+          expected-calls @calls]
+      (reset! calls 0)
+      (is (= expected (result (:invoke region) value)))
+      (is (= expected-calls @calls))
+      (reset! stale? true)
+      (reset! calls 0)
+      (is (identical? failure (try ((:invoke region) value) nil
+                                  (catch Throwable error error))))
+      (is (zero? @calls) "owner refusal precedes the Number's conversion effects"))
+    (doseq [bad [(completion/complete-value (:contract (completion/canonical-parts expression))
+                                          '(do (println :effect) input))
+                 '(clojure.core/float input)]]
+      (is (= :planned-source-floating-completion-form
+             (try (bytecode/compile-planned-source-floating-completion-region
+                   emission bad {:unchecked-math true} guard) nil
+                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))))
+
+(deftest planned-unchecked-float-keeps-the-selected-source-operation
+  (let [{:keys [emission]} (fixture 'Object :float false true 'value)
+        expression (completion/complete-value
+                    (completion/source-floating-cast-contract :unchecked-float
+                                                              {:unchecked-math false}) 'input)
+        region (bytecode/compile-planned-source-floating-completion-region
+                emission expression {:unchecked-math true} (fn []))
+        source-cast (binding [*unchecked-math* false]
+                      (eval '(fn [^Object input] (clojure.core/unchecked-float input))))]
+    (doseq [value [(double -0.0) 1.0e40 Double/NaN]]
+      (is (= (outcome (fn [x _] (source-cast x)) (constantly value))
+             (outcome (fn [x _] ((:invoke region) x)) (constantly value)))))))
+
 (deftest source-float-completion-preserves-overloads-bits-failures-and-evaluation
   (doseq [operation [:float :unchecked-float]
           frozen [false true :warn-on-boxed]

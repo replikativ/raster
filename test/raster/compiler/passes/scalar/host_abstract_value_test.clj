@@ -14,6 +14,16 @@
 (defn- reference-entry [carrier operand]
   (completion/complete-value (completion/bytecode-boxed-parameter-contract carrier) operand))
 
+(deftest opaque-aliases-do-not-manufacture-integral-extent-equalities
+  (let [opaque (av/make {:kind :opaque :memory-space :host :ownership :borrowed})
+        analysis (host-av/analyze-capacities
+                  '(let* [alias input again alias] again)
+                  {:values {'input opaque} :lexical-inputs '[input]})]
+    (is (= opaque (get-in analysis [:definition-values 'alias])))
+    (is (= opaque (get-in analysis [:definition-values 'again])))
+    (is (empty? (:equalities analysis)))
+    (is (empty? (:aliases analysis)) "opaque references are not buffer-capacity aliases")))
+
 (deftest reference-entry-transports-only-existing-compatible-source-capacity
   (doseq [[dtype tag] [[:float 'floats] [:double 'doubles]]]
     (let [input (with-meta 'input {:raster.type/tag tag})

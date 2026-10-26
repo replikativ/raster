@@ -1077,6 +1077,7 @@
                          {:scalar-math (numerics/validate-scalar-math-policy! (:scalar-math opts))})
         initial (invocation-link/validate-ordered-source-actions!
                  (invocation-link/begin-ordered-realization compilation args caller-options))
+        _ (gpu-link/validate-ordered-source-completions! compilation invocation-plan)
         available (materialization/prefix-bindings (:materialization initial))
         buffers (:program-buffers available)
         parameters (:parameters invocation-plan)

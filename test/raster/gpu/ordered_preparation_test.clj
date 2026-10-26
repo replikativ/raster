@@ -2,6 +2,11 @@
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.equation-first :as equation-first]
             [raster.compiler.backend.jvm.typed-scalar :as scalar]
+            [raster.compiler.backend.gpu.parallel-program-c-family :as c-family]
+            [raster.compiler.core.method-entry :as method-entry]
+            [raster.compiler.core.value-completion :as completion]
+            [raster.compiler.ir.abstract-value :as av]
+            [raster.compiler.ir.parallel-program :as program]
             [raster.compiler.ir.invocation-source-order-test :as fixture]
             [raster.compiler.ir.ordered-invocation-realization-test :as allocation-fixture]
             [raster.compiler.ir.invocation-link :as invocation-link]
@@ -12,6 +17,12 @@
             [raster.core :refer [deftm]]
             [raster.par :as par]
             [raster.compiler.passes.scalar.effects :as effects]
+            [raster.compiler.passes.scalar.source-import :as source-import]
+            [raster.compiler.passes.parallel.structured-control-route :as structured]
+            [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
+            [raster.compiler.passes.parallel.typed-soac-resident :as resident]
+            [raster.compiler.passes.parallel.typed-soac-route :as typed-route]
+            [raster.compiler.passes.parallel.terminal-reduction-import-test :as completion-fixture]
             [raster.gpu.compiled :as compiled]
             [raster.gpu.core :as gpu]
             [raster.gpu.link :as link]
@@ -23,6 +34,154 @@
 
 (defn- reason [f]
   (try (f) nil (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+
+(defn- owned-completion-compilation [configuration]
+  (let [{:keys [source-program plan step]}
+        (#'completion-fixture/planned-completion-source configuration)
+        frontend (#'completion-fixture/selected-frontend #'par/sum)
+        adapter (method-entry/call-with-definition-inputs
+                 #(source-import/compile-source-completion-step
+                   {:frontend frontend :source-program source-program :plan plan :step step}))
+        options {:dtype :float :target-dialect :opencl-portable}
+        scheduled (structured/schedule-program source-program options)
+        emitted (:program (c-family/emit-program scheduled options))]
+    {:semantic source-program :scheduled scheduled :emitted emitted :target :ocl:0
+     :source-ns *ns* :source-completion-adapters {(:id step) adapter}}))
+
+(deftest completion-adapter-admission-precedes-session-creation
+  (let [compilation (owned-completion-compilation false)
+        [id adapter] (first (:source-completion-adapters compilation))
+        forbidden (fn [& _] (throw (AssertionError. "invalid adapter opened a session")))]
+    (with-redefs [gpu/make-session forbidden]
+      (is (= :link-ordered-source-completion-adapters
+             (reason #(link/instantiate-ordered-invocation!
+                        (dissoc compilation :source-completion-adapters) [0.25] {}))))
+      (doseq [invalid [(dissoc adapter :receipt)
+                       (assoc-in adapter [:region :invoke] (constantly (float 1.0)))]]
+        (is (= :source-completion-step-correspondence
+               (reason #(link/instantiate-ordered-invocation!
+                          (assoc compilation :source-completion-adapters {id invalid}) [0.25] {}))))))))
+
+(deftest numerical-result-import-remains-refused-before-session-creation
+  ;; A source-translated numerical algorithm with a declarative suspension, not
+  ;; placeholder target operations. There is no claimed payload/transfer authority.
+  (let [reduction '(raster.par/reduce acc 0.0 i 3 (+ acc 1.0))
+        typed (frontend/form->program (list 'let* ['total reduction] 'total) {:dtype :double})
+        [typed _] (resident/realize-source-free-reductions typed ['total])
+        envelope (typed-route/program-envelope typed)
+        producer (assoc (first (:equations envelope)) :site [:binding 'total] :source reduction)
+        snapshot (completion/complete-value completion/object-input-contract 'total)
+        semantic (program/make
+                  {:dialect :typed-parallel
+                   :source (list 'let* ['total reduction 'saved-import snapshot] 'total)
+                   :values (:values envelope) :inputs [] :equations [producer] :outputs '[total]})
+        opaque (av/make {:kind :opaque :memory-space :host :ownership :borrowed})
+        plan (invocation/from-prefix
+              {:id :unimplemented-import :parameters [] :parameter-values {}
+               :bindings [['saved-import snapshot]] :binding-values {'saved-import opaque}
+               :result-imports {'saved-import {:equation (:id producer) :result 'total}}
+               :program-values (:values semantic) :program-inputs [] :program-outputs '[total]})
+        semantic (assoc-in semantic [:attributes :invocation-plan] plan)
+        options {:dtype :double :target-dialect :opencl-portable}
+        emitted (:program (c-family/emit-program (structured/schedule-program semantic options) options))
+        compiled {:semantic semantic :emitted emitted :target :ocl:0}]
+    (is (some :program-result-import (invocation/source-order plan semantic)))
+    (with-redefs [gpu/make-session (fn [& _] (throw (AssertionError. "import acquired resources")))]
+      (is (= :invocation-ordered-source-action
+             (reason #(link/instantiate-ordered-invocation! compiled [] {})))))))
+
+(defn- check-owned-completion-runtime! [target]
+  (doseq [alias? [false true]]
+    (let [compilation (assoc (owned-completion-compilation alias?) :target target)
+          live (link/instantiate-ordered-invocation! compilation [(double -0.0)] {})]
+      (try
+        (dotimes [_ 2]
+          (link/run! live)
+          (let [result (link/download live (first (keys (link/outputs live))))]
+            (is (= (class (float-array 0)) (class result)))
+            (is (= [Integer/MIN_VALUE] (mapv #(Float/floatToRawIntBits %) result)))))
+        (finally (link/close! live))))
+    (let [compilation (assoc (owned-completion-compilation alias?) :target target)
+          live (link/instantiate-ordered-invocation! compilation [Double/MAX_VALUE] {})]
+      (try
+        (is (thrown? IllegalArgumentException (link/run! live)))
+        (is (empty? (get-in @(:execution-state live) [:ordered :roots]))
+            "checked overflow precedes the suffix allocation")
+        (is (nil? (:resident-boundary @(:execution-state live)))
+            "failure publishes no output")
+        (finally (link/close! live)))))
+  (let [compilation (assoc (owned-completion-compilation false) :target target)
+        owner (atom nil)
+        calls (atom 0)
+        invalidate! (fn []
+                      (swap! calls inc)
+                      (swap! (:execution-state @owner) update :value-epoch inc))
+        number (proxy [Number] []
+                 (intValue [] (throw (AssertionError. "wrong conversion")))
+                 (longValue [] (throw (AssertionError. "wrong conversion")))
+                 (floatValue [] (invalidate!) (float 0.25))
+                 (doubleValue [] (invalidate!) (double 0.25)))
+        live (link/instantiate-ordered-invocation! compilation [number] {})]
+    (reset! owner live)
+    (try
+      (is (= :link-ordered-source-completion-epoch (reason #(link/run! live))))
+      (is (pos? @calls) "the callback actually changed the owning invocation epoch")
+      (is (empty? (get-in @(:execution-state live) [:ordered :roots])))
+      (is (nil? (:resident-boundary @(:execution-state live))))
+      (finally (link/close! live)))))
+
+(defn- check-completion-source-order-and-replay! [target]
+  (let [compilation (assoc (owned-completion-compilation {:prefix? true}) :target target)
+        live (link/instantiate-ordered-invocation! compilation
+                                                  [Double/MAX_VALUE (float-array 1)] {})]
+    (try
+      (is (thrown? IllegalArgumentException (link/run! live)))
+      (let [state @(:execution-state live)
+            token (get-in state [:ordered :current :realized :buffers 'early])
+            view (get-in state [:ordered :node-views token])
+            result (float-array 1)]
+        (is (some? view) "the earlier numerical producer actually acquired its storage")
+        (when view
+          (gpu/download-range! (:session live) view result {:elements 1})
+          (is (= [(float 17.0)] (vec result)) "overflow preserves the preceding device write"))
+        (is (= 1 (count (get-in state [:ordered :roots])))
+            "only the prefix buffer exists; suffix allocation did not run")
+        (is (nil? (:resident-boundary state))))
+      (finally (link/close! live))))
+  (let [amount (atom 0.25)
+        calls (atom 0)
+        number (proxy [Number] []
+                 (intValue [] (throw (AssertionError. "wrong conversion")))
+                 (longValue [] (throw (AssertionError. "wrong conversion")))
+                 (floatValue [] (swap! calls inc) (float @amount))
+                 (doubleValue [] (swap! calls inc) (double @amount)))
+        source-cast (binding [*unchecked-math* false]
+                      (eval '(fn [^Object input] (clojure.core/float input))))
+        compilation (assoc (owned-completion-compilation false) :target target)
+        live (link/instantiate-ordered-invocation! compilation [number] {})]
+    (try
+      (doseq [value [0.25 0.75]]
+        (reset! amount value)
+        (reset! calls 0)
+        (let [expected (source-cast number)
+              expected-calls @calls]
+          (reset! calls 0)
+          (link/run! live)
+          (is (= expected-calls @calls) "each replay performs the original source conversion")
+          (is (= [(Float/floatToRawIntBits expected)]
+                 (mapv #(Float/floatToRawIntBits %)
+                       (link/download live (first (keys (link/outputs live)))))))))
+      (finally (link/close! live)))))
+
+(deftest planned-source-completion-runs-at-its-cursor-on-local-backends
+  (if @ocl-probe/opencl-available?
+    (do (check-owned-completion-runtime! :ocl:0)
+        (check-completion-source-order-and-replay! :ocl:0))
+    (ocl-probe/opencl-skip! "owned planned source completion"))
+  (if @ze-probe/gpu-available?
+    (do (check-owned-completion-runtime! :ze:0)
+        (check-completion-source-order-and-replay! :ze:0))
+    (ze-probe/gpu-skip! "owned planned source completion")))
 
 (deftm completed-float-terminal [completed :- Float] :- Float
   (let [out (float-array 1)]

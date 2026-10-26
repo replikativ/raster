@@ -287,7 +287,7 @@
                  (not= expression bound-buffer-source))
           state
           (cond-> (assoc-in state [:values symbol] value)
-            (and (= [] (:shape value))
+            (and (= :tensor (:kind value)) (= [] (:shape value))
                  (contains? #{:int :long} (dtype/canon (:dtype value))))
             (assoc-in [:equalities expression] symbol)))
         state)

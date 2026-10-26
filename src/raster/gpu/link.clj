@@ -1142,6 +1142,24 @@
   (parallel-program/release-prepared! prepared)
   (swap! execution-state update-in [:ordered :prepared] dissoc position))
 
+(defn ^:no-doc validate-ordered-source-completions!
+  "Bind process-local completion executors before any session or captured storage exists.
+   An arbitrary callback map is not an execution capability. The compiler-owned adapter
+   independently checks its exact semantic source program, attached plan and actual step."
+  [compilation plan]
+  (let [steps (filterv invocation/source-completion? (:steps plan))
+        adapters (:source-completion-adapters compilation)]
+    (when-not (and (or (nil? adapters) (map? adapters))
+                   (= (set (keys adapters)) (set (map :id steps))))
+      (throw (ex-info "ordered source completions require exact owner-local adapters"
+                      {:reason :link-ordered-source-completion-adapters})))
+    (when (seq steps)
+      (let [validate! (requiring-resolve
+                       'raster.compiler.passes.scalar.source-import/validate-source-completion-step!)]
+        (doseq [step steps]
+          (validate! (get adapters (:id step)) (:semantic compilation) plan step))))
+    adapters))
+
 (defn- instantiate-ordered-invocation-with!
   "Internal owned-root vertical for source-ordered invocation execution. No source-created
    storage or suffix graph is acquired here. Captured public entries are initialized at binding; dynamic
@@ -1155,6 +1173,7 @@
                     {:reason :link-ordered-options})))
   (let [caller-options (caller-math-options opts)
         initial (invocation-link/validate-ordered-source-actions! (begin-realization caller-options))
+        _ (validate-ordered-source-completions! compilation (get-in initial [:materialization :plan]))
         parameter-defaults (materialization/initial-parameter-arguments (:materialization initial))
         entry-roles (invocation-link/ordered-entry-roles initial (:entry-roles opts))
         entry-layout (invocation-link/ordered-entry-layout initial entry-roles)
@@ -1334,6 +1353,41 @@
       (swap! execution-state assoc :resident-boundary {:plan plan :node-views (:node-views storage)
                                                       :projection (:projection final)}))))
 
+(defn- execute-ordered-source-completion
+  "Execute one authenticated Object -> Float recipe at the current source cursor.
+   Materialization still owns result-Class validation and advancing the prefix."
+  [executable source-state step operands]
+  (let [execution-state (:execution-state executable)
+        initial @execution-state
+        compilation (get-in initial [:ordered :compilation])
+        plan (get-in source-state [:materialization :plan])
+        adapter (get-in compilation [:source-completion-adapters (:id step)])
+        validate! (requiring-resolve
+                   'raster.compiler.passes.scalar.source-import/validate-source-completion-step!)
+        assert-current!
+        (fn []
+          (ensure-live! executable :source-completion)
+          (let [current @execution-state]
+            (when-not (and (= (:value-epoch initial) (:value-epoch current))
+                           (identical? source-state (get-in current [:ordered :current])))
+              (throw (ex-info "source completion lost its current invocation owner"
+                              {:reason :link-ordered-source-completion-epoch}))))
+          (validate! adapter (:semantic compilation) plan step))]
+    (assert-current!)
+    (let [{:keys [symbol value]} (first (:operands step))
+          operand (get operands symbol)]
+      (when-not (and (= 1 (count (:operands step))) (= 1 (count operands))
+                     (materialization/materialized-opaque? operand)
+                     ;; ValueAlias intentionally retains the original opaque wrapper.
+                     ;; Check the exact current slot, not a newly fabricated alias ID.
+                     (identical? operand
+                                 (get-in source-state [:materialization :values value])))
+        (throw (ex-info "planned source completion requires its exact opaque Object operand"
+                        {:reason :link-ordered-source-completion-input})))
+      (let [result ((get-in adapter [:region :invoke]) (:source operand))]
+        (assert-current!)
+        {:type :float :value result}))))
+
 (defn- run-ordered-invocation! [executable]
   (let [execution-state (:execution-state executable)
         {:keys [compilation parameter-arguments caller-options prepared entry-roles entry-refresh initialized]}
@@ -1366,7 +1420,8 @@
                                                                             caller-options))
                   (or (:invocation-step entry) equation)
                   (invocation-link/advance-host-source
-                   state (partial scalar/evaluate-invocation-step (:source-ns compilation))
+                   state {:scalar (partial scalar/evaluate-invocation-step (:source-ns compilation))
+                          :source-completion (partial execute-ordered-source-completion executable state)}
                    (partial scalar/evaluate-host-equation (:source-ns compilation)) caller-options)
                   :else (update state :source-cursor inc))]
             (recur next-state))

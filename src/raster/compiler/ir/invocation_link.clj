@@ -693,6 +693,14 @@
              {:entry entry :destination destination}))
     projection))
 
+(defn- ordered-source-completion?
+  "The planned backend currently implements a single lexical Object -> Float region.
+   Exact operand/source ownership is checked by its owner-local adapter, not this predicate."
+  [step]
+  (and (invocation/source-completion? step)
+       (= :float (get-in step [:value :dtype]))
+       (= 1 (count (:operands step)))))
+
 (defn ^:no-doc validate-ordered-source-actions!
   "Check structural executor coverage after begin-ordered-realization, before capture or source
    effects. This evaluates no source operand, acquires no storage and grants no completion proof.
@@ -714,6 +722,7 @@
                 (and step (not (or (invocation/scalar-compute? step)
                                   (invocation/shape-projection? step)
                                   (invocation/value-alias? step)
+                                  (ordered-source-completion? step)
                                   (and (:storage entry) (invocation/buffer-allocation? step))))))
         (fail! :invocation-ordered-source-action
                "ordered source entry requires an unimplemented realization action" {:entry entry}))
@@ -777,7 +786,8 @@
                        (and (= (:invocation-step entry) (:id step))
                             (or (invocation/scalar-compute? step)
                                 (invocation/shape-projection? step)
-                                (invocation/value-alias? step))))
+                                (invocation/value-alias? step)
+                                (ordered-source-completion? step))))
                    (or (not (:equation entry))
                        (and equation (true? (get-in equation [:attributes :host-only]))))
                    (or step equation))
