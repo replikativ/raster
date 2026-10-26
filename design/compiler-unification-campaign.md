@@ -99,6 +99,29 @@ composition failures or the original campaign. Uncached source-action compilatio
 currently pays one semantic discovery pass; measure that cost before adding a
 non-preparing readiness query or any persistent cache.
 
+Deferred-composition foundations now share semantic intent normalization between
+the existing eager path and the future deferred path, without treating that
+transient map as a physical certificate. Eager composition retains concrete-plan,
+donor-node identity and low-level alias/effect/shape verification. The existing
+ordered runtime separates fragment preparation from execution/release; execution
+checks actual readiness and exact prepared-ledger ownership, while source result
+retention, completed-write credit and cursor advancement remain in the original
+stage owner. Occupied, foreign and stale prepared slots refuse before mutation.
+Existing early-stage device fixtures now use retained ProgramLinkInstances and
+checked source spans instead of the retired graph-shaped intermediate.
+The affected composition/ordered/device gate passes 62 tests / 800 assertions
+in the capped REPL; independent cross-reviews found no blockers. This refactor
+does not yet enable deferred composition.
+
+Exact-head `3205e0330` CI remains red. Unit job 35064 has 15 completed shards:
+7,167 tests, 91,266 passing assertions, 22 failures and 41 errors across 51 Vars;
+shard 3 is incomplete with 309 observed Vars. CPU-OpenCL job 35063 has four
+completed shards: 673 tests, 8,394 passing assertions, 9 failures and 32 errors
+across 39 Vars. New emitted-source-region/boundary failures require diagnosis;
+the artifact-extraction path also needs the graph's scalar equality obligations
+transported into independently callable leaf artifacts. Neither is waived by
+the affected green gates above.
+
 The October 25 independent review keeps all eight original campaign objectives.
 The numerical IR is compositional; the source-execution and public ownership
 boundary is not yet uniformly compositional. Consolidate the common boundary

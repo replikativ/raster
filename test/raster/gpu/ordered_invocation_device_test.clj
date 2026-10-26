@@ -4,6 +4,7 @@
             [raster.compiler.backend.jvm.typed-scalar :as scalar]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.invocation-link :as invocation-link]
+            [raster.compiler.ir.link-plan :as link-plan]
             [raster.compiler.ir.invocation-source-order-test :as fixture]
             [raster.compiler.ir.ordered-invocation-realization-test :as allocation-fixture]
             [raster.compiler.fixtures.symbolic-storage :as symbolic-storage]
@@ -13,6 +14,22 @@
             [raster.gpu.device-probe :as ocl-probe]
             [raster.gpu.link :as link]
             [raster.gpu.parallel-program :as program]))
+
+(defn- run-retained-stage! [ready session execution-id storage ledger consume]
+  (let [plan (:stage-plan ready)
+        executor (link/resident-program-executor
+                  plan session execution-id (:node-views storage) false false ledger)
+        prepared (program/prepare-sequence-with-retained-programs!
+                  (mapv (fn [instance]
+                          {:id (:id instance) :kind :program :call (:call instance)})
+                        (:instances plan))
+                  executor
+                  (link-plan/retained-program-validations! plan (:effect-evidence ready) nil)
+                  nil)]
+    (try
+      (program/run-prepared! prepared)
+      (consume)
+      (finally (program/release-prepared! prepared)))))
 
 (defn- run-early-stage! [target]
   (let [source (double-array [7.0])
@@ -29,17 +46,9 @@
         timings (volatile! {})]
     (try
       (let [storage (link/realize-plan-storage!
-                     plan session :early-stage (link/allocation-groups plan) {} ledger timings)
-            executor (link/resident-program-executor
-                      plan session :early-stage (:node-views storage) false false ledger)
-            call (:call ready)
-            prepared (program/prepare-sequence-with!
-                      [{:id :early :kind :graph
-                        :call {:graph (:graph call) :bindings (:buffers call)
-                               :scalar-values (:scalar-values call)}}]
-                      executor)]
-        (try
-          (program/run-prepared! prepared)
+                     plan session :early-stage (link/allocation-groups plan) {} ledger timings)]
+        (run-retained-stage! ready session :early-stage storage ledger
+         (fn []
           (let [output-id (first (:outputs plan))
                 first-result (double-array 1)
                 after-reuse (double-array 1)]
@@ -61,7 +70,9 @@
             (let [checks (atom 0)]
               (is (thrown? ArithmeticException
                            (invocation-link/advance-host-source
-                            (-> (:state ready) (dissoc :pending) (assoc :source-cursor 1))
+                            (-> (:state ready) (dissoc :pending)
+                                (assoc :source-cursor
+                                       (invocation-link/ordered-stage-source-end initial (:state ready))))
                             (fn [step operands]
                               (swap! checks inc)
                               (scalar/evaluate-invocation-step (:source-ns compilation) step operands))
@@ -70,8 +81,7 @@
               (is (= 2 (count @ledger)) "the failed check acquired no suffix root")
               (gpu/download-range! session (get-in storage [:node-views output-id])
                                    after-reuse {:elements 1})
-              (is (= [8.0] (vec after-reuse)) "the late failure preserves completed earlier writes")))
-          (finally (program/release-prepared! prepared))))
+              (is (= [8.0] (vec after-reuse)) "the late failure preserves completed earlier writes"))))))
       (finally (gpu/close-session! session)))))
 
 (deftest opencl-early-stage-completes-without-materializing-the-late-overflow
@@ -143,17 +153,8 @@
           (let [storage (link/realize-plan-storage!
                          plan session :source-position (link/allocation-groups plan) {} ledger timings)
                 run-stage! (fn [ready storage]
-                             (let [call (:call ready)
-                                   executor (link/resident-program-executor
-                                             (:stage-plan ready) session :source-position
-                                             (:node-views storage) false false ledger)
-                                   prepared (program/prepare-sequence-with!
-                                             [{:id :source-stage :kind :graph
-                                               :call {:graph (:graph call) :bindings (:buffers call)
-                                                      :scalar-values (:scalar-values call)}}]
-                                             executor)]
-                               (try (program/run-prepared! prepared)
-                                    (finally (program/release-prepared! prepared)))))
+                             (run-retained-stage! ready session :source-position storage ledger
+                                                  (constantly nil)))
                 checks (atom 0)
                 evaluate (fn [expression scalars]
                            (swap! checks inc)
@@ -164,7 +165,8 @@
             ;; not evidence that public LinkedExecutable already drives the source cursor.
             (let [state (-> (:state early)
                             (dissoc :pending)
-                            (assoc :source-cursor 1 :acquired-storage (set (keys (:roots storage)))))
+                            (assoc :source-cursor (invocation-link/ordered-stage-source-end initial (:state early))
+                                   :acquired-storage (set (keys (:roots storage)))))
                   early-view (get-in storage [:node-views (first (:outputs plan))])]
               (if (neg? n)
                 (do
@@ -182,10 +184,11 @@
                   (is (= (vec (repeat n 0.0)) (download session output-view n)))
                   (let [next-state (-> (:state allocation)
                                        (dissoc :pending)
-                                       (assoc :source-cursor 2
-                                              :acquired-storage (set (keys (:roots acquired)))))
+                                       (update :source-cursor inc)
+                                       (assoc :acquired-storage (set (keys (:roots acquired)))))
                         suffix (invocation-link/realize-ready-equation
-                                next-state (:equation (nth (:source-order next-state) 2)) nil)
+                                next-state (:equation (nth (:source-order next-state)
+                                                           (:source-cursor next-state))) nil)
                         suffix-storage (link/realize-plan-storage!
                                         (:stage-plan suffix) session :source-position
                                         (link/allocation-groups (:stage-plan suffix)) {} ledger timings

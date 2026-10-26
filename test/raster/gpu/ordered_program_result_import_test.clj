@@ -14,6 +14,7 @@
             [raster.compiler.ir.invocation-plan :as invocation]
             [raster.compiler.ir.invocation-materialization :as materialization]
             [raster.compiler.ir.invocation-link :as invocation-link]
+            [raster.compiler.ir.link-plan :as link-plan]
             [raster.compiler.passes.scalar.source-import :as source-import]
             [raster.compiler.passes.parallel.structured-control-route :as structured]
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
@@ -24,10 +25,92 @@
             [raster.gpu.device-probe :as ocl-probe]
             [raster.gpu.resource-cleanup :as cleanup]
             [raster.gpu.link :as link]
+            [raster.gpu.parallel-program :as parallel-program]
             [raster.dl.gpu-grad-parity :as ze-probe]))
 
 (defn- reason [f]
   (try (f) nil (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+
+(deftest prepared-fragments-recheck-actual-readiness-and-always-release
+  ;; Dispatch/lifecycle only: stand-in bindings grant no program validation or
+  ;; device authority. Real view geometry still drives the initialization guard.
+  (doseq [mode [:uninitialized :success :run-failure]]
+    (let [allocation (view/allocation {:id :storage :byte-size 8 :device :ocl:0
+                                       :memory-space :global :alignment 8
+                                       :coherence :explicit-transfer :ownership :owned})
+          descriptor (view/view allocation {:id :root :dtype :double :shape [1]})
+          source (Object.)
+          initialized (if (= mode :uninitialized) [] [descriptor])
+          state (atom {:ordered {:execution-id :execution :ledger (volatile! [])
+                                 :caller-options {} :initialized initialized :prepared {}
+                                 :current source :completed-results
+                                 {:result {:view descriptor :resident-ready? true}}}})
+          executable {:execution-state state :session (atom {})}
+          plan {:instances [(link-plan/map->ProgramLinkInstance {:id :stage :call :stand-in})]
+                :nodes {:root {:view descriptor}} :aliases #{}}
+          contract {:requires #{:root} :writes #{:root} :full-produces #{:root}}
+          packet (Object.)
+          primary (ex-info "run failed" {:reason :test-run})
+          secondary (ex-info "release failed" {:reason :test-release})
+          acquisitions (atom 0)
+          events (atom [])]
+      (with-redefs-fn
+        {#'link/acquire-ordered-storage! (fn [& _] (swap! acquisitions inc) {:node-views {}})
+         #'link/resident-program-executor (fn [& _] :executor)
+         #'link-plan/retained-program-validations! (fn [& _] :validations)
+         #'parallel-program/prepare-sequence-with-retained-programs!
+         (fn [& _] (swap! events conj :prepare) packet)
+         #'parallel-program/run-prepared!
+         (fn [actual]
+           (is (identical? packet actual))
+           (is (false? (get-in @state [:ordered :completed-results :result :resident-ready?])))
+           (swap! events conj :run)
+           (when (= mode :run-failure) (throw primary)))
+         #'parallel-program/release-prepared!
+         (fn [actual]
+           (is (identical? packet actual))
+           (swap! events conj :release)
+           (when (= mode :run-failure) (throw secondary)))}
+        (fn []
+          ;; Predicted contract flow can permit preparation, never execution.
+          (let [fragment (#'link/prepare-ordered-program-fragment!
+                          executable plan :evidence contract :position [descriptor])]
+            (is (= initialized (get-in @state [:ordered :initialized])))
+            (is (identical? packet (get-in @state [:ordered :prepared :position])))
+            (is (= :link-ordered-prepared-position
+                   (reason #(#'link/prepare-ordered-program-fragment!
+                             executable plan :evidence contract :position [descriptor]))))
+            (is (= 1 @acquisitions))
+            (is (= :link-ordered-prepared-owner
+                   (reason #(#'link/run-ordered-program-fragment!
+                             executable (assoc fragment :prepared (Object.))))))
+            (is (= [:prepare] @events))
+            (is (identical? packet (get-in @state [:ordered :prepared :position])))
+            (is (true? (get-in @state [:ordered :completed-results :result :resident-ready?])))
+            (let [error (try (#'link/run-ordered-program-fragment! executable fragment)
+                             nil (catch Throwable error error))]
+              (case mode
+                :uninitialized
+                (do (is (= :link-ordered-uninitialized (:reason (ex-data error))))
+                    (is (= [:prepare :release] @events))
+                    (is (true? (get-in @state [:ordered :completed-results :result :resident-ready?]))))
+                :success
+                (do (is (nil? error)) (is (= [:prepare :run :release] @events)))
+                :run-failure
+                (do (is (identical? primary error))
+                    (is (= [secondary] (vec (.getSuppressed primary))))
+                    (is (= [:prepare :run :release] @events)))))
+            ;; A failed release remains owned for existing cleanup retry.
+            (is (= (= mode :run-failure)
+                   (contains? (get-in @state [:ordered :prepared]) :position)))
+            (when-not (= mode :run-failure)
+              (let [before @events]
+                (is (= :link-ordered-prepared-owner
+                       (reason #(#'link/run-ordered-program-fragment! executable fragment))))
+                (is (= before @events))
+                (is (empty? (get-in @state [:ordered :prepared])))))
+            (is (= initialized (get-in @state [:ordered :initialized])))
+            (is (identical? source (get-in @state [:ordered :current])))))))))
 
 (deftest import-table-preflight-requires-exact-keys-and-delegates-owner-validation
   ;; This tests dispatch/preflight only: the stand-in validator grants no actual

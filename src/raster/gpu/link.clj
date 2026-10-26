@@ -1366,23 +1366,26 @@
                                     (bview/overlapping-id-pairs
                                      (map (juxt :id :view) (:nodes layout)))))))
 
-(defn- run-ordered-stage! [executable ready]
+(defn- prepare-ordered-program-fragment!
+  "Acquire/bind one checked program fragment, but never submit or credit its writes.
+   An optional preparation-only initialized set may describe preceding contract flow;
+   the run helper must independently gate execution on ACTUAL runtime readiness."
+  ([executable plan effect-evidence entry-contract position]
+   (prepare-ordered-program-fragment! executable plan effect-evidence entry-contract position nil))
+  ([executable plan effect-evidence entry-contract position preparation-initialized]
   (let [execution-state (:execution-state executable)
-        source-state (get-in @execution-state [:ordered :current])
-        source-end (invocation-link/ordered-stage-source-end source-state (:state ready))
-        epoch (:value-epoch @execution-state)
-        replay (get-in @execution-state [:ordered :import-replay])
         {:keys [execution-id ledger caller-options]} (:ordered @execution-state)
-        plan (:stage-plan ready)
+        _ (when (contains? (get-in @execution-state [:ordered :prepared]) position)
+            (throw (ex-info "ordered fragment position already owns prepared resources"
+                            {:reason :link-ordered-prepared-position :position position})))
         _ (when-not (and (seq (:instances plan))
                          (every? link-plan/program-link-instance? (:instances plan)))
             (throw (ex-info "ordered numerical stages require checked program instances"
                             {:reason :link-ordered-stage-kind})))
         storage (acquire-ordered-storage! executable (:nodes plan) (:aliases plan))
-        initialized (get-in @execution-state [:ordered :initialized])
+        initialized (or preparation-initialized (get-in @execution-state [:ordered :initialized]))
         _ (ordered-require-initialized! (:nodes plan) initialized
-                                       (get-in ready [:entry-contract :requires]))
-        position (get-in ready [:state :source-cursor])
+                                       (:requires entry-contract))
         executor (resident-program-executor plan (:session executable) execution-id
                                             (:node-views storage) false false ledger)
         instances (mapv (fn [instance]
@@ -1390,13 +1393,28 @@
                         (:instances plan))
         prepared (parallel-program/prepare-sequence-with-retained-programs!
                   instances executor
-                  (link-plan/retained-program-validations! plan (:effect-evidence ready) caller-options)
-                  caller-options)
-        failure (volatile! nil)]
+                  (link-plan/retained-program-validations! plan effect-evidence caller-options)
+                  caller-options)]
     (swap! execution-state assoc-in [:ordered :prepared position] prepared)
+    {:plan plan :position position :prepared prepared :entry-contract entry-contract})))
+
+(defn- run-ordered-program-fragment!
+  "Run/release an already bound fragment only after checking actual initialized views.
+   Preparation, node roles and predicted contract flow are never execution permission.
+   Source cursor advancement, result imports and completed-write credit belong to the caller."
+  [executable {:keys [plan position prepared entry-contract]}]
+  (let [execution-state (:execution-state executable)
+        _ (when-not (and (contains? (get-in @execution-state [:ordered :prepared]) position)
+                         (identical? prepared (get-in @execution-state [:ordered :prepared position])))
+            (throw (ex-info "ordered fragment must retain its exact prepared resource owner"
+                            {:reason :link-ordered-prepared-owner :position position})))
+        failure (volatile! nil)]
     (try
+      (ordered-require-initialized! (:nodes plan)
+                                    (get-in @execution-state [:ordered :initialized])
+                                    (:requires entry-contract))
       (invalidate-ordered-result-reads!
-       execution-state (map #(get-in plan [:nodes % :view]) (get-in ready [:entry-contract :writes])))
+       execution-state (map #(get-in plan [:nodes % :view]) (:writes entry-contract)))
       (parallel-program/run-prepared! prepared)
       (catch Throwable error (vreset! failure error) (throw error))
       (finally
@@ -1404,7 +1422,19 @@
              (catch Throwable error
                (if-let [primary @failure]
                  (when-not (identical? primary error) (.addSuppressed primary error))
-                 (throw error))))))
+                 (throw error))))))))
+
+(defn- run-ordered-stage! [executable ready]
+  (let [execution-state (:execution-state executable)
+        source-state (get-in @execution-state [:ordered :current])
+        source-end (invocation-link/ordered-stage-source-end source-state (:state ready))
+        epoch (:value-epoch @execution-state)
+        replay (get-in @execution-state [:ordered :import-replay])
+        plan (:stage-plan ready)
+        fragment (prepare-ordered-program-fragment!
+                  executable plan (:effect-evidence ready) (:entry-contract ready)
+                  (get-in ready [:state :source-cursor]))]
+    (run-ordered-program-fragment! executable fragment)
     (retain-ordered-result-completions! executable ready source-state epoch replay)
     ;; run-prepared! is synchronous. Only now may the source cursor and initialized postcondition
     ;; advance; having bound a graph or acquired its storage never supplies this evidence.

@@ -1478,28 +1478,18 @@
                        :available (mapv :key entries)})))
     (first matches)))
 
-(defn- compose-for-request
-  "Compose independently lowered Prepared artifacts through semantic boundary keys.
+(defn- normalize-composition-intent!
+  "Resolve and validate the semantic boundary of a Prepared composition.
 
-   Request shape:
-   {:id stable-id
-    :components [{:id component-id :program prepared} ...]
-    :connections [{:from [producer-id output-key] :to [consumer-id input-key]} ...]
-    :shares [[[component-id input-or-constant-key] ...] ...]
-    :mutable-shares [{:owner [component-id donated-input-key]
-                      :borrowers [[component-id read-only-input-key] ...]
-                      :output [component-id donated-output-key]} ...]
-    :outputs [{:key composite-output-key :from [component-id output-key]} ...]}
-
-   Remaining component inputs are exposed under `[component-id input-key]`. Composition happens
-   before allocation, so connected intermediates and shared constants have one physical
-   allocation. Explicit mutable sharing retains one donated state owner, removes borrower input
-   refresh, and exports its final state. Constants cannot be mutable borrowers; ranged views and
-   escaped earlier aliases remain rejected. One linked executable owns replay and output leases."
+   This transient normalization deliberately stops before concrete LinkPlan nodes and is not a
+   certificate. An ordered semantic preparation can therefore contribute value-bearing boundary
+   entries without those values being treated as physical nodes. The eager composition path
+   separately requires concrete preparations and projects these resolved entries into the
+   low-level node composition."
   [{:keys [id components connections shares mutable-shares outputs attributes]
-    :or {connections [] shares [] mutable-shares [] attributes {}}} options]
-  (let [preparation-started (System/nanoTime)
-        caller-options (when (contains? options :scalar-math)
+    :or {connections [] shares [] mutable-shares [] attributes {}}}
+   options]
+  (let [caller-options (when (contains? options :scalar-math)
                          {:scalar-math (numerics/validate-scalar-math-policy! (:scalar-math options))})
         components (mapv (fn [component]
                            (when-not (and (map? component) (contains? component :id)
@@ -1508,7 +1498,6 @@
                                      "each compiled component requires :id and a Prepared :program"
                                      {:reason :compiled-composition-component
                                       :component component})))
-                           (require-concrete-preparation! (:program component) :compose)
                            (when (and (some? (:math-request (:program component))) (nil? caller-options))
                              (throw (ex-info "contextual composition requires independent caller math intent"
                                              {:reason :compiled-composition-math-request
@@ -1527,7 +1516,6 @@
             (throw (ex-info "compiled component identities must be unique"
                             {:reason :compiled-composition-component-ids
                              :ids (mapv :id components)})))
-        donated-components (filterv (comp seq :donated :program) components)
         resolved-connections
         (mapv (fn [{:keys [from to]}]
                 {:from from :to to
@@ -1568,7 +1556,6 @@
                             (= (first owner) (first output))
                             (= (get-in component-map [(first owner) :donated (second owner)])
                                (second output))
-                            (= (:node owner-entry) (:node output-entry))
                             (every? #(= :input (:role %)) borrower-entries)
                             (= 1 (count selected)))
                (throw (ex-info "mutable sharing must retain a donated owner and its final output"
@@ -1576,17 +1563,59 @@
              {:owner owner :owner-entry owner-entry
               :borrowers (mapv (fn [reference entry] {:reference reference :entry entry})
                                borrowers borrower-entries)
-              :output output :output-entry output-entry :output-key (:key (first selected))}))
+              :output output :output-entry output-entry :output-key (:key (first selected))
+              :specification binding}))
          mutable-shares)
         donation-owners (mapv :owner resolved-mutable-shares)
         component-donations
-        (set (for [{component-id :id program :program} donated-components
-                   key (keys (:donated program))] [component-id key]))
-        _ (when-not (and (= (count donation-owners) (count (distinct donation-owners)))
-                         (= component-donations (set donation-owners)))
-            (throw (ex-info "every component donation requires exactly one mutable owner binding"
-                            {:reason :compiled-composition-donation
-                             :expected component-donations :owners donation-owners})))
+        (set (for [{component-id :id program :program} components
+                   key (keys (:donated program))] [component-id key]))]
+    (when-not (and (= (count donation-owners) (count (distinct donation-owners)))
+                   (= component-donations (set donation-owners)))
+      (throw (ex-info "every component donation requires exactly one mutable owner binding"
+                      {:reason :compiled-composition-donation
+                       :expected component-donations :owners donation-owners})))
+    {:id id
+     :components components
+     :component-map component-map
+     :connections resolved-connections
+     :shares resolved-shares
+     :mutable-shares resolved-mutable-shares
+     :outputs output-specs
+     :attributes attributes
+     :caller-options caller-options}))
+
+(defn- compose-for-request
+  "Compose independently lowered Prepared artifacts through semantic boundary keys.
+
+   Request shape:
+   {:id stable-id
+    :components [{:id component-id :program prepared} ...]
+    :connections [{:from [producer-id output-key] :to [consumer-id input-key]} ...]
+    :shares [[[component-id input-or-constant-key] ...] ...]
+    :mutable-shares [{:owner [component-id donated-input-key]
+                      :borrowers [[component-id read-only-input-key] ...]
+                      :output [component-id donated-output-key]} ...]
+    :outputs [{:key composite-output-key :from [component-id output-key]} ...]}
+
+   Remaining component inputs are exposed under `[component-id input-key]`. Composition happens
+   before allocation, so connected intermediates and shared constants have one physical
+   allocation. Explicit mutable sharing retains one donated state owner, removes borrower input
+   refresh, and exports its final state. Constants cannot be mutable borrowers; ranged views and
+   escaped earlier aliases remain rejected. One linked executable owns replay and output leases."
+  [request options]
+  (let [preparation-started (System/nanoTime)
+        {:keys [id components connections shares mutable-shares outputs attributes caller-options]}
+        (normalize-composition-intent! request options)
+        _ (doseq [{:keys [program]} components]
+            (require-concrete-preparation! program :compose))
+        ;; Node identity is a concrete suffix obligation. Semantic normalization intentionally
+        ;; neither requires nor fabricates it for ordered, value-bearing boundaries.
+        _ (doseq [{:keys [owner-entry output-entry specification]} mutable-shares]
+            (when-not (= (:node owner-entry) (:node output-entry))
+              (throw (ex-info "mutable sharing must retain a donated owner and its final output"
+                              {:reason :compiled-composition-mutable-owner
+                               :binding specification}))))
         prevalidated? (every? (comp sealed-artifact? :program) components)
         compose-lowering (if prevalidated?
                            link-composition/compose-prevalidated
@@ -1604,22 +1633,22 @@
           :connections (mapv (fn [{:keys [from to from-entry to-entry]}]
                                {:from [(first from) (:node from-entry)]
                                 :to [(first to) (:node to-entry)]})
-                             resolved-connections)
+                             connections)
           :shares (mapv (fn [group]
                           (mapv (fn [{:keys [reference entry]}]
                                   [(first reference) (:node entry)])
                                 group))
-                        resolved-shares)
+                        shares)
           :mutable-shares
           (mapv (fn [{:keys [owner owner-entry borrowers output output-entry]}]
                   {:owner [(first owner) (:node owner-entry)]
                    :borrowers (mapv (fn [{:keys [reference entry]}]
                                       [(first reference) (:node entry)]) borrowers)
                    :output [(first output) (:node output-entry)]})
-                resolved-mutable-shares)
+                mutable-shares)
           :outputs (mapv (fn [{:keys [from entry]}]
                            [(first from) (:node entry)])
-                         output-specs)
+                         outputs)
           :attributes attributes})
         node-mapping (get-in low-level [:certificate :node-mapping])
         mapped-node (fn [component-id node-id]
@@ -1628,10 +1657,10 @@
                                   "certified semantic node disappeared during composition"
                                   {:reason :compiled-composition-node
                                    :component component-id :node node-id}))))
-        consumed-inputs (set (map :to resolved-connections))
+        consumed-inputs (set (map :to connections))
         discarded-shares (set (mapcat (fn [group] (map :reference (rest group)))
-                                      resolved-shares))
-        borrowed-inputs (set (mapcat #(map :reference (:borrowers %)) resolved-mutable-shares))
+                                      shares))
+        borrowed-inputs (set (mapcat #(map :reference (:borrowers %)) mutable-shares))
         in-tree
         (vec
          (for [{component-id :id program :program} components
@@ -1651,7 +1680,7 @@
         (mapv (fn [{:keys [key from entry]}]
                 (assoc entry :key key :sym [(first from) (:sym entry)] :from :composed
                        :node (mapped-node (first from) (:node entry))))
-              output-specs)
+              outputs)
         descriptor {:all-params [] :array-params [] :scalar-params []
                     :steps (vec (mapcat (comp :steps :descriptor :program) components))
                     :result-sym nil :composite? true}
@@ -1666,7 +1695,7 @@
                 :instances (count (get-in low-level [:plan :instances]))}]
     (seal-artifact
      (cond-> (->Prepared low-level in-tree out-tree
-                 (into {} (map (juxt :owner :output-key)) resolved-mutable-shares)
+                 (into {} (map (juxt :owner :output-key)) mutable-shares)
                  schedules (:target (:plan low-level))
                  descriptor [] report nil)
        caller-options (assoc :math-request caller-options)))))
