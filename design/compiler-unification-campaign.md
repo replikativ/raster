@@ -86,6 +86,12 @@ The complete affected pure suites pass 22 tests / 194 assertions. Existing
 ordered root/device suites separately pass 13 tests / 632 assertions on the local
 backends. These gates qualify the descriptor seam and preserve host behavior;
 the actual resident transfer/replay integration remains unfinished.
+The projection also returns its canonical `:resident-realized` storage mapping.
+This remains conditional metadata, not acquired or initialized state: runtime
+may install the exact mapping and credit acquisition only after the corresponding
+refresh succeeds. Acquired tokens must have their matching realized storage
+binding; the runtime must not reconstruct this private schema independently.
+The expanded pure gate passes 22 tests / 200 assertions.
 
 The next address-proof repair must transport exact integral InvocationPlan
 producer relationships into sliced scheduled bodies as executable equality

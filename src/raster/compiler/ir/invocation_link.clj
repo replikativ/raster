@@ -1154,7 +1154,8 @@
         tokens (vec (distinct (map (comp :id val) selected)))
         layout (storage-link-layout realized scalars (:target state) #{} tokens)
         nodes (into {} (map (juxt :id #(assoc % :role :input))) (:nodes layout))]
-    (into {}
+    {:realized realized
+     :inputs (into {}
           (map (fn [token]
                  (let [entries (filterv (fn [[_ buffer]] (= token (:id buffer))) selected)
                        buffers (mapv val entries)
@@ -1165,7 +1166,7 @@
                             {:storage token :values (mapv first entries)}))
                    [token {:storage token :values (mapv first entries)
                            :parameter (:id buffer) :buffer buffer :node (get nodes token)}]))
-          tokens))))
+          tokens))}))
 
 (defn- checked-ordered-input-preflight
   [state arguments roles replacements resident-values]
@@ -1225,7 +1226,9 @@
                  (materialization/source-free-parameter-state
                   (:materialization host-state) parameter-ids))
           host-state)
-        checked (ordered-entry-buffers checked-state)]
+        checked (ordered-entry-buffers checked-state)
+        resident (when (seq resident-values)
+                   (resident-input-descriptors checked-state checked resident-values))]
     (validate-ordered-entry-aliases! checked roles)
     (doseq [[id buffer] buffers
             :let [actual (get checked id)]]
@@ -1234,9 +1237,8 @@
         (fail! :invocation-ordered-input-specialization
                "input replacement cannot change the prepared storage specialization" {:value id})))
     {:state checked-state :parameter-arguments arguments
-     :resident-inputs (if (seq resident-values)
-                        (resident-input-descriptors checked-state checked resident-values)
-                        {})}))
+     :resident-inputs (or (:inputs resident) {})
+     :resident-realized (or (:realized resident) {:buffers {} :storage {} :loop-scratch {}})}))
 
 (defn ^:no-doc ordered-input-initial-state
   "Preflight host replacements plus a set of separately owned resident public inputs.
@@ -1245,11 +1247,13 @@
    must be consumed directly, once, by its runtime owner. `:resident-inputs` contains only exact
    backend-neutral storage/LinkNode descriptors. It carries no DeviceArray, native handle, source
    bytes, readiness, initialization credit or lifetime proof. The runtime must independently
-   validate and refresh every resident descriptor before executing this state."
+   validate and refresh every resident descriptor before executing this state. `:resident-realized`
+   is the canonical logical storage projection only; install it after successful runtime refresh,
+   never as initialization or acquisition evidence."
   [state arguments roles replacements resident-values]
   (assert-resident-input-state-pristine! state)
   (select-keys (checked-ordered-input-preflight state arguments roles replacements resident-values)
-               [:state :resident-inputs]))
+               [:state :resident-inputs :resident-realized]))
 
 (defn ^:no-doc ordered-input-arguments
   "Preflight primitive host-array replacements without evaluating source steps or mutating an

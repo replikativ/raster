@@ -91,7 +91,7 @@
   (let [{:keys [state arguments]} (fixture)
         roles {'input :input 'output :state}
         original (get (link/ordered-entry-buffers state) 'input)
-        {:keys [state resident-inputs]}
+        {:keys [state resident-inputs resident-realized]}
         (link/ordered-input-initial-state state arguments roles {} #{'input})
         current (get (link/ordered-entry-buffers state) 'input)
         descriptor (get resident-inputs (:id original))]
@@ -106,6 +106,12 @@
     (is (= (:shape original) (get-in descriptor [:node :view :shape])))
     (is (not (contains? descriptor :initialized)))
     (is (not (contains? descriptor :ready?)))
+    (is (= (:id original) (get-in resident-realized [:buffers 'input])))
+    (is (= #{'input} (get-in resident-realized [:storage (:id original) :compiler-values])))
+    (is (nil? (get-in resident-realized [:storage (:id original) :source])))
+    (is (= :unspecified (get-in resident-realized [:storage (:id original) :initialization])))
+    (is (empty? (:acquired-storage state)))
+    (is (empty? (get-in state [:realized :storage])))
     (is (= :invocation-materialization-source-free-arguments
            (reason #(materialization/initial-parameter-arguments (:materialization state)))))))
 
