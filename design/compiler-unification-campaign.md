@@ -211,8 +211,9 @@ The warm affected gate passes 33 tests / 366 assertions, including both complete
 source/allocation namespaces and existing flat/loop fragment controls. The real
 mixed-attention/projection test additionally passes 24 assertions on both local
 OpenCL and Level Zero, covering reference/cooperative schedules, replay and the
-initialized empty row. Independent fresh qualification and full CI remain
-separate gates. The allocation-witness test now explicitly distinguishes the
+initialized empty row. Independent clean qualification at `ccc366154` passes
+the same 34 tests / 390 assertions, with both actual local backends required and
+available. Full CI remains a separate gate. The allocation-witness test now explicitly distinguishes the
 numerical traversal output from the promoted whole-buffer source return; its
 constructor execution and allocation-tampering controls are retained.
 
@@ -221,6 +222,28 @@ all eight objectives. Its next structural unit remains the consumed source/
 component assembler, followed by actual result import/completion/publication and
 then deferred resident composition. This fragment repair closes a demonstrated
 context-loss bug in that existing execution machinery, not those larger gaps.
+
+### Timeout diagnostics preserve incomplete CI evidence (October 25)
+
+The timed runner previously wrote its artifact only while unwinding. A process
+killed by CircleCI's no-output timeout therefore left no timing report at all.
+It now atomically publishes a full running snapshot initially and at namespace
+boundaries, then the completed/aborted report in the normal final path. A separate
+constant-size `.progress` file records the latest observed load/namespace/Var
+event and the same fresh run ID. It does not assert a unique active Var when
+callbacks nest or overlap. Publication is serialized locally to the run; no
+periodic output or per-assertion/per-Var full serialization is introduced.
+
+Neither a running snapshot nor a progress event is completion or passing
+authority. Timing-weight import now requires an explicit completed report;
+running, aborted and missing-state reports refuse. Use fresh artifact paths for
+each run (as CI does), or match the run ID: if all new writes fail, an older
+completed artifact must not be attributed to the current process. Publication
+and diagnostic-output failures preserve the original runner result/exception,
+with at most one persistence warning. The focused runner/sharding gate passes
+19 tests / 128 assertions, including mid-run reads, full-write counts and combined
+file/output failure controls. This improves diagnosis of the recurrent shard-3
+timeout; it does not resolve GSDM compile cost or establish complete coverage.
 
 ### Whole-buffer source-return correction (October 25, branch qualification)
 

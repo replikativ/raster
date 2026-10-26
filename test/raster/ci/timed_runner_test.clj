@@ -6,6 +6,10 @@
             [cognitect.test-runner :as runner]
             [raster.ci.timed-runner :as timed]))
 
+(defn- delete-timing-report! [file]
+  (io/delete-file (str file ".progress") true)
+  (io/delete-file file true))
+
 (deftest timing-preserves-results-and-records-exceptions
   (let [times (atom {})]
     (is (= :result (timed/measured times [:ok] (constantly :result))))
@@ -29,7 +33,7 @@
         (is (= :completed (:run-state report)))
         (is (= summary (:summary report))
             "a completed failing run is not reported as an aborted run"))
-      (finally (io/delete-file file)))))
+      (finally (delete-timing-report! file)))))
 
 (deftest compiled-progress-is-bounded-and-cannot-change-the-test-result
   (let [timings (atom {})
@@ -67,7 +71,7 @@
         (is (= :aborted (:run-state report)))
         (is (= {:class "java.lang.Exception"} (:runner-error report)))
         (is (not (contains? report :summary))))
-      (finally (io/delete-file file)))))
+      (finally (delete-timing-report! file)))))
 
 (deftest outcome-accounting-separates-device-skips-and-preserves-report-events
   (let [file (java.io.File/createTempFile "raster-ci-outcomes-" ".edn")
@@ -101,7 +105,7 @@
                                    "gpu-capability-skip-marker" 1}}}
                (:outcomes report)))
         (is (= 1 (:schema-version report)) "timing fields keep their existing schema"))
-      (finally (io/delete-file file)))))
+      (finally (delete-timing-report! file)))))
 
 (deftest failure-classifiers-are-portable-bounded-and-do-not-inspect-runtime-inputs
   (let [file (java.io.File/createTempFile "raster-ci-diagnostics-" ".edn")
@@ -137,7 +141,7 @@
         (is (= events @forwarded))
         (is (= summary (:summary report)))
         (is (= :completed (:run-state report))))
-      (finally (io/delete-file file)))))
+      (finally (delete-timing-report! file)))))
 
 (deftest outcome-accounting-does-not-claim-unselected-or-simulated-tests
   (let [file (java.io.File/createTempFile "raster-ci-selection-outcomes-" ".edn")
@@ -162,7 +166,7 @@
                       {:test 0 :pass 0 :fail 0 :error 0})]
         (timed/run-timed! {:namespace #{'raster.ci.timed-runner-test}} file))
       (is (= {} (:outcomes (edn/read-string (slurp file)))))
-      (finally (io/delete-file file)))))
+      (finally (delete-timing-report! file)))))
 
 (deftest outcome-accounting-preserves-real-test-counters
   (let [file (java.io.File/createTempFile "raster-ci-real-outcomes-" ".edn")
@@ -182,7 +186,7 @@
         (is (= 1 (:started (first outcomes))))
         (is (= (:pass baseline) (get-in (first outcomes) [:assertions :pass])))
         (is (nil? (:skip-markers (first outcomes)))))
-      (finally (io/delete-file file)))))
+      (finally (delete-timing-report! file)))))
 
 (deftest real-failing-assertions-keep-their-counters-and-completed-status
   (let [file (java.io.File/createTempFile "raster-ci-real-failure-" ".edn")]
@@ -205,7 +209,7 @@
           (is (= :completed (:run-state report)))
           (is (= {:fail 1} (:assertions outcome)))
           (is (= :fail (get-in outcome [:diagnostics 0 :type])))))
-      (finally (io/delete-file file)))))
+      (finally (delete-timing-report! file)))))
 
 (deftest outcome-observation-never-retries-or-masks-a-reporting-error
   (let [file (java.io.File/createTempFile "raster-ci-reporter-error-" ".edn")
@@ -228,7 +232,7 @@
         (is (identical? failure (first observed)))
         (is (true? (second observed)) "the prior reporter is restored even after failure")
         (is (= 1 @calls)))
-      (finally (io/delete-file file)))))
+      (finally (delete-timing-report! file)))))
 
 (deftest timing-output-failure-does-not-mask-test-outcomes
   (let [file (java.io.File/createTempFile "raster-timings-parent-" ".edn")
@@ -241,7 +245,75 @@
       (with-redefs [runner/test (fn [_] (throw (Exception. "original failure")))]
         (is (thrown-with-msg? Exception #"original failure"
                               (timed/run-timed! options impossible-report))))
-      (finally (io/delete-file file)))))
+      (let [broken-output (proxy [java.io.Writer] []
+                            (write [buffer offset length] (throw (java.io.IOException. "diagnostic failed")))
+                            (flush [] (throw (java.io.IOException. "diagnostic failed")))
+                            (close []))
+            summary {:test 1 :pass 1 :fail 0 :error 0}
+            failure (Exception. "original runner failure")
+            observed (binding [*err* broken-output *out* broken-output]
+                       (with-redefs [runner/test (constantly summary)]
+                         (timed/run-timed! options impossible-report)))
+            error (binding [*err* broken-output *out* broken-output]
+                    (with-redefs [runner/test (fn [_] (throw failure))]
+                      (try (timed/run-timed! options impossible-report) nil
+                           (catch Exception error error))))]
+        (is (= summary observed))
+        (is (identical? failure error)))
+      (finally (delete-timing-report! file)))))
+
+(deftest running-checkpoints-identify-the-current-event-without-per-var-full-writes
+  (let [file (java.io.File/createTempFile "raster-ci-running-" ".edn")
+        namespace 'raster.ci.timed-runner-test
+        inside (atom [])
+        after-namespace (atom nil)
+        full-writes (atom 0)
+        publish @#'timed/publish-report!]
+    (try
+      (with-local-vars [probe nil]
+        (alter-meta! probe assoc :ns (the-ns namespace) :name 'checkpoint-probe
+                     :test (fn []
+                             (swap! inside conj
+                                    {:report (edn/read-string (slurp file))
+                                     :progress (edn/read-string (slurp (str file ".progress")))
+                                     :full-writes @full-writes})
+                             (is true)))
+        (let [summary
+              (with-redefs-fn
+                {#'timed/publish-report!
+                 (fn [path report]
+                   (when (= (str file) (str path)) (swap! full-writes inc))
+                   (publish path report))
+                 #'clojure.test/test-ns
+                 (fn [_]
+                   (binding [clojure.test/*report-counters* (ref clojure.test/*initial-report-counters*)]
+                     (dotimes [_ 5] (clojure.test/test-var probe))
+                     @clojure.test/*report-counters*))
+                 #'runner/test
+                 (fn [_]
+                   (let [summary (clojure.test/test-ns namespace)]
+                     (reset! after-namespace (edn/read-string (slurp file)))
+                     summary))}
+                #(timed/run-timed! {:namespace #{namespace}} file))
+              final (edn/read-string (slurp file))
+              progress (edn/read-string (slurp (str file ".progress")))]
+          (is (= {:test 5 :pass 5 :fail 0 :error 0} summary (:summary final)))
+          (is (= 5 (count @inside)))
+          (doseq [{:keys [report progress full-writes]} @inside]
+            (is (= :running (:run-state report) (:run-state progress)))
+            (is (= (:run-id report) (:run-id progress) (:run-id final)))
+            (is (= {:scope :test-var :phase :begin
+                    :id 'raster.ci.timed-runner-test/checkpoint-probe}
+                   (:latest-event progress)))
+            (is (= 1 full-writes) "no full outcome serialization per Var or assertion"))
+          (is (= :running (:run-state @after-namespace)))
+          (is (nil? (:summary @after-namespace)))
+          (is (= 5 (get-in @after-namespace
+                          [:outcomes 'raster.ci.timed-runner-test/checkpoint-probe :assertions :pass])))
+          (is (= 3 @full-writes) "initial, namespace completion, final")
+          (is (= :completed (:run-state final) (:run-state progress)))
+          (is (= {:scope :runner :phase :end} (:latest-event progress)))))
+      (finally (delete-timing-report! file)))))
 
 (deftest cli-completes-executor-shutdown-before-returning-exit-status
   (doseq [[summary status] [[{:fail 0 :error 0} 0]

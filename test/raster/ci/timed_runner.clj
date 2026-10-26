@@ -5,7 +5,9 @@
   (:require [clojure.java.io :as io]
             [clojure.test :as test]
             [clojure.tools.cli :as cli]
-            [cognitect.test-runner :as runner]))
+            [cognitect.test-runner :as runner])
+  (:import [java.nio.file Files CopyOption StandardCopyOption AtomicMoveNotSupportedException]
+           [java.nio.file.attribute FileAttribute]))
 
 (def ^:dynamic *loading?* false)
 
@@ -81,6 +83,24 @@
     (try (measured timings [:vars id] f)
          (finally (progress! :end)))))
 
+(defn- publish-report!
+  "Replace a diagnostic only after a complete sibling file has been written."
+  [file report]
+  (let [destination (.toPath (.getAbsoluteFile (io/file file)))]
+    (io/make-parents file)
+    (let [temporary (Files/createTempFile (.getParent destination) ".raster-ci-timing-" ".tmp"
+                                          (make-array FileAttribute 0))]
+      (try
+        (spit (.toFile temporary) (pr-str report))
+        (try
+          (Files/move temporary destination
+                      (into-array CopyOption [StandardCopyOption/ATOMIC_MOVE
+                                              StandardCopyOption/REPLACE_EXISTING]))
+          (catch AtomicMoveNotSupportedException _
+            (Files/move temporary destination
+                        (into-array CopyOption [StandardCopyOption/REPLACE_EXISTING]))))
+        (finally (Files/deleteIfExists temporary))))))
+
 (defn run-timed!
   [options report-file]
   (let [started (System/nanoTime)
@@ -91,10 +111,42 @@
         require* clojure.core/require
         test-ns* test/test-ns
         test-var* test/test-var
-        report* test/report]
+        report* test/report
+        run-id (str (java.util.UUID/randomUUID))
+        publication-lock (Object.)
+        warned? (atom false)
+        checkpoint!
+        (fn [event full?]
+          ;; Capture under the same run-local lock as publication: a slow old
+          ;; namespace checkpoint must not replace the final completed report.
+          (locking publication-lock
+            (let [snapshot (assoc @timings :run-id run-id
+                                  :elapsed-ns (- (System/nanoTime) started)
+                                  :java-version (System/getProperty "java.version"))]
+              (try
+                (when full? (publish-report! report-file snapshot))
+                ;; This records the latest observed event, not a unique active
+                ;; Var: fixtures can nest calls or run tests concurrently.
+                ;; It is constant-sized and never serializes the outcome table.
+                (publish-report! (str report-file ".progress")
+                                 (assoc (select-keys snapshot [:run-id :run-state :elapsed-ns])
+                                        :schema-version 1 :latest-event event))
+                (catch Exception error
+                  ;; Repeated diagnostic output would itself keep a stuck CI
+                  ;; action alive. Warn once, without masking test exceptions.
+                  (when (compare-and-set! warned? false true)
+                    (try
+                      (binding [*out* *err*]
+                        (println "Could not write CI timing diagnostics:" (.getMessage error)))
+                      (catch Exception _ nil))))))))
+        observe (fn [event full-after? f]
+                  (checkpoint! (assoc event :phase :begin) false)
+                  (try (f)
+                       (finally (checkpoint! (assoc event :phase :end) full-after?))))]
     (when-not (seq selected)
       (throw (ex-info "timed CI runner requires explicit namespace selection" {})))
     (try
+      (checkpoint! {:scope :runner :phase :begin} true)
       (with-redefs [test/report
                     (fn [event]
                       (record-outcome! timings selected event)
@@ -105,20 +157,24 @@
                                (contains? selected (first args)))
                         (binding [*loading?* true]
                           (swap! timings update :load-order conj (first args))
-                          (measured timings [:namespaces (first args) :load-ns]
-                                    #(apply require* args)))
+                          (observe {:scope :load-ns :id (first args)} true
+                                   #(measured timings [:namespaces (first args) :load-ns]
+                                              (fn [] (apply require* args)))))
                         (apply require* args)))
                     test/test-ns
                     (fn [n]
                       (swap! timings update :test-order conj (ns-name (the-ns n)))
-                      (measured timings [:namespaces (ns-name (the-ns n)) :test-ns]
-                                #(test-ns* n)))
+                      (observe {:scope :test-ns :id (ns-name (the-ns n))} true
+                               #(measured timings [:namespaces (ns-name (the-ns n)) :test-ns]
+                                          (fn [] (test-ns* n)))))
                     test/test-var
                     (fn [v]
                       (let [{:keys [ns name]} (meta v)]
                         (if (and (:test (meta v)) (contains? selected (ns-name ns)))
-                          (measured-var timings (symbol (str (ns-name ns)) (str name))
-                                        (boolean (:compiled (meta v))) #(test-var* v))
+                          (let [id (symbol (str (ns-name ns)) (str name))]
+                            (observe {:scope :test-var :id id} false
+                                     #(measured-var timings id (boolean (:compiled (meta v)))
+                                                    (fn [] (test-var* v)))))
                           (test-var* v))))]
         (let [summary (runner/test options)]
           ;; A complete run can fail assertions. Do not equate completion with passing,
@@ -131,16 +187,9 @@
                :runner-error (exception-diagnostic error))
         (throw error))
       (finally
-        (try
-          (io/make-parents report-file)
-          (spit report-file
-                (pr-str (assoc @timings :elapsed-ns (- (System/nanoTime) started)
-                               :java-version (System/getProperty "java.version"))))
-          (println "CI namespace/var timings:" (str report-file))
-          (catch Exception error
-            ;; Diagnostics must not mask the compiler/test exception we are diagnosing.
-            (binding [*out* *err*]
-              (println "Could not write CI timing diagnostics:" (.getMessage error)))))))))
+        (checkpoint! {:scope :runner :phase :end} true)
+        (try (println "CI namespace/var timings:" (str report-file))
+             (catch Exception _ nil))))))
 
 (defn- cli-status [args]
   (let [{:keys [options errors]} (cli/parse-opts args runner/cli-options)

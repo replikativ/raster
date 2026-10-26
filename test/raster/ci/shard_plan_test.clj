@@ -7,15 +7,19 @@
 
 (deftest timing-import-validates-units-and-schema
   (is (= {'a 3 'b 1}
-         (weights/report-costs {:schema-version 1
+         (weights/report-costs {:schema-version 1 :run-state :completed
                                :namespaces {'a {:load-ns 1000001 :test-ns 1000000}
                                             'b {:load-ns 0}}})))
   (is (thrown? Exception (weights/report-costs {:schema-version 2})))
   (is (thrown? Exception (weights/report-costs {:schema-version 1})))
   (is (thrown? Exception (weights/report-costs
-                          {:schema-version 1 :namespaces {'a {}}})))
+                          {:schema-version 1 :run-state :completed :namespaces {'a {}}})))
   (is (thrown? Exception (weights/report-costs
-                          {:schema-version 1 :namespaces {'a {:test-ns -1}}}))))
+                          {:schema-version 1 :run-state :completed :namespaces {'a {:test-ns -1}}})))
+  (doseq [state [nil :running :aborted]]
+    (is (thrown? Exception (weights/report-costs
+                            {:schema-version 1 :run-state state
+                             :namespaces {'a {:test-ns 123}}})))))
 
 (deftest measured-plan-preserves-complete-unique-namespace-coverage
   (let [run (fn [timings]
