@@ -14,6 +14,7 @@
             [raster.compiler.ir.emitted-parallel-program :as emitted-program]
             [raster.compiler.ir.emitted-structured-loop :as emitted-loop]
             [raster.compiler.ir.soac-dialect :as soac]
+            [raster.compiler.fixtures.mixed-storage :as mixed]
             [raster.core :refer [deftm]]
             [raster.par :as par]
             [raster.compiler.passes.scalar.effects :as effects]
@@ -62,7 +63,7 @@
                (reason #(link/instantiate-ordered-invocation!
                           (assoc compilation :source-completion-adapters {id invalid}) [0.25] {}))))))))
 
-(deftest numerical-result-import-remains-refused-before-session-creation
+(deftest unowned-numerical-result-import-is-refused-before-session-creation
   ;; A source-translated numerical algorithm with a declarative suspension, not
   ;; placeholder target operations. There is no claimed payload/transfer authority.
   (let [reduction '(raster.par/reduce acc 0.0 i 3 (+ acc 1.0))
@@ -87,7 +88,7 @@
         compiled {:semantic semantic :emitted emitted :target :ocl:0}]
     (is (some :program-result-import (invocation/source-order plan semantic)))
     (with-redefs [gpu/make-session (fn [& _] (throw (AssertionError. "import acquired resources")))]
-      (is (= :invocation-ordered-source-action
+      (is (= :link-ordered-result-import-adapters
              (reason #(link/instantiate-ordered-invocation! compiled [] {})))))))
 
 (defn- check-owned-completion-runtime! [target]
@@ -172,6 +173,117 @@
                  (mapv #(Float/floatToRawIntBits %)
                        (link/download live (first (keys (link/outputs live)))))))))
       (finally (link/close! live)))))
+
+(defn- witnessed-completion-compilation [opaque-input?]
+  (let [original (#'completion-fixture/selected-frontend
+                  (if opaque-input? #'completion-fixture/public-object-float-entry
+                      #'completion-fixture/public-float-entry))
+        {:keys [source-program plan steps] :as request}
+        (#'completion-fixture/witnessed-completion-source original opaque-input?)
+        adapters (method-entry/call-with-definition-inputs
+                  #(into {} (map (fn [step]
+                                   [(:id step) (source-import/compile-source-completion-step
+                                                (assoc request :step step))])) steps))
+        options {:dtype :float :target-dialect :opencl-portable}
+        scheduled (structured/schedule-program source-program options)
+        emitted (:program (c-family/emit-program scheduled options))]
+    {:semantic source-program :scheduled scheduled :emitted emitted :target :ocl:0
+     :source-ns *ns* :source-completion-adapters adapters}))
+
+(defn- check-witnessed-source-values! [target]
+  (let [compilation (assoc (witnessed-completion-compilation false) :target target)]
+    (doseq [input [(float -0.0) (float 0.25)]]
+      (let [live (link/instantiate-ordered-invocation! compilation [input] {})]
+        (try
+          (dotimes [_ 2]
+            (link/run! live)
+            (is (= [(Float/floatToRawIntBits input)]
+                   (mapv #(Float/floatToRawIntBits %)
+                         (link/download live (first (keys (link/outputs live))))))))
+          (finally (link/close! live))))))
+  (let [amount (atom 0.25)
+        calls (atom 0)
+        number (proxy [Number] []
+                 (intValue [] (throw (AssertionError. "wrong conversion")))
+                 (longValue [] (throw (AssertionError. "wrong conversion")))
+                 (floatValue [] (swap! calls inc) (float @amount))
+                 (doubleValue [] (swap! calls inc) (double @amount)))
+        reference (binding [*unchecked-math* false] (eval '(fn [^Object x] (float x))))
+        compilation (assoc (witnessed-completion-compilation true) :target target)
+        live (link/instantiate-ordered-invocation! compilation [number] {})]
+    (try
+      (doseq [input [0.25 -0.0 0.75]]
+        (reset! amount input)
+        (reset! calls 0)
+        (let [expected (reference number)
+              expected-calls @calls]
+          (reset! calls 0)
+          (link/run! live)
+          (is (= expected-calls @calls) "validation does not replay boxing or Number conversion")
+          (is (= [(Float/floatToRawIntBits expected)]
+                 (mapv #(Float/floatToRawIntBits %)
+                       (link/download live (first (keys (link/outputs live)))))))))
+      (finally (link/close! live)))))
+
+(deftest witnessed-float-object-completions-execute-on-local-backends
+  (if @ocl-probe/opencl-available?
+    (check-witnessed-source-values! :ocl:0)
+    (ocl-probe/opencl-skip! "witnessed Float/Object source completions"))
+  (if @ze-probe/gpu-available?
+    (check-witnessed-source-values! :ze:0)
+    (ze-probe/gpu-skip! "witnessed Float/Object source completions")))
+
+(defn- check-public-mixed-gradient! [target]
+  (let [compilation (equation-first/compile #'mixed/mixed-scale-energy-gradient
+                                           (merge mixed/policy {:target target :dtype :double}))
+        values (double-array [1.0 2.0 3.0])
+        live (link/instantiate-ordered-invocation! compilation [(float 0.25) values] {})]
+    (try
+      (is (seq (:program-result-import-adapters compilation)))
+      (is (seq (:source-completion-adapters compilation)))
+      (doseq [input [[1.0 2.0 3.0] [2.0 4.0 -1.0]]]
+        (dotimes [i 3] (aset values i (double (nth input i))))
+        (let [transfers (atom 0)
+              download-range! gpu/download-range!]
+          (with-redefs [gpu/download-range!
+                        (fn [& arguments]
+                          (swap! transfers inc)
+                          (apply download-range! arguments))]
+            (link/run! live))
+          (let [expected (float (reduce + (map #(* % %) input)))
+              output (first (keys (link/outputs live)))
+              actual (link/download live output)
+              records (get-in @(:execution-state live) [:ordered :completed-results])]
+          (is (= [(Float/floatToRawIntBits expected)]
+                 (mapv #(Float/floatToRawIntBits %) actual)))
+          (is (= :float (get-in (link/outputs live) [output :view :dtype])))
+          (is (seq records))
+          (is (every? #(contains? % :root-object) (vals records)))
+          (is (= (count records) @transfers)
+              "each producer is transferred once in this replay, not once per source use"))))
+      (let [download-range! gpu/download-range!
+            transfers (atom 0)]
+        (with-redefs [gpu/download-range!
+                      (fn [& arguments]
+                        (let [result (apply download-range! arguments)]
+                          (swap! transfers inc)
+                          (swap! (:execution-state live) update :value-epoch inc)
+                          result))]
+          (is (= :link-ordered-result-import-epoch (reason #(link/run! live)))))
+        (is (= 1 @transfers) "owner loss after a real transfer stops the source continuation")
+        (is (nil? (:resident-boundary @(:execution-state live))))
+        (is (not-any? #(contains? % :root-object)
+                      (vals (get-in @(:execution-state live) [:ordered :completed-results])))
+            "the failed replay cannot borrow a boxed root from the preceding replay"))
+      (finally (link/close! live)))))
+
+(deftest public-mixed-gradient-imports-before-distinct-float-publication
+  (if @ocl-probe/opencl-available?
+    (check-public-mixed-gradient! :ocl:0)
+    (ocl-probe/opencl-skip! "public mixed-gradient result import"))
+  (if @ze-probe/gpu-available?
+    (check-public-mixed-gradient! :ze:0)
+    (ze-probe/gpu-skip! "public mixed-gradient result import")))
 
 (deftest planned-source-completion-runs-at-its-cursor-on-local-backends
   (if @ocl-probe/opencl-available?

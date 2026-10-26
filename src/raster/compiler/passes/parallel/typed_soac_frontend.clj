@@ -44,6 +44,27 @@
   [reason message data]
   (throw (ex-info message (assoc data :reason reason :front-end :analyzed-source))))
 
+(def ^:private ^:dynamic *contextual-source-construction* nil)
+
+(defn ^:no-doc call-with-contextual-reduction-constructor
+  "Internal orchestration scope for constructing current-source continuations.
+   No public compiler option installs this callback. The constructor owns actual
+   current-source carrier evidence; this frontend still constructs ordinary SOAC
+   descriptions. Nothing here authorizes a transfer or runtime completion."
+  [construct! consume!]
+  (when-not (and (fn? construct!) (fn? consume!) (nil? *contextual-source-construction*))
+    (fail! :contextual-source-construction-scope
+           "contextual source construction requires one explicit compiler scope" {}))
+  (binding [*contextual-source-construction* {:construct! construct!}]
+    (consume!)))
+
+(defn ^:no-doc construct-terminal-float-publication
+  "Offer the complete live source to the existing compiler-owned construction
+   scope. A returned candidate still requires ordinary frontend/residency proof."
+  [source]
+  (when-let [construct! (:construct! *contextual-source-construction*)]
+    (construct! {:kind :terminal-float-publication :source source})))
+
 (def source-decline-reasons
   "Structured analysis failures that mean source lies outside the closed TypedSOAC subset."
   #{:unsupported-scalar-binding
@@ -4062,7 +4083,7 @@
               (form/binding-form? source) (vector? (second source))
               (even? (count (second source)))
               (every? symbol? (take-nth 2 (second source)))
-              (some #(completion/boxed-reference-input-parts (second %))
+              (some #(completion/reference-input-parts (second %))
                     (partition 2 (second source))))
      (method-entry/call-with-optional-definition-inputs
       (fn []
@@ -4081,16 +4102,22 @@
                                                     (not (contains? shadowed formal)))
                                            [formal {:formal formal :carrier carrier}])))
                                  (map vector (:parameters physical) (:parameter-carriers physical)))
+                  current-constructor
+                  (when (and (:construct! *contextual-source-construction*)
+                             (some (fn [[_ expression]]
+                                     (let [{:keys [contract operand]} (completion/canonical-parts expression)]
+                                       (and (= :jvm-bytecode-result-context (:source-context contract))
+                                            (par/par-reduce-form? operand))))
+                                   (partition 2 bindings)))
+                    (:construct! *contextual-source-construction*))
                   {:keys [projected replaced]}
                   (reduce
-                   (fn [{:keys [carriers] :as state} [id expression]]
-                     (let [checked (completion/boxed-reference-input-parts expression)
+                   (fn [{:keys [carriers] :as state} [ordinal [id expression]]]
+                     (let [checked (completion/reference-input-parts expression)
                            object-input (completion/object-input-parts expression)
                            operand (cond checked (:operand checked)
                                          object-input (:operand object-input)
                                          (symbol? expression) expression)
-                           {:keys [formal carrier] :as provenance} (get carriers operand)
-                           array-carrier? (some? (some-> carrier dtype/dtype-for-jvm-array-class))
                            normalized-id (vary-meta id assoc :tag 'java.lang.Object)
                            normalized-expression (when checked
                                                    (with-meta
@@ -4099,19 +4126,34 @@
                            preserved? (and checked
                                            (invocation-source/preserved-reference-identity?
                                             normalized-id normalized-expression))
-                           identity? (and provenance array-carrier?
-                                          (or (nil? checked)
-                                              (identical? carrier (get-in checked [:contract :target-carrier])))
-                                          (= (some-> carrier dtype/dtype-for-jvm-array-class dtype/canon)
-                                             (some-> (get array-types formal) dtype/canon))
-                                          (reference-array-declarations-compatible? carrier [id expression operand])
-                                          (not-any? snapshot-evaluation-required? [id operand])
-                                          (or (not (snapshot-evaluation-required? expression)) preserved?)
-                                          (binding-completion/reference-binding-without-check?
-                                           id source-ns source-binding-context carrier)
-                                          (or (not preserved?)
-                                              (binding-completion/object-binding-without-check?
-                                               normalized-id source-ns source-binding-context)))
+                           accepts?
+                           (fn [{:keys [formal carrier current-source?]}]
+                             (let [element (some-> carrier dtype/dtype-for-jvm-array-class dtype/canon)
+                                   declared (some-> (get array-types formal) dtype/canon)]
+                               (and element
+                                    (not (true? (get-in checked [:contract :operand-context :void-context])))
+                                    (or (nil? checked)
+                                        (.isAssignableFrom ^Class (get-in checked [:contract :target-carrier])
+                                                           ^Class carrier))
+                                    (if current-source?
+                                      (or (nil? declared) (= element declared))
+                                      (= element declared))
+                                    (reference-array-declarations-compatible? carrier [id expression operand])
+                                    (not-any? snapshot-evaluation-required? [id operand])
+                                    (or (not (snapshot-evaluation-required? expression)) preserved?)
+                                    (binding-completion/reference-binding-without-check?
+                                     id source-ns source-binding-context carrier)
+                                    (or (not preserved?)
+                                        (binding-completion/object-binding-without-check?
+                                         normalized-id source-ns source-binding-context)))))
+                           known (get carriers operand)
+                           provenance (or (when (and known (accepts? known)) known)
+                                          (when (and current-constructor (symbol? operand))
+                                            (current-constructor
+                                             {:kind :reference-provenance :source source
+                                              :ordinal ordinal :binder id :expression expression
+                                              :accept? accepts?})))
+                           identity? (some? provenance)
                            project? (and identity? checked)]
                        (cond-> (-> state
                                    (update :projected into
@@ -4123,7 +4165,7 @@
                          identity? (assoc-in [:carriers id] provenance)
                          project? (update :replaced inc))))
                    {:carriers carriers :projected [] :replaced 0}
-                   (partition 2 bindings))]
+                   (map-indexed vector (partition 2 bindings)))]
               (when (pos? replaced)
                 (with-meta (list* head (with-meta projected (meta bindings)) body) (meta source)))))))))
    source))
@@ -4550,7 +4592,22 @@
         {:keys [array-types scalar-definitions local-scalar-types stageable-prefix?
                  before-parallel?] :as state}
          [id [symbol expression]]]
-      (let [expression (retain-free-scalar-reference-types expression local-scalar-types)
+      (let [original-expression expression
+            {:keys [contract operand]} (completion/canonical-parts expression)
+            contextual (when (and (:source *contextual-source-construction*)
+                                  (= :jvm-bytecode-result-context (:source-context contract))
+                                  (par/par-reduce-form? operand))
+                         ((:construct! *contextual-source-construction*)
+                          {:source (:source *contextual-source-construction*)
+                           :ordinal id :binder symbol :expression expression}))
+            _ (when (and contextual
+                         (not (and (identical? operand (:root contextual))
+                                   (contains? #{'float 'double} (:result-tag contextual)))))
+                (fail! :contextual-reduction-correspondence
+                       "current reduction constructor changed its exact source operand"
+                       {:binding symbol :position id}))
+            expression (retain-free-scalar-reference-types
+                        (if contextual operand expression) local-scalar-types)
             description
             ;; Semantic source facts do not depend on whether this consumer admits the plan.
             ;; The form->program capability gate remains separate below.
@@ -4560,12 +4617,20 @@
                 (if (par/par-form? expression)
                   {:kind :unsupported :id id :sym symbol :expr expression}
                   {:kind :scalar :id id :sym symbol :expr expression}))
-            description (assoc description
+            _ (when (and contextual
+                         (not (and (= :reduce (:kind description))
+                                   (= (keyword (name (:result-tag contextual)))
+                                      (get-in description [:product :components 0 :dtype])))))
+                (fail! :contextual-reduction-carrier
+                       "numerical reduction differs from its current normal-return carrier"
+                       {:binding symbol :position id}))
+            description (cond-> (assoc description
                                :source-prefix? stageable-prefix?
                                ;; Distinct from `source-prefix?`: a host allocation or other
                                ;; non-stageable host binding prevents scalar hoisting, but it does
                                ;; not put device work before a following checked scalar boundary.
                                :before-parallel? before-parallel?)
+                          contextual (assoc :source-expression original-expression))
             scalar-dtype (when (= :scalar (:kind description))
                            (some-> (or (retained-scalar-dtype symbol local-scalar-types)
                                        (retained-scalar-dtype expression local-scalar-types))
@@ -6240,6 +6305,8 @@
         (try
           (binding [util/*shadowing-locals* (source-shadowing-locals
                                             source array-types scalar-types values)
+                    *contextual-source-construction* (when *contextual-source-construction*
+                                                      (assoc *contextual-source-construction* :source source))
                     *region-local-counter* (atom -1)
                     *region-local-source-symbols* (source-symbols source options)]
             (let [pairs (vec (mapv vec (partition 2 bindings)))
@@ -6436,6 +6503,8 @@
                  (even? (count (second source))))
     (fail! :source-fragment-binding-form "source fragment requires flat ordered bindings" {}))
   (binding [util/*shadowing-locals* (source-shadowing-locals source array-types scalar-types values)
+            *contextual-source-construction* (when *contextual-source-construction*
+                                              (assoc *contextual-source-construction* :source source))
             *region-local-counter* (atom -1)
             *region-local-source-symbols* (source-symbols source options)]
     (let [pairs (vec (map vec (partition 2 (second source))))
@@ -7087,5 +7156,7 @@
 (defn- form->program*
   [source options]
   (method-entry/call-with-optional-definition-inputs
-   #(binding [*source-value-owner* method-entry/*emission-inputs*]
+   #(binding [*source-value-owner* method-entry/*emission-inputs*
+              *contextual-source-construction* (when *contextual-source-construction*
+                                                (assoc *contextual-source-construction* :source source))]
       (construct-source-program source options))))

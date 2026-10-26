@@ -282,14 +282,20 @@
    (numerical-equations-for-request parallel-program caller-options)))
 
 (defn- retained-schedule-matches?
-  "Relate a scheduled peer to the actual source schedules of checked emitted alternatives."
+  "Relate a scheduled peer to checked emitted alternatives. Attached invocation-plan
+   correspondence is exact identity, not ownership proof or portable numerical data."
   [emitted scheduled equations caller-options]
   (program/validate! scheduled)
-  (let [by-id (into {} (map (juxt :id identity)) (:equations scheduled))]
+  (let [by-id (into {} (map (juxt :id identity)) (:equations scheduled))
+        numerical-boundary #(update (select-keys % [:values :inputs :outputs :effects :attributes])
+                                    :attributes dissoc :invocation-plan)]
     (and (contains? #{:segop :scheduled-parallel} (:dialect scheduled))
+         (= (contains? (:attributes scheduled) :invocation-plan)
+            (contains? (:attributes emitted) :invocation-plan))
+         (identical? (get-in scheduled [:attributes :invocation-plan])
+                     (get-in emitted [:attributes :invocation-plan]))
          (semantic-fingerprint/equivalent?
-          (select-keys scheduled [:values :inputs :outputs :effects :attributes])
-          (select-keys emitted [:values :inputs :outputs :effects :attributes]))
+          (numerical-boundary scheduled) (numerical-boundary emitted))
          (= (mapv :id (:equations scheduled)) (mapv :id equations))
          (every?
           (fn [equation]

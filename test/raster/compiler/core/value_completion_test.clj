@@ -18,6 +18,25 @@
   (is (nil? (completion/source-cast-result-tag completion/object-input-contract)))
   (is (nil? (completion/source-cast-result-tag (completion/reference-check-contract Float)))))
 
+(deftest invocation-completion-results-separate-reference-storage-from-numerical-tags
+  (is (= {:kind :opaque} (completion/invocation-result-description completion/object-input-contract)))
+  (doseq [contract [(completion/source-floating-cast-contract :float {:unchecked-math false})
+                    (completion/bytecode-boxed-parameter-contract Float/TYPE)
+                    (completion/primitive-input-contract Float/TYPE {:unchecked-math false})
+                    (completion/bytecode-input-contract Float/TYPE
+                                                        (completion/bytecode-operand-context {}))]]
+    (is (= {:kind :scalar :tag 'float} (completion/invocation-result-description contract)))
+    (is (nil? (completion/invocation-result-description (assoc contract :unowned true)))))
+  (doseq [contract [(completion/reference-check-contract Float)
+                    (completion/bytecode-boxed-parameter-contract (.arrayType Float/TYPE))
+                    (completion/bytecode-boxed-parameter-contract Double/TYPE)
+                    (completion/bytecode-result-context-contract
+                     (completion/bytecode-operand-context {}) :ref)]]
+    (is (nil? (completion/invocation-result-description contract))))
+  (is (= {:kind :scalar :tag 'long}
+         (completion/invocation-result-description
+          (completion/source-integral-cast-contract :long {:unchecked-math false})))))
+
 (deftest source-floating-completion-names-the-source-overload-not-an-ieee-cast
   (doseq [operation [:float :unchecked-float]
           mode [false true :warn-on-boxed]]

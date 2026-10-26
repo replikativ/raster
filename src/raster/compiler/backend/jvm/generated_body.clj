@@ -284,8 +284,40 @@
 
     :else [[] expression]))
 
+(defn- optional-terminal-return [frontend]
+  (try
+    ((requiring-resolve
+      'raster.compiler.passes.scalar.source-import/terminal-reduction-return-contract)
+     {:frontend frontend :input-body (:body frontend) :root (first (:body frontend))})
+    (catch clojure.lang.ExceptionInfo error
+      (if (contains? #{:terminal-reduction-import-root :terminal-reduction-import-return}
+                     (:reason (ex-data error)))
+        nil
+        (throw error)))))
+
+(defn- consume-terminal-return
+  [consume! {:keys [return-contract argument-bindings binding-facts] :as request}]
+  (let [validate! (requiring-resolve
+                   'raster.compiler.passes.scalar.source-import/validate-terminal-reduction-return!)]
+    (validate! return-contract)
+    (when-let [constructed (consume! request)]
+      (validate! return-contract)
+      (let [expression (when (map? constructed) (:expression constructed))
+            facts (when (map? constructed) (:binding-facts constructed))
+            [head bindings & body] (when (seq? expression) expression)]
+        (when-not (and (map? constructed)
+                       (= #{:expression :binding-facts} (set (keys constructed)))
+                       (seq? expression) (= 'let* head) (vector? bindings)
+                       (even? (count bindings)) (= 1 (count body))
+                       (<= (count argument-bindings) (count bindings))
+                       (every? true? (map identical? argument-bindings bindings))
+                       (map? facts)
+                       (every? (fn [[id original]] (= original (get facts id))) binding-facts))
+          (decline! "Terminal consumer changed argument completion or existing local obligations" {}))
+        constructed))))
+
 (defn- instantiate-helper
-  [expression locals context capture!]
+  [expression locals context capture! consume-terminal-reduction terminal-only?]
   (let [[_ receiver & arguments] expression
         invocation (bytecode/typed-invocation-plan receiver (count arguments) locals context)]
     (when (and (:global? invocation)
@@ -298,9 +330,19 @@
               source (get-in owner [:signature :definition :source-var])
               frontend (when source (entry/original-source-frontend source))]
           (when (and emission frontend (identical? emission (:emission frontend)))
-            (when-let [bridge (or (entry/frontend-primitive-body-return-bridge frontend)
-                                 (entry/frontend-reference-return-bridge frontend))]
-              (when-not (get-in bridge [:body-context :unretained-sibling-calls?])
+            (let [bridge (when-not terminal-only?
+                           (or (entry/frontend-primitive-body-return-bridge frontend)
+                               (entry/frontend-reference-return-bridge frontend)))
+                  ;; Authenticate this third, weaker return contract BEFORE
+                  ;; hygiene. It is useful only to an actual consuming owner;
+                  ;; ordinary JVM/C expansion keeps its existing abstention.
+                  terminal-return (when (and (nil? bridge) consume-terminal-reduction)
+                                    (optional-terminal-return frontend))
+                  saved (or (:body-context bridge)
+                            (when terminal-return
+                              (bytecode/retained-input-body-context emission (:input-body terminal-return))))]
+              (when (and (or bridge terminal-return)
+                         saved (not (:unretained-sibling-calls? saved)))
                 (let [{:keys [body binding-facts]} (qualified-helper-body emission (:source-ns context))
                       body (if (= 1 (count body)) (first body) (list* 'do body))
                       ;; Retain the selected formal's existing logical
@@ -313,20 +355,38 @@
                                              [value (completion/complete-value
                                                      (:contract input) (:operand input))]) values inputs))
                       instantiated (util/subst-syms (zipmap (:params emission) values) body)
-                      saved (:body-context bridge)
-                      result (completion/complete-value
+                      result (when bridge (completion/complete-value
                               (completion/bytecode-result-context-contract
-                               (:result-context saved) (:emitted-result-type saved)) instantiated)
-                      result (if (= :reference-static-return (:kind bridge))
+                               (:result-context saved) (:emitted-result-type saved)) instantiated))
+                      result (when bridge (if (= :reference-static-return (:kind bridge))
                                (reference-check (:body-return-carrier bridge) result)
-                               (completion/complete-value completion/object-input-contract result))
-                      [body-bindings result] (expose-anchored-result-spine result binding-facts)
-                      result (vary-meta result assoc :raster.type/tag (:return-tag emission))]
+                               (completion/complete-value completion/object-input-contract result)))
+                      [body-bindings result] (when bridge (expose-anchored-result-spine result binding-facts))
+                      result (when bridge (vary-meta result assoc :raster.type/tag (:return-tag emission)))]
                   ;; All operands, including unused ones, are completed once in
                   ;; positional order before the exact helper body. There is no
                   ;; synthesized receiver term for the global args-first path.
-                  {:expression (list 'let* (into bindings body-bindings) result)
-                   :binding-facts binding-facts})))))))))
+                  (if bridge
+                    {:expression (list 'let* (into bindings body-bindings) result)
+                     :binding-facts binding-facts}
+                    (consume-terminal-return
+                     consume-terminal-reduction
+                     {:return-contract terminal-return :frontend frontend :invocation invocation
+                      :inputs inputs :expression expression :locals locals :context context
+                      :argument-bindings bindings
+                      :input-values values :instantiated-body instantiated
+                      :saved-return-context saved :binding-facts binding-facts})))))))))))
+
+(defn- optional-terminal-helper
+  [construct!]
+  (try
+    ;; Refused captures are not dependencies of a source program that keeps
+    ;; the original call. A fresh child also prevents inherited history from
+    ;; becoming the candidate's own preparation/receipt history.
+    (entry/call-with-optional-definition-inputs
+     #(entry/call-with-independent-definition-inputs construct!))
+    (catch clojure.lang.ExceptionInfo error
+      (if (= :generated-body-unsupported (:reason (ex-data error))) nil (throw error)))))
 
 (defn- generated-interface-method? [program method]
   (when (and (instance? java.lang.reflect.Method method) (vector? (:tags program))
@@ -350,7 +410,7 @@
    Unsupported binding spines abstain; dependency changes still invalidate the
    entire producer attempt. Nested helper calls remain for ordinary lowering;
    their presence is NOT a claim that source or device admission is closed."
-  [program method capture!]
+  [program method capture! consume-terminal-reduction terminal-only?]
   (try
    (entry/call-with-optional-definition-inputs
    (fn []
@@ -369,20 +429,34 @@
                   (fn [{:keys [binder initializer before completion after]}]
                     (let [eligible? (and (seq? initializer) (= '.invk (first initializer)))
                           imported (when eligible?
-                                     (instantiate-helper initializer before
-                                                         (bytecode/binding-initializer-context context)
-                                                         capture!))
+                                     (let [construct! #(instantiate-helper
+                                                        initializer before
+                                                        (bytecode/binding-initializer-context context)
+                                                        capture! consume-terminal-reduction terminal-only?)]
+                                       (if terminal-only? (optional-terminal-helper construct!) (construct!))))
                           [_ helper-bindings tail] (:expression imported)
                           value (if imported tail initializer)
-                          binder (if-let [hint (:hint after)] (vary-meta binder assoc :tag hint) binder)]
-                      (when (or (not eligible?) imported)
-                        (vswap! imported-facts merge (:binding-facts imported)
-                                {binder (select-keys after local-fact-keys)})
-                        (into (vec helper-bindings)
-                              [binder (reference-check (:checkcast-class completion) value)]))))
+                          unchanged? (and terminal-only? (nil? imported))
+                          binder (if unchanged? binder
+                                     (if-let [hint (:hint after)] (vary-meta binder assoc :tag hint) binder))]
+                      (when (or terminal-only? (not eligible?) imported)
+                        ;; The planner's inferred hint is not an observation
+                        ;; of an unchanged binding, whose literal declaration
+                        ;; was deliberately not strengthened above.
+                        (when-not unchanged?
+                          (vswap! imported-facts merge (:binding-facts imported)
+                                  {binder (select-keys after local-fact-keys)}))
+                        (if unchanged?
+                          ;; Its original declaration still owns any implicit
+                          ;; binding CHECKCAST. Do not hide an ordinary map/helper
+                          ;; call inside a newly synthesized completion wrapper.
+                          [binder initializer]
+                          (into (vec helper-bindings)
+                                [binder (reference-check (:checkcast-class completion) value)])))))
                   (:bindings plan))]
-             ;; An unsupported eligible call invalidates the requested whole
-             ;; top-level interval; a partially expanded body is not success.
+             ;; Ordinary expansion still requires a complete interval. The
+             ;; targeted mode intentionally retains other exact source calls;
+             ;; it grants no import or fallback authority for those calls.
              (when (every? some? expanded)
                (let [bindings (vec (mapcat identity expanded))
                      ids (vec (take-nth 2 bindings))]
@@ -450,22 +524,38 @@
          (let [body (util/remake-if-changed walked-body (mapv #(walk % (set params)) walked-body))]
            {:body body :changed? @changed?}))))))
 
-(defn normalize-program
-  "Construct the generated JVM adapter from its exact numerical producer.
-   Source casts become canonical completions under explicit producer policy even
-   when helper expansion abstains. Neither construction admits device execution."
-  [program method capture!]
+(defn- normalize-program*
+  [program method capture! options]
+  (let [consume-terminal-reduction (:consume-terminal-reduction options)
+        terminal-only? (true? (:terminal-only? options))]
+   (when-not (and (map? options) (every? #{:consume-terminal-reduction :terminal-only?} (keys options))
+                  (or (not (contains? options :terminal-only?)) (instance? Boolean (:terminal-only? options)))
+                  (or (nil? consume-terminal-reduction) (fn? consume-terminal-reduction))
+                  (or (not terminal-only?) (fn? consume-terminal-reduction)))
+     (decline! "Generated terminal construction requires an actual consumer function" {}))
   (entry/call-with-optional-definition-inputs
    (fn []
      (when (and entry/*emission-inputs* (generated-interface-method? program method))
        (let [{:keys [body changed?]} (canonical-source-casts program)
              canonical (if changed? (assoc program :walked-body body) program)
-             expanded (normalize-helper-program canonical method capture!)]
+             expanded (normalize-helper-program canonical method capture! consume-terminal-reduction terminal-only?)]
          (cond
            expanded (assoc expanded ::normalization-input program)
            changed? (assoc canonical ::normalization-input program
                            ::entry-method method ::binding-facts {})
-           :else nil))))))
+           :else nil)))))))
+
+(defn normalize-program
+  "Construct the generated JVM adapter from its exact numerical producer.
+   Source casts become canonical completions under explicit producer policy even
+   when helper expansion abstains. Neither construction admits device execution.
+   Optional :consume-terminal-reduction is a constructing function receiving an
+   authenticated owner-local return contract and instantiated source. It must
+   return complete :expression/:binding-facts, preserving the supplied argument
+   binding prefix. :terminal-only? true leaves all other helpers unchanged for
+   ordinary downstream inlining. No default helper permission is enabled."
+  ([program method capture!] (normalize-program* program method capture! {}))
+  ([program method capture! options] (normalize-program* program method capture! options)))
 
 (defn validate-program-emission!
   "Check construction-time local expectations against the sole actual outer

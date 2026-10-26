@@ -344,12 +344,18 @@
                                      descriptions)))))))
 
 (deftest reference-entry-projection-requires-the-actual-unshadowed-formal
+ (doseq [contract-kind [:boxed-entry :method-input]]
   (let [{:keys [source]} (#'lineage/fresh-entry)
         parameters '[values count scale reference]
         scope (:ns (meta source))
         array-class (.arrayType Double/TYPE)
         checked (fn [carrier operand]
-                  (completion/complete-value (completion/bytecode-boxed-parameter-contract carrier) operand))
+                  (completion/complete-value
+                   (case contract-kind
+                     :boxed-entry (completion/bytecode-boxed-parameter-contract carrier)
+                     :method-input (completion/bytecode-reference-input-contract
+                                    carrier (completion/bytecode-operand-context {:object-result? true})))
+                   operand))
         baseline-options {:dtype :double :source-ns scope :lexical-inputs parameters
                           :array-types {'values :double} :scalar-types {'count :long 'scale :double}}
         normalize (fn [body changes]
@@ -373,15 +379,17 @@
       (is (= 'doubles (:raster.type/tag (meta id))))
       (is (= 'values (:operand (completion/object-input-parts identity))))
       (is (true? (:raster.effect/preserve-evaluation (meta identity))))
-      (is (= :jvm-bytecode-boxed-parameter-input
-             (:source-context (:contract (completion/boxed-reference-input-parts expression))))
+      (is (= (case contract-kind
+               :boxed-entry :jvm-bytecode-boxed-parameter-input
+               :method-input :jvm-bytecode-reference-input)
+             (:source-context (:contract (completion/reference-input-parts expression))))
           "the original checked source remains unchanged"))
     (let [snapshot (with-meta 'snapshot {:tag 'Object :raster.type/tag 'doubles})
           object-input #(completion/complete-value completion/object-input-contract %)
           chained (list 'let* [snapshot (object-input 'values)
                               binder (checked array-class 'snapshot)] 'array-input)
           result (normalize chained {})]
-      (is (not-any? completion/boxed-reference-input-parts (take-nth 2 (rest (second result))))
+      (is (not-any? completion/reference-input-parts (take-nth 2 (rest (second result))))
           "the actual entry Class survives an exact, independently checked Object alias")
       (doseq [blocked [(list 'let* [(with-meta 'snapshot {:tag 'String :raster.type/tag 'doubles})
                                     (object-input 'values)
@@ -391,7 +399,7 @@
                                     binder (checked array-class 'snapshot)] 'array-input)
                        (list 'let* [binder (checked array-class 'snapshot)
                                     snapshot (object-input 'values)] 'array-input)]]
-        (is (some completion/boxed-reference-input-parts
+        (is (some completion/reference-input-parts
                   (take-nth 2 (rest (second (normalize blocked {})))))
             "a checked/effectful/future intermediate cannot establish formal provenance")))
     (doseq [[candidate changes]
@@ -407,13 +415,17 @@
                           binder (checked array-class 'values)] 'array-input) {}]
              [(list 'let* [binder (vary-meta (checked array-class 'values)
                                             assoc :raster.effect/source-reference-cast true)]
-                    'array-input) {}]]]
+                    'array-input) {}]
+             [(list 'let* [binder (completion/complete-value
+                                  (completion/bytecode-reference-input-contract
+                                   array-class (completion/bytecode-operand-context {:void-context true}))
+                                  'values)] 'array-input) {}]]]
       (let [unchanged (frontend/normalize-source candidate (merge baseline-options changes))
             result (normalize candidate changes)]
         (is (= unchanged result)
             "declarations, incompatible storage, Object formals, shadowing and independent checks cannot grant the projection")))
     (is (nil? (entry/source-var-body-entry-carriers source))
-        "carrier evidence remains an owned compiler query, not a process-wide hint")))
+        "carrier evidence remains an owned compiler query, not a process-wide hint"))))
 
 (deftest dead-object-snapshots-respect-lexical-binding-completion
   (let [scope (the-ns 'raster.compiler.passes.parallel.typed-soac-frontend-test)

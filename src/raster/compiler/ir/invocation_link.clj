@@ -8,6 +8,7 @@
    kernel name, or legacy resident descriptor participates."
   (:require [clojure.set :as set]
             [raster.compiler.core.op-descriptor :as descriptor]
+            [raster.compiler.core.value-completion :as completion]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.buffer-view :as bview]
             [raster.compiler.ir.emitted-equation-dispatch :as equation-dispatch]
@@ -694,12 +695,72 @@
     projection))
 
 (defn- ordered-source-completion?
-  "The planned backend currently implements a single lexical Object -> Float region.
+  "The planned backend implements bounded lexical Float/reference completions.
    Exact operand/source ownership is checked by its owner-local adapter, not this predicate."
   [step]
-  (and (invocation/source-completion? step)
-       (= :float (get-in step [:value :dtype]))
-       (= 1 (count (:operands step)))))
+  (let [result (completion/invocation-result-description
+                (:contract (completion/canonical-parts (:expression step))))]
+    (and (invocation/source-completion? step)
+         (or (= {:kind :opaque} result) (= {:kind :scalar :tag 'float} result))
+         (= 1 (count (:operands step))))))
+
+(defn- checked-import-source-order [state materialized]
+  (let [plan (:plan materialized)
+        program (:program state)
+        expected (invocation/source-order plan program)]
+    (when-not (and (identical? plan (get-in program [:attributes :invocation-plan]))
+                   (semantic/equivalent? expected (:source-order state)))
+      (fail! :invocation-ordered-import-source
+             "result import requires the retained program's exact plan and source order" {}))
+    expected))
+
+(defn ^:no-doc prepare-program-result-import
+  "Describe the exact next numerical-result snapshot without transferring it.
+   A storage token is not initialized-view, event, completion or download permission;
+   the runtime owner must independently prove those obligations before supplying a value."
+  [state caller-options]
+  (when-not (= caller-options (:caller-options state))
+    (fail! :invocation-ordered-request "ordered realization cannot change its caller math request" {}))
+  (when (:pending state)
+    (fail! :invocation-ordered-pending "the preceding source action has not completed" {}))
+  (checked-ordered-validation state)
+  (let [materialized (materialization/validate-state! (:materialization state))
+        order (checked-import-source-order state materialized)
+        cursor (:source-cursor state)
+        entry (when (and (integer? cursor) (<= 0 cursor) (< cursor (count order))) (nth order cursor))
+        step (nth (get-in materialized [:plan :steps]) (:next-step materialized) nil)
+        result (:result step)
+        equations (filterv #(= (:equation step) (:id %)) (get-in state [:program :equations]))
+        equation (first equations)
+        producer-positions (keep-indexed #(when (= (:id equation) (:equation %2)) %1) order)
+        value (get-in state [:program :values result])
+        storage (get-in state [:realized :buffers result])]
+    (when-not (and entry (invocation/program-result-import? step)
+                   (= (:id step) (:invocation-step entry))
+                   (= (select-keys step [:equation :result]) (:program-result-import entry))
+                   (not (:equation entry)) (not (:storage entry)) (not (:realization entry))
+                   (= 1 (count equations)) (= [result] (:results equation))
+                   (seq (:operations equation)) (not (true? (get-in equation [:attributes :host-only])))
+                   (= :tensor (:kind value)) (= [] (:shape value))
+                   (= 1 (count producer-positions)) (< (first producer-positions) cursor))
+      (fail! :invocation-ordered-next-import
+             "only the exact next snapshot of a preceding numerical scalar may import a result" {}))
+    (when-not (some? storage)
+      (fail! :invocation-ordered-import-storage
+             "numerical result import has no realized result storage token" {:result result}))
+    {:state state :entry entry :step step :equation equation :result result :storage storage :value value}))
+
+(defn ^:no-doc complete-program-result-import
+  "Supply one raw source value to its exact next import, without evaluating,
+   acquiring storage or proving execution/transfer. The runtime owns those proofs."
+  [state step source caller-options]
+  (let [prepared (prepare-program-result-import state caller-options)]
+    (when-not (identical? step (:step prepared))
+      (fail! :invocation-ordered-import-step
+             "result import completion requires the actual current invocation step" {}))
+    (-> state
+        (assoc :materialization (materialization/supply-program-result (:materialization state) step source))
+        (update :source-cursor inc))))
 
 (defn ^:no-doc validate-ordered-source-actions!
   "Check structural executor coverage after begin-ordered-realization, before capture or source
@@ -711,6 +772,8 @@
            "ordered linking requires an explicit native-content provider"
            {:destinations (vec providers)}))
   (checked-ordered-validation state)
+  (when (some invocation/program-result-import? (get-in state [:materialization :plan :steps]))
+    (checked-import-source-order state (materialization/validate-state! (:materialization state))))
   (let [steps (into {} (map (juxt :id identity)) (get-in state [:materialization :plan :steps]))
         equations (into {} (map (juxt :id identity)) (get-in state [:program :equations]))]
     (doseq [entry (:source-order state)
@@ -722,6 +785,8 @@
                 (and step (not (or (invocation/scalar-compute? step)
                                   (invocation/shape-projection? step)
                                   (invocation/value-alias? step)
+                                  (and (invocation/program-result-import? step)
+                                       (= (select-keys step [:equation :result]) (:program-result-import entry)))
                                   (ordered-source-completion? step)
                                   (and (:storage entry) (invocation/buffer-allocation? step))))))
         (fail! :invocation-ordered-source-action

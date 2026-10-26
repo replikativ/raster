@@ -6,12 +6,15 @@
    control expression and retained as first-class algorithms in a ParallelProgram."
   (:require [clojure.set :as set]
             [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.method-entry :as me]
             [raster.compiler.core.op-descriptor :as descriptor]
+            [raster.compiler.core.value-completion :as completion]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.invocation-source :as invocation-source]
             [raster.compiler.ir.axis-map :as axis-map]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.parallel-program :as parallel-program]
+            [raster.compiler.ir.par :as par]
             [raster.compiler.ir.numerical-contract :as numerics]
             [raster.compiler.ir.semantic-fingerprint :as semantic]
             [raster.compiler.ir.segmented-weighted-reduction :as swr]
@@ -1164,7 +1167,10 @@
         (if (= required required') required (recur required'))))))
 
 (defn- retain-analyzed-binding-expressions
-  "Transport analyzed expressions only at their exact original ordered binding identities."
+  "Transport analyzed expressions at their exact original ordered binding identities.
+   A separately projected numerical expression must not overwrite its preserved
+   source initializer. That correspondence is supplied by the constructing
+   frontend and checked against this exact current source position."
   [form descriptions invariant]
   (let [[head bindings & body] form
         pairs (mapv vec (partition 2 bindings))
@@ -1172,16 +1178,22 @@
     (when-not (= (count ids) (count (distinct ids)))
       (throw (ex-info "analyzed source descriptors repeat a binding site"
                       {:reason :raster/bug :invariant invariant :source-binding-ids ids})))
-    (doseq [{:keys [id sym expr]} descriptions]
+    (doseq [{:keys [id sym expr source-expression]} descriptions]
       (when-not (and (integer? id) (<= 0 id) (< id (count pairs))
-                     (= sym (first (nth pairs id))) (some? expr))
+                     (= sym (first (nth pairs id))) (some? (or source-expression expr))
+                     (or (nil? source-expression)
+                         (identical? source-expression (second (nth pairs id)))))
         (throw (ex-info "analyzed source descriptor lost its binding site"
                         {:reason :raster/bug :invariant invariant
                          :binding sym :source-binding-id id}))))
-    (let [pairs (reduce (fn [pairs {:keys [id expr]}]
-                          (assoc pairs id [(first (nth pairs id)) expr])) pairs descriptions)]
-      (with-meta (list* head (with-meta (vec (mapcat identity pairs)) (meta bindings)) body)
-        (meta form)))))
+    (if (every? (fn [{:keys [id expr source-expression]}]
+                  (identical? (or source-expression expr) (second (nth pairs id)))) descriptions)
+      form
+      (let [pairs (reduce (fn [pairs {:keys [id expr source-expression]}]
+                            (assoc pairs id [(first (nth pairs id)) (or source-expression expr)]))
+                          pairs descriptions)]
+        (with-meta (list* head (with-meta (vec (mapcat identity pairs)) (meta bindings)) body)
+          (meta form))))))
 
 (defn- public-resident-source-substitutions
   "Map direct public resident roots and exact top-level symbol aliases to scalar zero-loads.
@@ -1245,6 +1257,62 @@
               (dialect/equations program))]
     (set/union reduction-outputs scalar-outputs)))
 
+(defn- contextual-source-bindings
+  [pairs]
+  (reduce
+   (fn [contexts [position [binder expression]]]
+     (let [{:keys [contract operand]} (completion/canonical-parts expression)]
+       (if-not (and (= :jvm-bytecode-result-context (:source-context contract))
+                    (= :ref (:result-carrier contract)) (par/par-reduce-form? operand))
+         contexts
+         (do
+           (when (contains? (:bindings contexts) binder)
+             (throw (ex-info "contextual source bindings must be unique"
+                             {:reason :typed-soac-contextual-source :binding binder})))
+           (-> contexts
+               (assoc-in [:bindings binder] {:position position :expression expression :contract contract})
+               (assoc-in [:positions position] binder))))))
+   {:bindings {} :positions {}} (map-indexed vector pairs)))
+
+(defn- preserve-contextual-reduction-source
+  "Keep a source-observable result context around NEW scalar reduction source.
+   The algorithm may have fused; its old operand/occurrence is never reused.
+   Resident/compound reconstruction needs its distinct scalar-to-view relation."
+  [program equation {:keys [bindings positions]} realized]
+  (let [results (nth equation 2)
+        attached (keep bindings results)
+        at-placement (get positions (:placement realized))]
+    (if-not (or (seq attached) at-placement)
+      realized
+      (let [result (first results)
+            context (get bindings result)
+            {:keys [kind attributes]} (dialect/operation-parts equation)
+            value (get-in (dialect/facts program) [:values result])
+            pairs (:pairs realized)
+            matches (filterv #(= result (first %)) pairs)
+            source (:source realized)]
+        (when-not (and (= 1 (count results)) (= 1 (count attached)) context
+                       (= (:position context) (:placement realized))
+                       (= [:binding result] (:site realized))
+                       (= 'reduce kind) (nil? (:result-transform attributes))
+                       (= :tensor (:kind value)) (= [] (:shape value))
+                       (= {:kind :plain} (:representation value))
+                       (not (resident/resident-scalar-value? value))
+                       (empty? (get-in (dialect/facts program)
+                                       [:equations (second equation) :attributes :result-storage]))
+                       (= 1 (count pairs) (count matches))
+                       (identical? source (second (first matches)))
+                       (par/par-reduce-form? source))
+          (throw (ex-info "source reduction context has no matching plain scalar realization"
+                          {:reason :typed-soac-contextual-source
+                           :equation (second equation) :result result
+                           :placement (:placement realized)})))
+        (let [wrapped (with-meta (completion/complete-value (:contract context) source)
+                        (meta (:expression context)))]
+          (assoc realized :source wrapped
+                 :pairs (mapv (fn [[id expression :as pair]]
+                                (if (= result id) [id wrapped] pair)) pairs)))))))
+
 (defn- realize-source
   [form program]
   ;; Root and dependency scans run outside the original walker. Retain its
@@ -1276,7 +1344,16 @@
         original-pairs (vec (partition 2 bindings))
         host-binding-ids (set (get-in (dialect/facts program)
                                       [:attributes :host-binding-ids]))
-        realized (mapv #(realize-equation program %) (dialect/equations program))
+        contexts (contextual-source-bindings original-pairs)
+        realized (mapv #(preserve-contextual-reduction-source
+                         program % contexts (realize-equation program %))
+                       (dialect/equations program))
+        missing-contexts (set/difference (set (keys (:bindings contexts)))
+                                         (into #{} (map (comp second :site)) realized))
+        _contexts (when (seq missing-contexts)
+                    (throw (ex-info "source-observable reduction context was lost during realization"
+                                    {:reason :typed-soac-contextual-source
+                                     :bindings missing-contexts})))
         by-placement (group-by :placement realized)
         ;; Fusion constituents are exact source bindings now owned by a realized typed equation.
         ;; They must not re-enter the ordinary host dependency closure after staging/fusion has
@@ -1560,12 +1637,14 @@
 (defn- public-scalar-checkpoint
   "Transport one globally unused source-public scalar across component splitting.
    This selects a candidate; the complete residency and production boundary proofs remain required."
-  [{:keys [typed-program outputs entries]}]
+  [{:keys [typed-program outputs entries source-result] :as projection}]
   (let [facts (dialect/facts typed-program)
         equations (dialect/equations typed-program)
         by-id (into {} (map (juxt second identity)) equations)
         scalar-outputs (resident/public-scalar-results typed-program outputs)
-        result (when (= 1 (count scalar-outputs)) (first scalar-outputs))
+        result (if (contains? projection :source-result)
+                 (when (some #{source-result} scalar-outputs) source-result)
+                 (when (= 1 (count scalar-outputs)) (first scalar-outputs)))
         producer (when result (some #(when (= [result] (nth % 2)) %) equations))]
     (if (and producer (= 'scalar (dialect/operation-kind producer))
              (resident/public-scalar-unused-in-program? facts equations result)
@@ -1810,10 +1889,17 @@
   [form {:keys [segmented-plans?] :as frontend-options}]
   (let [projection (when segmented-plans?
                      (frontend/form->program-components form frontend-options))
+        preserved (into [] (comp (map :description) (filter :source-expression))
+                        (:entries projection))
+        form (if (seq preserved)
+               (retain-analyzed-binding-expressions form preserved :numerical-source-binding-mismatch)
+               form)
+        projection (cond-> projection
+                     (and projection (seq preserved)) (assoc :source form))
         typed-input (or (:typed-program projection)
                         (when-not projection
                           (frontend/form->program form frontend-options)))]
-    {:projection projection
+    {:form form :projection projection
      :typed-input typed-input
      :admitted? (boolean (or typed-input (:segmented-plans? projection)))}))
 
@@ -1826,7 +1912,8 @@
    the filtered form.  If filtering removes the last admitted operation, retain the validated input;
    liveness is an optional optimization and cannot turn an admitted program into fallback."
   [form frontend-options]
-  (let [initial (source-projection form frontend-options)]
+  (let [initial (source-projection form frontend-options)
+        form (:form initial)]
     (if-not (:admitted? initial)
       (assoc initial :form form :bindings-removed 0)
       (let [{filtered :form {:keys [bindings-removed]} :stats}
@@ -1849,7 +1936,7 @@
               (assoc rebuilt :form filtered :bindings-removed bindings-removed)
               (assoc initial :form form :bindings-removed 0))))))))
 
-(defn- validated-terminal-scalar-projection
+(defn- validated-terminal-scalar-projection*
   "Reproject one frontend-certified named terminal scalar without weakening source admission.
 
    The original complete source has already passed projection. A speculative candidate which is
@@ -1857,13 +1944,18 @@
   [{:keys [form projection typed-input] :as admitted} frontend-options]
   (if (or (:segmented-plans? projection) (nil? typed-input))
     (assoc admitted :terminal-scalars-materialized 0)
-    (if-let [{candidate-form :form result :result}
+    (if-let [{candidate-form :form result :result description :description}
              (frontend/materialize-terminal-scalar-result form frontend-options)]
       (let [rebuilt (try
                       (source-projection candidate-form frontend-options)
                       (catch clojure.lang.ExceptionInfo exception
                         (if (frontend/source-decline? exception) nil (throw exception))))
             program (when (:admitted? rebuilt) (:typed-input rebuilt))
+            selection (when program
+                        (public-scalar-checkpoint
+                         (assoc (:projection rebuilt)
+                                :typed-program program :outputs (dialect/outputs program)
+                                :source-result result)))
             result-equation (when program
                               (some #(when (= [result] (nth % 2)) %)
                                     (dialect/equations program)))]
@@ -1872,17 +1964,55 @@
           (do
             (when-not (and (not (:segmented-plans? (:projection rebuilt)))
                            (= 'scalar (some-> result-equation dialect/operation-kind))
-                           (= [result] (dialect/outputs program))
+                           (= 3 (count form) (count candidate-form))
+                           (identical? result (nth candidate-form 2 nil))
+                           (= :scalar (:kind description)) (= result (:sym description))
+                           (= (+ 2 (count (second form))) (count (second candidate-form)))
+                           (identical? result (nth (second candidate-form) (count (second form))))
+                           (every? true? (map identical? (second form) (second candidate-form)))
+                           (identical? (nth form 2) (last (second candidate-form)))
+                           (some #{result} (dialect/outputs program))
                            (= [] (get-in (dialect/facts program) [:values result :shape])))
               (throw (ex-info "terminal scalar reprojection lost its certified result boundary"
                               {:reason :raster/bug
                                :invariant :terminal-scalar-result-projection
                                :result result :outputs (dialect/outputs program)})))
-            (if (resident/terminal-device-scalar-projection program)
-              (assoc rebuilt :form candidate-form :terminal-scalars-materialized 1
-                     :bindings-removed (:bindings-removed admitted))
-              (assoc admitted :terminal-scalars-materialized 0)))))
+            (let [facts (assoc-in (dialect/facts program)
+                                  [:attributes :public-scalar-checkpoint] selection)
+                  selected (dialect/make facts (dialect/equations program) (dialect/outputs program))]
+              ;; Internal host-action liveouts remain outputs of this component.
+              ;; Selection does not prove residency: audit its entire equation
+              ;; spine, including the writer/allocation and every other output.
+              (if (and (= [result] selection)
+                       (resident/terminal-device-scalar-projection selected))
+                (cond-> (assoc rebuilt :form candidate-form :typed-input selected
+                               :terminal-scalars-materialized 1
+                               :bindings-removed (:bindings-removed admitted))
+                  (:projection rebuilt)
+                  (assoc :projection (assoc (:projection rebuilt)
+                                            :typed-program selected :facts facts)))
+                (assoc admitted :terminal-scalars-materialized 0))))))
       (assoc admitted :terminal-scalars-materialized 0))))
+
+(defn- validated-terminal-scalar-projection
+  "Use the ordinary terminal audit for an owned Float publication candidate.
+   A failed optional candidate rolls back as a whole, never retaining just its
+   writer, changed output selection or partially reconstructed component."
+  [admitted frontend-options]
+  (or
+   (when (:admitted? admitted)
+     (me/call-with-optional-definition-inputs
+      (fn []
+        (when-let [candidate (frontend/construct-terminal-float-publication (:form admitted))]
+          (let [rebuilt (try (source-projection (:form candidate) frontend-options)
+                             (catch clojure.lang.ExceptionInfo error
+                               (if (frontend/source-decline? error) nil (throw error))))]
+            (when (:admitted? rebuilt)
+              (let [selected (validated-terminal-scalar-projection*
+                              (assoc rebuilt :bindings-removed (:bindings-removed admitted))
+                              frontend-options)]
+                (when (= 1 (:terminal-scalars-materialized selected)) selected))))))))
+   (validated-terminal-scalar-projection* admitted frontend-options)))
 
 (defn attempt
   "Return a typed production ParallelProgram result, an explicit `:declined` result, or nil when

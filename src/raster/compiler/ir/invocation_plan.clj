@@ -317,9 +317,9 @@
                      (scalar-value? (get values (:result step)))
                      (= value (av/make {:kind :opaque :memory-space :host :ownership :borrowed}))
                      (= (:result step)
-                        (:operand (completion/object-input-parts (:source-expression step)))))
+                        (invocation-source/program-result-source (:source-expression step))))
         (fail! :invocation-program-result-import
-               "program result import requires a scalar demand and an exact opaque Object snapshot"
+               "program result import requires a scalar demand and an exact opaque Object-return recipe"
                {:step id :result (:result step) :value value}))
 
       (shape-projection? step)
@@ -337,15 +337,21 @@
 
       (source-completion? step)
       (let [{:keys [contract operand]} (completion/canonical-parts (:expression step))
-            expected (some-> (completion/source-cast-result-tag contract) dtype/dtype-for-scalar-tag)
+            result (completion/invocation-result-description contract)
+            expected (some-> (:tag result) dtype/dtype-for-scalar-tag)
             symbols (set (keys operands))]
-        (when-not (and (scalar-value? value) expected (= expected (dtype/canon (:dtype value)))
+        (when-not (and result
+                       (case (:kind result)
+                         :opaque (= value (av/make {:kind :opaque :memory-space :host :ownership :borrowed}))
+                         :scalar (and (scalar-value? value) expected
+                                      (= expected (dtype/canon (:dtype value)))))
+                       (or (completion/source-cast-result-tag contract) (symbol? operand))
                        (every? (fn [id]
                                  (let [input (get values id)]
                                    (or (scalar-value? input) (opaque-value? input)))) operand-values)
                        (= (util/free-syms operand) symbols))
           (fail! :invocation-source-completion
-                 "source completion requires a closed source cast over host values"
+                 "source completion requires its declared scalar or opaque result over host values"
                  {:step id :value value})))
 
       (scalar-compute? step)
@@ -631,7 +637,7 @@
                          (vector? bindings) (even? (count bindings)))
                 (mapv vec (partition 2 bindings)))
         snapshots (filterv #(= symbol (first (second %))) (map-indexed vector pairs))
-        result (:operand (completion/object-input-parts expression))
+        result (invocation-source/program-result-source expression)
         producers (filterv #(some #{result} (:results %)) (:equations program))
         producer (first producers)
         sources (filterv #(= result (first (second %))) (map-indexed vector pairs))
@@ -646,9 +652,41 @@
                    (< producer-position position)
                    (identical? producer (parallel-program/equation-for-binding program result producer-source)))
       (fail! :invocation-program-result-import-source
-             "result import requires one exact preceding scalar equation and direct Object snapshot"
+             "result import requires one exact preceding scalar equation and closed Object-return recipe"
              {:binding symbol :result result :producers (mapv :id producers)}))
     {:equation (:id producer) :result result}))
+
+(defn result-import-demands
+  "Reconstruct opaque snapshot demands for actual numerical scalar producers.
+   Argument boxing, array references and host-only scalar equations stay ordinary
+   prefix bindings. Candidate detection grants no authority: every numerical
+   candidate passes the same exact retained-source/order reconstruction as an
+   explicit import. No payload, initialization or device-read fact is supplied."
+  [program bindings]
+  (let [numerical-results (into #{}
+                                (mapcat :results)
+                                (remove #(true? (get-in % [:attributes :host-only]))
+                                        (:equations program)))]
+    (reduce (fn [demands [symbol expression]]
+              (let [result (invocation-source/program-result-source expression)]
+                (if (and result (contains? numerical-results result)
+                         (scalar-value? (get-in program [:values result])))
+                  (assoc demands symbol (result-import-for-source program symbol expression))
+                  demands)))
+            {} bindings)))
+
+(defn source-completion-value
+  "Project an invocation-only completion result without replacing numerical facts.
+   Existing buffer identities keep their separately established storage contract.
+   Canonical scalar result declarations fill missing source facts, not conflicts."
+  [expression retained]
+  (when-let [result (completion/invocation-result-description
+                     (:contract (completion/canonical-parts expression)))]
+    (case (:kind result)
+      :opaque (if (buffer-value? retained) retained
+                  (av/make {:kind :opaque :memory-space :host :ownership :borrowed}))
+      :scalar (or retained
+                  (av/tensor {:dtype (dtype/dtype-for-scalar-tag (:tag result)) :shape []})))))
 
 (defn- prefix-step
   [plan-id ordinal symbol expression value environment lexical-values result-import]
@@ -704,7 +742,8 @@
                             (get environment source) value)
                :source-expression expression))
 
-      (completion/source-cast-result-tag (:contract (completion/canonical-parts expression)))
+      (and (not (buffer-value? value))
+           (completion/invocation-result-description (:contract (completion/canonical-parts expression))))
       (->SourceCompletion id symbol (referenced-operands expression environment) expression value)
 
       (scalar-value? value)
@@ -749,7 +788,14 @@
         initial-environment (into {} (map (juxt :symbol :id)) public)
         {:keys [steps values environment]}
         (reduce (fn [{:keys [steps values environment]} [ordinal [symbol expression]]]
-                  (let [value (get binding-values symbol)]
+                  (let [declared (get binding-values symbol)
+                        ;; Source representations use invocation IDs, distinct
+                        ;; from numerical symbols in program-values. Boxing a
+                        ;; scalar does not make an opaque source value a Float
+                        ;; numerical port. Established buffer aliases remain
+                        ;; governed by their existing storage projection.
+                        value (when declared
+                                (or (source-completion-value expression declared) declared))]
                     (when-not value
                       (fail! :invocation-prefix-value
                              "invocation prefix binding has no retained AbstractValue"

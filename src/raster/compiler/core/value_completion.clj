@@ -245,6 +245,21 @@
              (contains? #{:source-integral-cast :source-floating-cast} (:source-context contract)))
     (case (:operation contract) :int 'int :long 'long (:float :unchecked-float) 'float nil)))
 
+(defn invocation-result-description
+  "Describe the bounded source completion result, not its numerical operand.
+   Object input yields an opaque host value, even when numerical metadata says
+   Float. Buffer identities retain their separate existing storage projection.
+   This declares neither an input Class nor successful conversion/execution."
+  [contract]
+  (when (canonical-contract? contract)
+    (cond
+      (= object-input-contract contract) {:kind :opaque}
+      (source-cast-result-tag contract) {:kind :scalar :tag (source-cast-result-tag contract)}
+      (and (contains? #{:jvm-bytecode-boxed-parameter-input :jvm-bytecode-floating-input
+                        :jvm-primitive-input} (:source-context contract))
+           (identical? Float/TYPE (:target-carrier contract)))
+      {:kind :scalar :tag 'float})))
+
 (defn- value-meta [contract expression]
   ;; A new value term cannot inherit the original callee's identity/effects or
   ;; a JVM hint which changes physical compilation. Retain declarations only.
@@ -294,16 +309,24 @@
   (let [parts (canonical-parts expression)]
     (when (= object-input-contract (:contract parts)) parts)))
 
-(defn boxed-reference-input-parts
-  "Recognize a boxed-entry reference CHECKCAST, without discharging it.
+(defn reference-input-parts
+  "Recognize an explicit entry/Method reference CHECKCAST, without discharging it.
    The actual Class remains in the original contract. No declaration, storage
    dtype or source spelling establishes the operand's Class or presence."
   [expression]
   (when-let [{:keys [contract] :as parts} (canonical-parts expression)]
     (let [carrier (:target-carrier contract)]
-      (when (and (= :jvm-bytecode-boxed-parameter-input (:source-context contract))
+      (when (and (contains? #{:jvm-bytecode-boxed-parameter-input :jvm-bytecode-reference-input}
+                            (:source-context contract))
                  (class? carrier) (not (.isPrimitive ^Class carrier)))
         parts))))
+
+(defn boxed-reference-input-parts
+  "The boxed-wrapper-only specialization of the reference-input grammar."
+  [expression]
+  (let [parts (reference-input-parts expression)]
+    (when (= :jvm-bytecode-boxed-parameter-input (get-in parts [:contract :source-context]))
+      parts)))
 
 (defn bytecode-context-form?
   "A canonical region whose reconstruction needs original bytecode authority.

@@ -637,6 +637,34 @@
 
 (deftype ^:private InputOrigins [input-body emitted-body families])
 
+(defn- clear-emission-occurrence-metadata [expression]
+  (if (instance? clojure.lang.IObj expression)
+    (vary-meta expression dissoc ::call-occurrence ::binding-scope-occurrence
+               ::reduction-occurrence ::reduction-witness ::reduction-role
+               ::completion-occurrence)
+    expression))
+
+(defn ^:no-doc detach-emission-occurrences
+  "Construct source without borrowed JVM emission occurrence identities.
+   Only the emitter's private ownership keys are removed; semantic metadata is
+   retained and quoted data stays opaque. This supplies no equivalence proof:
+   the enclosing producer must first discharge its original source relation.
+   A later actual emission acquires its own independent occurrence ownership."
+  [source]
+  (letfn [(visit [expression]
+            (if (and (seq? expression)
+                     (contains? '#{quote clojure.core/quote} (first expression)))
+              expression
+              (let [cleared (clear-emission-occurrence-metadata expression)
+                    cleared (if (instance? clojure.lang.IObj cleared)
+                              (vary-meta cleared dissoc ::body-occurrence)
+                              cleared)]
+                (if (completion/canonical-form? cleared)
+                  (with-meta (list (first cleared) (second cleared) (visit (nth cleared 2)))
+                    (meta cleared))
+                  (mex/walk-preserving-meta visit identity cleared)))))]
+    (visit source)))
+
 (defn ^:no-doc retain-invocation-occurrences
   "Give each executable call occurrence an emission-local identity.
    Run after semantic source transforms, before backend macroexpansion. This
@@ -650,11 +678,7 @@
                 expression
                 (let [node (mex/walk-preserving-meta
                             visit identity
-                            (if (instance? clojure.lang.IObj expression)
-                              (vary-meta expression dissoc ::call-occurrence ::binding-scope-occurrence
-                                         ::reduction-occurrence ::reduction-witness ::reduction-role
-                                         ::completion-occurrence)
-                              expression))]
+                            (clear-emission-occurrence-metadata expression))]
                   (cond
                     (completion/canonical-form? node)
                     (let [token (Object.)
@@ -7402,61 +7426,197 @@
   [emission input-body original]
   (compile-source-completion-region emission input-body original :source-floating-cast))
 
-(defn ^:no-doc compile-planned-source-floating-completion-region
-  "Compile a NEW lexical Object -> Float source recipe under its construction owner.
-   This does not outline or claim an observed occurrence in owner-emission. The chosen
-   Object input ABI preserves source Number conversion; it is not payload-Class evidence.
-   The caller guard owns exact source/plan correspondence, freshness and use permission.
-   No numerical-result transfer or runtime completion is authorized by this constructor."
-  [owner-emission expression operand-policy owner-guard]
-  (let [{:keys [contract operand]} (completion/canonical-parts expression)]
-    (when-not (and (= :source-floating-cast (:source-context contract))
-                   (completion/canonical-contract? contract)
-                   (= 'float (completion/source-cast-result-tag contract))
-                   (symbol? operand) (source-policy/valid? operand-policy)
+(defn- compile-planned-recipe-region
+  "Own one NEW closed recipe's compilation, history and post-emission audit."
+  [owner-emission input carrier recipe spec-options owner-guard audit!]
+  (let [observations (atom {:static [] :values []})
+        child-lineage (atom nil)
+        guard (fn []
+                (owner-guard)
+                (me/assert-emission-inputs-current! owner-emission)
+                (me/assert-definition-inputs-current! @observations)
+                (when-let [lineage @child-lineage]
+                  (me/assert-emission-inputs-current! lineage)))
+        region (binding [me/*emission-inputs* observations]
+                 (let [dependencies (prepare-emission-input-snapshots!
+                                     [recipe] (:source-ns owner-emission) (vec (keys (:ports input))))
+                       revision (dispatch/compiler-definition-revision)
+                       region (compile-owned-input-region
+                               owner-emission input carrier
+                               (assoc spec-options :walked-body [recipe]) guard)]
+                   (reset! child-lineage
+                           {:dependency-snapshots (into dependencies (:values @observations))
+                            :static-inputs (:static @observations)
+                            :producer-inputs (:producer-inputs @observations)
+                            :definition-revision revision
+                            :completed-definition-revision (dispatch/compiler-definition-revision)})
+                   region))]
+    (audit! @observations)
+    (guard)
+    region))
+
+(defn ^:no-doc compile-planned-completion-region
+  "Compile a NEW bounded lexical completion under its construction owner.
+   The trusted caller authenticates the actual operand port and observed carrier/
+   context against current source. This compiler audits NEW code only; it claims
+   no original occurrence, payload, transfer or runtime permission."
+  [owner-emission expression operand-port observed operand-policy owner-guard]
+  (let [{:keys [contract operand]} (completion/canonical-parts expression)
+        kind (:source-context contract)
+        object? (= completion/object-input-contract contract)
+        source? (= :source-floating-cast kind)
+        floating? (and (= :jvm-bytecode-floating-input kind)
+                       (identical? Float/TYPE (:target-carrier contract)))
+        boxed? (and (= :jvm-bytecode-boxed-parameter-input kind)
+                    (identical? Float/TYPE (:target-carrier contract)))
+        raw (:type operand-port)
+        completed (:completion-carrier observed)
+        carrier (case completed :float Float/TYPE :ref Object nil)
+        context (:operand-context observed)]
+    (when-not (and (completion/canonical-contract? contract) (symbol? operand)
+                   (or object? floating? boxed?
+                       (and source? (= 'float (completion/source-cast-result-tag contract))))
+                   (contains? #{:float :ref} raw)
+                   (or (= :float raw)
+                       (contains? #{Object Float} (:reference-class operand-port)))
+                   (or (= :float raw) (boolean? (:verified operand-port)))
+                   (= contract (:contract observed))
+                   (= (if (or object? boxed?) :ref raw) (:input-carrier observed))
+                   (= (if object? :ref :float) completed)
+                   (completion/bytecode-operand-context? context)
+                   (or (not floating?) (= context (:operand-context contract)))
+                   (source-policy/valid? operand-policy)
+                   (or (not source?) (= operand-policy (:operand-source-policy observed)))
                    (ifn? owner-guard))
-      (throw (ex-info "Planned Float completion requires one canonical lexical Object input"
-                      {:reason :planned-source-floating-completion-form})))
-    (let [observations (atom {:static [] :values []})
-          child-lineage (atom nil)
-          token (Object.)
+      (throw (ex-info "Planned completion requires a supported actual lexical port and observation"
+                      {:reason :planned-completion-form})))
+    (let [token (Object.)
           recipe (vary-meta expression assoc ::completion-occurrence token)
           ;; This closed grammar has exactly one lexical operand and a canonical
           ;; conversion. Unlike arbitrary source, it cannot contain sibling calls.
-          input {:ports {operand {:slot 0 :type :ref :reference-class Object :verified false}}
+          input {:ports {operand (assoc operand-port :slot 0)}
                  :unretained-sibling-calls? false}
-          guard (fn []
-                  (owner-guard)
-                  (me/assert-emission-inputs-current! owner-emission)
-                  (me/assert-definition-inputs-current! @observations)
-                  (when-let [lineage @child-lineage]
-                    (me/assert-emission-inputs-current! lineage)))
-          region
-          (binding [me/*emission-inputs* observations]
-            (let [dependencies (prepare-emission-input-snapshots!
-                                [recipe] (:source-ns owner-emission) [operand])
-                  revision (dispatch/compiler-definition-revision)
-                  region (compile-owned-input-region
-                          owner-emission input Float/TYPE
-                          {:return-tag 'float :walked-body [recipe]
-                           :source-policy operand-policy} guard)]
-              (reset! child-lineage
-                      {:dependency-snapshots (into dependencies (:values @observations))
-                       :static-inputs (:static @observations)
-                       :producer-inputs (:producer-inputs @observations)
-                       :definition-revision revision
-                       :completed-definition-revision (dispatch/compiler-definition-revision)})
-              region))
-          actual (get-in @observations [:completion-contexts token])]
-      (when-not (and (= :known (:status actual))
-                     (= contract (:contract actual))
-                     (= :ref (:input-carrier actual))
-                     (= :float (:completion-carrier actual))
-                     (= operand-policy (:operand-source-policy actual)))
-        (throw (ex-info "Planned source completion emitted a different conversion ABI"
-                        {:reason :planned-source-floating-completion-carrier})))
-      (guard)
+          audit-keys (cond-> [:contract :input-carrier :completion-carrier :operand-context]
+                       source? (conj :operand-source-policy)
+                       (contains? observed :adaptation) (conj :adaptation))
+          region (compile-planned-recipe-region
+                  owner-emission input carrier recipe
+                  {:return-tag (if object? 'Object 'float) :source-policy operand-policy
+                   ::body-input-context context}
+                  owner-guard
+                  (fn [observations]
+                    (let [actual (get-in observations [:completion-contexts token])]
+                      (when-not (and (= :known (:status actual))
+                                     (= (select-keys observed audit-keys) (select-keys actual audit-keys)))
+                        (throw (ex-info "Planned completion emitted a different conversion ABI or context"
+                                        {:reason :planned-completion-carrier}))))))]
       (assoc region :completion-contract contract))))
+
+(defn ^:no-doc compile-planned-result-return-region
+  "Construct a NEW primitive FP payload -> boxed Object snapshot recipe.
+   The caller authenticates Float/Double payload Class from the actual producer's
+   normal return, not an AV. Box the root once per captured producer execution;
+   apply the separate Object return region for each snapshot (never cache its
+   adapted result). :invoke composes both for a standalone use. No old occurrence
+   or device read is claimed; actual Method evidence belongs to each subregion."
+  [owner-emission snapshot-expression result-symbol payload-carrier operand-policy owner-guard]
+  (let [outer (completion/object-input-parts snapshot-expression)
+        returned (completion/canonical-parts (:operand outer))
+        contract (:contract returned)
+        conversion? (and (= :jvm-bytecode-floating-input (:source-context contract))
+                         (contains? #{Float/TYPE Double/TYPE} (:target-carrier contract))
+                         (= :ref (:expected-input-carrier contract)))
+        source (if conversion? (:operand returned) (:operand outer))]
+    (when-not (and outer (symbol? result-symbol) (= result-symbol source)
+                   (contains? #{Float/TYPE Double/TYPE} payload-carrier)
+                   (source-policy/valid? operand-policy) (ifn? owner-guard))
+      (throw (ex-info "Planned result return requires a closed FP/Object snapshot recipe"
+                      {:reason :planned-result-return-form})))
+    (let [used (into #{} (filter symbol?) (tree-seq coll? seq snapshot-expression))
+          fresh (fn [prefix]
+                  (loop [candidate (gensym prefix)]
+                    (if (contains? used candidate) (recur (gensym prefix)) candidate)))
+          port (fresh "planned_result_payload__")
+          root-port (fresh "planned_result_root__")
+          raw (if (identical? Float/TYPE payload-carrier) :float :double)
+          box-token (Object.)
+          return-token (Object.)
+          outer-token (Object.)
+          boxed (vary-meta (completion/complete-value completion/object-input-contract port)
+                           assoc ::completion-occurrence box-token)
+          completed (if conversion?
+                      (vary-meta (completion/complete-value contract root-port)
+                                 assoc ::completion-occurrence return-token)
+                      root-port)
+          recipe (vary-meta (completion/complete-value completion/object-input-contract completed)
+                            assoc ::completion-occurrence outer-token)
+          object-context (completion/bytecode-operand-context (object-input-context {}))
+          object-record? #(and (= :known (:status %))
+                                (= completion/object-input-contract (:contract %))
+                                (= :ref (:input-carrier %) (:completion-carrier %))
+                                (= object-context (:operand-context %)))
+          box-region (compile-planned-recipe-region
+                      owner-emission {:ports {port {:slot 0 :type raw :verified false}}
+                                      :unretained-sibling-calls? false}
+                      Object boxed {:return-tag 'Object :source-policy operand-policy} owner-guard
+                      (fn [observations]
+                        (let [box (get-in observations [:completion-contexts box-token])]
+                          (when-not (and (object-record? box) (= raw (get-in box [:locals-before port :type])))
+                            (throw (ex-info "Planned result root box emitted a different FP/Object ABI"
+                                            {:reason :planned-result-return-carrier}))))))
+          return-region (compile-planned-recipe-region
+                         owner-emission {:ports {root-port {:slot 0 :type :ref :reference-class Object :verified false}}
+                                         :unretained-sibling-calls? false}
+                         Object recipe {:return-tag 'Object :source-policy operand-policy} owner-guard
+                         (fn [observations]
+                           (let [records (:completion-contexts observations)
+                                 outer (get records outer-token)
+                                 converted (get records return-token)]
+                             (when-not (and (object-record? outer)
+                                            (= :ref (get-in outer [:locals-before root-port :type]))
+                                     (or (not conversion?)
+                                         (and (= :known (:status converted)) (= contract (:contract converted))
+                                              (= :ref (:input-carrier converted))
+                                              (= (if (identical? Float/TYPE (:target-carrier contract)) :float :double)
+                                                 (:completion-carrier converted))
+                                              (= (:operand-context contract) (:operand-context converted)))))
+                               (throw (ex-info "Planned result snapshot emitted a different FP/Object recipe"
+                                               {:reason :planned-result-return-carrier}))))))
+          guard #(do ((:guard box-region)) ((:guard return-region)))
+          invoke (fn [payload]
+                   (guard)
+                   (let [root ((:invoke box-region) payload)
+                         result ((:invoke return-region) root)]
+                     (guard)
+                     result))]
+      (guard)
+      {:kind :planned-result-return :parameters [port] :parameter-carriers [payload-carrier]
+       :return-carrier Object :box-region box-region :return-region return-region
+       :invoke invoke :guard guard :snapshot-expression snapshot-expression
+       :result-symbol result-symbol :payload-carrier payload-carrier})))
+
+(defn ^:no-doc compile-planned-source-floating-completion-region
+  "Compile a NEW lexical Object -> Float source recipe, preserving the original
+   deliberate Object ABI. This is not evidence of an occurrence in owner-emission."
+  [owner-emission expression operand-policy owner-guard]
+  (let [{:keys [contract operand]} (completion/canonical-parts expression)]
+    (when-not (and (= :source-floating-cast (:source-context contract))
+                   (= 'float (completion/source-cast-result-tag contract))
+                   (symbol? operand) (source-policy/valid? operand-policy) (ifn? owner-guard))
+      (throw (ex-info "Planned Float completion requires one canonical lexical Object input"
+                      {:reason :planned-source-floating-completion-form})))
+    (try
+      (compile-planned-completion-region
+       owner-emission expression {:slot 0 :type :ref :reference-class Object :verified false}
+       {:contract contract :input-carrier :ref :completion-carrier :float
+        :operand-context (completion/bytecode-operand-context {}) :operand-source-policy operand-policy}
+       operand-policy owner-guard)
+      (catch clojure.lang.ExceptionInfo failure
+        (if-let [reason (get {:planned-completion-form :planned-source-floating-completion-form
+                             :planned-completion-carrier :planned-source-floating-completion-carrier}
+                            (:reason (ex-data failure)))]
+          (throw (ex-info (.getMessage failure) (assoc (ex-data failure) :reason reason) failure))
+          (throw failure))))))
 
 (defn- compile-raw-int-input-region
   [emission input input-type element-type guard]
@@ -7789,18 +7949,9 @@
     "V" (.aconst_null code)
     nil))
 
-(defn compile-typed-impl!
-  "Compile a deftm walked body into a class implementing the typed interface.
-  Returns an instance of the compiled class, or nil on failure.
-
-  The compiled class has a single `invk` method that:
-  1. Checkcasts Object params to the types expected by the static method
-  2. Calls invokestatic on the compiled static method
-  3. Returns the result
-
-  This replaces the Clojure-compiled deftype body with optimized bytecode
-  (branch folding, int loops, checkcast elimination)."
-  [class-name params tags return-tag walked-body source-ns typed-iface-name
+(defn- compile-typed-impl-with-extraction!
+  "Shared implementation and wrapper emission; extraction is a construction policy."
+  [extract-parallel? class-name params tags return-tag walked-body source-ns typed-iface-name
   & [fallback-ns fallback-name owned-siblings prepare-source!]]
   ;; Note: clojure.lang.IFn caps positional invoke at 20 args, but the JVM
   ;; method limit is 255. For >20 typed params we still emit compute_static
@@ -7811,7 +7962,7 @@
         ;; separate static methods. Keeps scalar code in the main method.
         ;; Uses size estimate to avoid splitting small bodies unnecessarily.
         form (first walked-body)
-        needs-split? (and (seq? form)
+        needs-split? (and extract-parallel? (seq? form)
                           (contains? #{'let 'let*} (first form))
                           (let [[_ binds & body] form]
                             (let [par-form? (requiring-resolve 'raster.compiler.passes.parallel.descriptors/par-form?)
@@ -8140,6 +8291,27 @@
                                                           (into-array Class (repeat (count param-cds) Object))))}
                     :compute-parameter-carriers (vec compute-params))))
     implementation))
+
+(defn compile-typed-impl!
+  "Compile a deftm walked body into a class implementing its typed interface.
+   Ordinary compilation retains parallel method extraction for large bodies.
+   The same actual compute/wrapper emission records their argument completions
+   and return edge; splitting alone grants no whole-source observation proof."
+  [class-name params tags return-tag walked-body source-ns typed-iface-name & options]
+  (apply compile-typed-impl-with-extraction! true
+         class-name params tags return-tag walked-body source-ns typed-iface-name options))
+
+(defn ^:no-doc compile-whole-source-impl!
+  "Emit an owned whole-source observation without parallel method extraction.
+   Uses the ordinary implementation/wrapper machinery and all its checks. This
+   is not a runtime optimization policy or a split-body equivalence claim.
+   JVM method-size limits remain errors; no partial observation is published."
+  [class-name params tags return-tag walked-body source-ns typed-iface-name & options]
+  (when-not me/*emission-inputs*
+    (throw (ex-info "whole-source observation requires its emission owner"
+                    {:reason :whole-source-emission-owner})))
+  (apply compile-typed-impl-with-extraction! false
+         class-name params tags return-tag walked-body source-ns typed-iface-name options))
 
 ;; ================================================================
 ;; compile-pipeline! — batch recompilation into a single class

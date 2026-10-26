@@ -37,6 +37,7 @@
             [raster.compiler.passes.parallel.structured-control-route :as structured-route]
             [raster.compiler.passes.parallel.typed-soac-resident :as resident]
             [raster.compiler.passes.scalar.soa-lower :as soa-lower]
+            [raster.compiler.passes.scalar.source-import :as source-import]
             [raster.compiler.pipeline :as pipeline]
             [raster.gpu.schedule :as gpu-schedule]
             [raster.core :as rcore]))
@@ -428,6 +429,47 @@
      :dispatch-reassociated? dispatch-reassociated?
      :dispatch-contractions? dispatch-contractions?}))
 
+(defn- attach-source-action-adapters
+  "Build process-local source recipes from the final semantic source, not a
+   pre-fusion witness. These authorize no execution or transfer. Source-free
+   programs have no original entry with which to discharge such recipes."
+  [compilation compiler-options]
+  (let [program (:semantic compilation)
+        plan (get-in program [:attributes :invocation-plan])
+        completions (filterv invocation/source-completion? (:steps plan))
+        imports (filterv invocation/program-result-import? (:steps plan))]
+    (if-not (or (seq completions) (seq imports))
+      compilation
+      (let [source-var (:source-var compiler-options)
+            _ (when-not (var? source-var)
+                (fail! :equation-first-source-action-owner
+                       "source actions require their original deftm entry" {}))
+            ;; Preparation may promote helpers and stale earlier observations.
+            ;; The enclosing definition-input transaction retries the complete
+            ;; compilation; never refresh an old witness around new source.
+            _ (rcore/prepare-emission-source-walk! source-var)
+            original (method-entry/prepare-frontend-source!
+                      (method-entry/original-source-frontend source-var) source-var
+                      rcore/ensure-current-owned-bytecode!)
+            witness (source-import/prepare-contextual-source-witness
+                     (:source program)
+                     (assoc compiler-options :lexical-inputs (:public-parameters compiler-options)))
+            request {:frontend original :source-program program :emitted (:emitted compilation)
+                     :plan plan :witness witness
+                     :caller-options (when (contains? compiler-options :scalar-math)
+                                       (select-keys compiler-options [:scalar-math]))}]
+        (cond-> compilation
+          (seq completions)
+          (assoc :source-completion-adapters
+                 (into {} (map (fn [step]
+                                 [(:id step) (source-import/compile-source-completion-step
+                                              (assoc request :step step))])) completions))
+          (seq imports)
+          (assoc :program-result-import-adapters
+                 (into {} (map (fn [step]
+                                 [(:id step) (source-import/compile-program-result-import-step
+                                              (assoc request :step step))])) imports)))))))
+
 (defn- compile-semantic
   "Schedule and emit one exact typed semantic program without source or ABI reconstruction."
   [{:keys [id function-id target dtype source-ns options compiler-options]
@@ -475,7 +517,8 @@
       (fail! :equation-first-invocation
              "equation-first semantic program has no retained public invocation plan"
              {:function function-id}))
-    (->EquationFirstCompilation
+    (attach-source-action-adapters
+     (->EquationFirstCompilation
      id function-id target dtype source-ns
      (cond-> (-> compiler-options
                  (assoc :schedule resolved-schedule)
@@ -492,7 +535,8 @@
       :schedule {:dialect (:dialect scheduled)
                  :equations (count (:equations scheduled))}
       :emission (:stats emission)
-      :fallback :none})))
+      :fallback :none})
+     compiler-options)))
 
 (def ^:private typed-compilation-options
   #{:target :schedule :scalar-math :resident-outputs})
@@ -702,6 +746,33 @@
       promoted)
       resident-outputs options))))
 
+(defn- project-semantic-source
+  "Keep target-local source construction out of original/JIT source publication."
+  [source compiler-options representation]
+  (pipeline/call-with-gpu-source-construction
+   (:target-device compiler-options)
+   (fn []
+     (let [represented-source (pipeline/run-passes
+                               source pipeline/gpu-resident-pre-soa-passes compiler-options)
+           represented (soa-lower/soa-lower represented-source (:params representation)
+                                             (:soa-env representation))
+           projection (:projection representation)
+           physical-parameters (mapv :sym (:params represented))
+           physical-types (when projection
+                            (opencl-pass/derive-param-types physical-parameters
+                                                           (mapv :tag (:params represented))
+                                                           (:dtype compiler-options) compiler-options))
+           compiler-options (cond-> compiler-options
+                              projection (assoc :active-params physical-parameters
+                                                :public-parameters physical-parameters
+                                                :array-types (:array-types physical-types)
+                                                :scalar-types (:scalar-types physical-types)))]
+       {:program (pipeline/run-passes
+                  (:body represented) pipeline/gpu-semantic-post-soa-passes
+                  compiler-options :write-read-fused)
+        :compiler-options compiler-options
+        :projection projection}))))
+
 (defn compile
   "Compile one deftm Var into an immutable equation-first target program.
 
@@ -746,25 +817,11 @@
                                                        :target-descriptor target-descriptor)))
          walked (pipeline/get-walked-body resolved-var (:dtype compiler-options))
          source (if (= 1 (count walked)) (first walked) (list* 'do walked))
-         represented-source (pipeline/run-passes
-                             source pipeline/gpu-resident-pre-soa-passes compiler-options)
          representation (parameter-representation f-var (:dtype compiler-options))
-         param-specs (:params representation)
-         represented (soa-lower/soa-lower represented-source param-specs (:soa-env representation))
-         projection (:projection representation)
-         physical-parameters (mapv :sym (:params represented))
-         physical-types (when projection
-                          (opencl-pass/derive-param-types physical-parameters
-                                                         (mapv :tag (:params represented))
-                                                         (:dtype compiler-options) compiler-options))
-         compiler-options (cond-> compiler-options
-                            projection (assoc :active-params physical-parameters
-                                              :public-parameters physical-parameters
-                                              :array-types (:array-types physical-types)
-                                              :scalar-types (:scalar-types physical-types)))
-         semantic-candidate (pipeline/run-passes
-                             (:body represented) pipeline/gpu-semantic-post-soa-passes
-                             compiler-options :write-read-fused)
+         projected-source (project-semantic-source source compiler-options representation)
+         compiler-options (:compiler-options projected-source)
+         projection (:projection projected-source)
+         semantic-candidate (:program projected-source)
          semantic (case (:dialect semantic-candidate)
                     :typed-parallel (if (get-in semantic-candidate [:attributes :invocation-plan])
                                       semantic-candidate

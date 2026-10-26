@@ -108,6 +108,187 @@
       (is (= (outcome (fn [x _] (source-cast x)) (constantly value))
              (outcome (fn [x _] ((:invoke region) x)) (constantly value)))))))
 
+(defn- actual-planned-completion [tag contract]
+  (let [expression (completion/complete-value contract 'input)
+        body [expression]
+        interface (types/ensure-fn-interface! [tag])
+        policy {:unchecked-math false}
+        emitted (binding [*unchecked-math* false]
+                  (core/emit-owned-bytecode!
+                   bytecode/compile-typed-impl! "raster.compiled.PlannedCompletionSource"
+                   '[input] [tag] (if (= contract completion/object-input-contract) 'Object 'float)
+                   body *ns* (:iface-name interface) 'planned-completion-source))
+        observed (bytecode/retained-input-completion-context (:emission emitted) body expression)]
+    {:emission (:emission emitted) :expression expression :observed observed
+     :port (get (:locals-before observed) 'input) :policy policy}))
+
+(deftest planned-canonical-completions-preserve-actual-port-and-result-abis
+  (let [context (completion/bytecode-operand-context {})]
+    (doseq [[tag contract] [['float completion/object-input-contract]
+                            ['Object completion/object-input-contract]
+                            ['Object (completion/bytecode-boxed-parameter-contract Float/TYPE)]
+                            ['Object (completion/bytecode-floating-input-contract Float/TYPE context)]
+                            ['float (completion/bytecode-boxed-parameter-contract Float/TYPE)]
+                            ['float (completion/bytecode-floating-input-contract Float/TYPE context)]
+                            ['float (completion/source-floating-cast-contract :float {:unchecked-math false})]]
+            :let [{:keys [emission expression observed port policy]}
+                  (actual-planned-completion tag contract)
+                  region (bytecode/compile-planned-completion-region
+                          emission expression port observed policy (fn []))
+                  method ^java.lang.reflect.Method (:method region)
+                  object? (= contract completion/object-input-contract)]]
+      (is (= [(if (= tag 'float) Float/TYPE Object)] (vec (.getParameterTypes method))))
+      (is (identical? (if object? Object Float/TYPE) (.getReturnType method)))
+      (is (= (assoc port :slot 0) (get-in region [:physical-ports 'input])))
+      (doseq [value [(float 0.25) (float -0.0) (Float/intBitsToFloat 0x7fc01234)
+                     Float/POSITIVE_INFINITY]]
+        (let [actual ((:invoke region) value)]
+          (is (instance? Float actual))
+          (is (= (Float/floatToRawIntBits value) (Float/floatToRawIntBits actual)))))
+      (when (and (= tag 'Object) object?)
+        (let [opaque (Object.)]
+          (is (identical? opaque ((:invoke region) opaque)))
+          (is (nil? ((:invoke region) nil))))))))
+
+(deftest planned-primitive-float-entry-retains-number-effects-and-current-owner
+  (let [{:keys [emission expression observed port policy]}
+        (actual-planned-completion 'Object (completion/bytecode-boxed-parameter-contract Float/TYPE))
+        stale? (atom false)
+        failure (Exception. "retired planned completion")
+        guard #(when @stale? (throw failure))
+        region (bytecode/compile-planned-completion-region emission expression port observed policy guard)
+        calls (atom 0)
+        value (proxy [Number] []
+                (intValue [] (throw (AssertionError. "wrong conversion")))
+                (longValue [] (throw (AssertionError. "wrong conversion")))
+                (doubleValue [] (throw (AssertionError. "wrong conversion")))
+                (floatValue [] (swap! calls inc) (float -0.0)))]
+    (is (= (Float/floatToRawIntBits (float -0.0))
+           (Float/floatToRawIntBits ((:invoke region) value))))
+    (is (= 1 @calls))
+    (is (thrown? NullPointerException ((:invoke region) nil)))
+    (is (thrown? ClassCastException ((:invoke region) true)))
+    (reset! stale? true)
+    (is (identical? failure (try ((:invoke region) value) nil (catch Exception error error))))
+    (is (= 1 @calls))
+    (doseq [[bad-expression bad-port bad-observed]
+            [[expression (assoc port :type :double) observed]
+             [expression (assoc port :reference-class Double) observed]
+             [expression port (assoc observed :completion-carrier :ref)]
+             [(completion/complete-value (:contract observed) '(do input input)) port observed]
+             [(completion/complete-value (completion/bytecode-boxed-parameter-contract Double/TYPE) 'input)
+              port (assoc observed :contract (completion/bytecode-boxed-parameter-contract Double/TYPE))]]]
+      (is (= :planned-completion-form
+             (try (bytecode/compile-planned-completion-region
+                   emission bad-expression bad-port bad-observed policy (fn [])) nil
+                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))
+    (is (= :planned-completion-carrier
+           (try (bytecode/compile-planned-completion-region
+                 emission expression port (assoc observed :adaptation :identity) policy (fn [])) nil
+                (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))))
+
+(deftest planned-result-snapshots-retain-primitive-payload-and-exact-return-recipe
+  (let [{:keys [emission]} (fixture 'Object :float false false 'value)
+        context (completion/bytecode-operand-context {:object-result? true})
+        result 'numerical-result
+        snapshot (fn [target]
+                   (completion/complete-value
+                    completion/object-input-contract
+                    (if target
+                      (completion/complete-value
+                       (completion/planned-bytecode-input-contract target context :ref) result)
+                      result)))
+        bits (fn [value]
+               (cond (instance? Float value) [:float (Float/floatToRawIntBits value)]
+                     (instance? Double value) [:double (Double/doubleToRawLongBits value)]))]
+    (doseq [payload [Float/TYPE Double/TYPE]
+            target [nil Float/TYPE Double/TYPE]
+            :let [expression (snapshot target)
+                  region (bytecode/compile-planned-result-return-region
+                          emission expression result payload {:unchecked-math false} (fn []))
+                  box-method ^java.lang.reflect.Method (get-in region [:box-region :method])
+                  return-method ^java.lang.reflect.Method (get-in region [:return-region :method])]]
+      (is (= [payload] (:parameter-carriers region)))
+      (is (= [payload] (vec (.getParameterTypes box-method))))
+      (is (identical? Object (.getReturnType box-method)))
+      (is (= [Object] (vec (.getParameterTypes return-method))))
+      (is (identical? Object (.getReturnType return-method)))
+      (is (identical? expression (:snapshot-expression region)))
+      (is (not= result (first (:parameters region))) "the new primitive input never claims the old result occurrence")
+      (doseq [value (if (identical? Float/TYPE payload)
+                     [(float 0.0) (float -0.0) (float 1.25) (Float/intBitsToFloat 0x7fc01234)
+                      Float/POSITIVE_INFINITY Float/NEGATIVE_INFINITY Float/MAX_VALUE]
+                     [0.0 -0.0 1.25 (Double/longBitsToDouble 0x7ff8000000001234)
+                      Double/POSITIVE_INFINITY Double/NEGATIVE_INFINITY Double/MAX_VALUE])]
+        (let [expected (cond
+                         (identical? Float/TYPE target) (.floatValue ^Number value)
+                         (identical? Double/TYPE target) (.doubleValue ^Number value)
+                         :else value)
+              actual ((:invoke region) value)]
+          (is (= (bits expected) (bits actual))))))))
+
+(deftest planned-result-return-refuses-unowned-grammar-and-stale-construction
+  (let [{:keys [emission]} (fixture 'Object :float false false 'value)
+        context (completion/bytecode-operand-context {})
+        result 'result
+        expression (completion/complete-value completion/object-input-contract result)
+        stale? (atom false)
+        failure (Exception. "retired result recipe")
+        region (bytecode/compile-planned-result-return-region
+                emission expression result Double/TYPE {:unchecked-math false}
+                #(when @stale? (throw failure)))]
+    (doseq [[snapshot symbol carrier]
+            [[expression result Long/TYPE]
+             [expression 'foreign Double/TYPE]
+             [(completion/complete-value completion/object-input-contract '(do result result)) result Double/TYPE]
+             [(completion/complete-value completion/object-input-contract
+                                         (completion/complete-value
+                                          (completion/planned-bytecode-input-contract Double/TYPE context :double) result))
+              result Double/TYPE]
+             [(completion/complete-value completion/object-input-contract
+                                         (completion/complete-value
+                                          (completion/source-floating-cast-contract :float {:unchecked-math false}) result))
+              result Double/TYPE]
+             ['(clojure.core/float result) result Double/TYPE]]]
+      (is (= :planned-result-return-form
+             (try (bytecode/compile-planned-result-return-region
+                   emission snapshot symbol carrier {:unchecked-math false} (fn [])) nil
+                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))
+    (reset! stale? true)
+    (doseq [invoke [(:invoke region) (get-in region [:box-region :invoke]) (get-in region [:return-region :invoke])]]
+      (is (identical? failure (try (invoke 1.0) nil (catch Exception error error)))))))
+
+(deftest result-snapshots-share-only-the-captured-root-not-adapted-boxes
+  (let [{:keys [emission]} (fixture 'Object :float false false 'value)
+        context (completion/bytecode-operand-context {})
+        result 'result
+        direct-expression (completion/complete-value completion/object-input-contract result)
+        return-expression (completion/complete-value
+                           completion/object-input-contract
+                           (completion/complete-value
+                            (completion/planned-bytecode-input-contract Float/TYPE context :ref) result))]
+    (doseq [payload [Float/TYPE Double/TYPE]
+            :let [direct (bytecode/compile-planned-result-return-region
+                          emission direct-expression result payload {:unchecked-math false} (fn []))
+                  returned (bytecode/compile-planned-result-return-region
+                            emission return-expression result payload {:unchecked-math false} (fn []))
+                  value (if (identical? payload Float/TYPE)
+                          (Float/intBitsToFloat 0x7fc01234) (Double/longBitsToDouble 0x7ff8000000001234))
+                  root ((get-in direct [:box-region :invoke]) value)
+                  first-direct ((get-in direct [:return-region :invoke]) root)
+                  second-direct ((get-in direct [:return-region :invoke]) root)
+                  first-return ((get-in returned [:return-region :invoke]) root)
+                  second-return ((get-in returned [:return-region :invoke]) root)]]
+      (is (identical? root first-direct))
+      (is (identical? root second-direct))
+      (is (identical? (if (identical? payload Float/TYPE) Float Double) (class root)))
+      (is (instance? Float first-return))
+      (is (= (Float/floatToRawIntBits (.floatValue ^Number root))
+             (Float/floatToRawIntBits first-return) (Float/floatToRawIntBits second-return)))
+      (is (not (identical? root first-return)) "a primitive-return recipe boxes separately from the captured root")
+      (is (not (identical? first-return second-return)) "adapted snapshots are never cached by this adapter")
+      (is (identical? root ((get-in direct [:return-region :invoke]) root))))))
+
 (deftest source-float-completion-preserves-overloads-bits-failures-and-evaluation
   (doseq [operation [:float :unchecked-float]
           frozen [false true :warn-on-boxed]

@@ -8,6 +8,7 @@
   (:refer-clojure :exclude [run!])
   (:require [clojure.set :as set]
             [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.value-completion :as completion]
             [raster.compiler.passes.local-storage-reuse :as storage-reuse]
             [raster.compiler.ir.buffer-view :as bview]
             [raster.compiler.ir.emitted-parallel-program-call :as program-call]
@@ -1160,6 +1161,23 @@
           (validate! (get adapters (:id step)) (:semantic compilation) plan step))))
     adapters))
 
+(defn ^:no-doc validate-ordered-program-result-imports!
+  "Preflight exact owner-local result-return adapters before session acquisition.
+   This proves neither execution completion nor permission to read resident data."
+  [compilation plan]
+  (let [steps (filterv invocation/program-result-import? (:steps plan))
+        adapters (:program-result-import-adapters compilation)]
+    (when-not (and (or (nil? adapters) (map? adapters))
+                   (= (set (keys adapters)) (set (map :id steps))))
+      (throw (ex-info "ordered result imports require exact owner-local adapters"
+                      {:reason :link-ordered-result-import-adapters})))
+    (when (seq steps)
+      (let [validate! (requiring-resolve
+                       'raster.compiler.passes.scalar.source-import/validate-program-result-import-step!)]
+        (doseq [step steps]
+          (validate! (get adapters (:id step)) (:semantic compilation) (:emitted compilation) plan step))))
+    adapters))
+
 (defn- instantiate-ordered-invocation-with!
   "Internal owned-root vertical for source-ordered invocation execution. No source-created
    storage or suffix graph is acquired here. Captured public entries are initialized at binding; dynamic
@@ -1174,6 +1192,7 @@
   (let [caller-options (caller-math-options opts)
         initial (invocation-link/validate-ordered-source-actions! (begin-realization caller-options))
         _ (validate-ordered-source-completions! compilation (get-in initial [:materialization :plan]))
+        _ (validate-ordered-program-result-imports! compilation (get-in initial [:materialization :plan]))
         parameter-defaults (materialization/initial-parameter-arguments (:materialization initial))
         entry-roles (invocation-link/ordered-entry-roles initial (:entry-roles opts))
         entry-layout (invocation-link/ordered-entry-layout initial entry-roles)
@@ -1237,6 +1256,81 @@
         (throw (ex-info "ordered stage requires storage that has not completed initialization"
                         {:reason :link-ordered-uninitialized :node id}))))))
 
+(defn- invalidate-ordered-result-reads!
+  "Writes retire uncaptured resident results BEFORE mutation. A previously captured
+   host root denotes the old source binding and survives later storage overwrites."
+  [execution-state views]
+  (when (seq views)
+    (swap! execution-state update-in [:ordered :completed-results]
+           (fn [records]
+             (into {} (map (fn [[id record]]
+                             [id (if (and (not (contains? record :root-object))
+                                          (some #(bview/overlaps? (:view record) %) views))
+                                   (assoc record :resident-ready? false) record)])) records)))))
+
+(defn- ordered-import-current! [executable source-state epoch replay]
+  (ensure-live! executable :program-result-import)
+  (let [current @(:execution-state executable)
+        session @(:session executable)]
+    (when-not (and (= epoch (:value-epoch current))
+                   (identical? replay (get-in current [:ordered :import-replay]))
+                   (identical? source-state (get-in current [:ordered :current]))
+                   (not (:closed? session)))
+      (throw (ex-info "result import lost its current replay/source owner"
+                      {:reason :link-ordered-result-import-epoch})))))
+
+(defn- ordered-result-binding!
+  "Authenticate a singleton compiler view against its current session root and
+   canonical backend owner. Compiler allocation IDs are normalized to runtime keys."
+  [executable token view]
+  (let [ordered (:ordered @(:execution-state executable))
+        session @(:session executable)
+        root (get (:roots ordered) (get-in view [:allocation :id]))
+        resident (get (:node-views ordered) token)
+        key (:key root)
+        allocation (get-in session [:allocations key])
+        buffer (get-in session [:buffers key])
+        owner (get-in session [:buffer-owners key])
+        expected-allocation (assoc (into {} (:allocation view)) :id key :device (:device-id session))]
+    (when-not (and (bview/buffer-view? view) (bview/contiguous? view)
+                   (= 1 (reduce *' 1 (:shape view)))
+                   (= (:byte-length view) (dtype/bytes-of (:dtype view)))
+                   root resident buffer owner (not (:closed? session))
+                   (identical? owner (::cleanup/owner buffer))
+                   (= (dtype/canon (:dtype buffer)) (dtype/canon (:dtype view)))
+                   (= (allocation-key (:execution-id ordered) (get-in view [:allocation :id])) key)
+                   (= (:allocation view) (:allocation root))
+                   (gpu/resident-buffer-view? resident)
+                   (= (:session-id session) (:session-id resident)) (= key (:key resident))
+                   (= expected-allocation (into {} allocation))
+                   (= allocation (get-in resident [:view :allocation]))
+                   (= (dissoc (into {} view) :allocation)
+                      (dissoc (into {} (:view resident)) :allocation)))
+      (throw (ex-info "result import requires its exact live singleton resident view/root"
+                      {:reason :link-ordered-result-import-view :storage token})))
+    (cleanup/assert-live! owner)
+    {:resident resident :backend-buffer buffer :backend-owner owner
+     :root root :session-id (:session-id session)}))
+
+(defn- retain-ordered-result-completions! [executable ready source-state epoch replay]
+  (ordered-import-current! executable source-state epoch replay)
+  (let [state (:state ready)
+        equation-id (get-in state [:pending :equation])
+        equation (first (filter #(= equation-id (:id %)) (get-in state [:program :equations])))
+        demands (filter #(and (invocation/program-result-import? %) (= equation-id (:equation %)))
+                        (get-in state [:materialization :plan :steps]))
+        produced (set (get-in ready [:entry-contract :full-produces]))]
+    (doseq [result (distinct (map :result demands))]
+      (let [token (get-in state [:realized :buffers result])
+            view (get-in ready [:stage-plan :nodes token :view])]
+        (when-not (and equation (some #{result} (:results equation)) (contains? produced token))
+          (throw (ex-info "synchronous producer did not fully produce the demanded scalar view"
+                          {:reason :link-ordered-result-import-production :result result})))
+        (let [binding (ordered-result-binding! executable token view)]
+          (swap! (:execution-state executable) assoc-in [:ordered :completed-results [equation-id result]]
+                 (merge binding {:equation equation :result result :storage token :view view
+                                 :epoch epoch :replay replay :resident-ready? true})))))))
+
 (defn- acquire-ordered-storage! [executable nodes aliases]
   (let [execution-state (:execution-state executable)
         {:keys [execution-id ledger timings roots entry-refresh]} (:ordered @execution-state)
@@ -1248,6 +1342,7 @@
     (doseq [[id node] by-id
             :when (and (:source node) (= :input (get entry-refresh id))
                        (contains? roots (get-in node [:view :allocation :id])))]
+      (invalidate-ordered-result-reads! execution-state [(:view node)])
       (gpu/upload-range! (:session executable) (get-in storage [:node-views id]) (:source node)
                          {:elements (reduce *' 1 (get-in node [:view :shape]))}))
     (swap! execution-state
@@ -1273,6 +1368,9 @@
 
 (defn- run-ordered-stage! [executable ready]
   (let [execution-state (:execution-state executable)
+        source-state (get-in @execution-state [:ordered :current])
+        epoch (:value-epoch @execution-state)
+        replay (get-in @execution-state [:ordered :import-replay])
         {:keys [execution-id ledger caller-options]} (:ordered @execution-state)
         plan (:stage-plan ready)
         _ (when-not (and (seq (:instances plan))
@@ -1296,6 +1394,8 @@
         failure (volatile! nil)]
     (swap! execution-state assoc-in [:ordered :prepared position] prepared)
     (try
+      (invalidate-ordered-result-reads!
+       execution-state (map #(get-in plan [:nodes % :view]) (get-in ready [:entry-contract :writes])))
       (parallel-program/run-prepared! prepared)
       (catch Throwable error (vreset! failure error) (throw error))
       (finally
@@ -1304,6 +1404,7 @@
                (if-let [primary @failure]
                  (when-not (identical? primary error) (.addSuppressed primary error))
                  (throw error))))))
+    (retain-ordered-result-completions! executable ready source-state epoch replay)
     ;; run-prepared! is synchronous. Only now may the source cursor and initialized postcondition
     ;; advance; having bound a graph or acquired its storage never supplies this evidence.
     (swap! execution-state update-in [:ordered :initialized] into
@@ -1324,6 +1425,7 @@
         storage (acquire-ordered-storage! executable (:nodes prepared) #{})
         token (:storage prepared)
         view (get-in storage [:node-views token])]
+    (invalidate-ordered-result-reads! execution-state (map :view (:nodes prepared)))
     (gpu/zero-buffer! (:session executable) view)
     (swap! execution-state update-in [:ordered :initialized] conj
            (:view (first (:nodes prepared))))
@@ -1354,7 +1456,7 @@
                                                       :projection (:projection final)}))))
 
 (defn- execute-ordered-source-completion
-  "Execute one authenticated Object -> Float recipe at the current source cursor.
+  "Execute one authenticated Float/reference recipe at the current source cursor.
    Materialization still owns result-Class validation and advancing the prefix."
   [executable source-state step operands]
   (let [execution-state (:execution-state executable)
@@ -1377,16 +1479,104 @@
     (let [{:keys [symbol value]} (first (:operands step))
           operand (get operands symbol)]
       (when-not (and (= 1 (count (:operands step))) (= 1 (count operands))
-                     (materialization/materialized-opaque? operand)
+                     (case (:input-kind adapter)
+                       :opaque (materialization/materialized-opaque? operand)
+                       :scalar (and (map? operand) (= :float (:type operand))
+                                    (identical? Float (class (:value operand))))
+                       false)
                      ;; ValueAlias intentionally retains the original opaque wrapper.
                      ;; Check the exact current slot, not a newly fabricated alias ID.
                      (identical? operand
                                  (get-in source-state [:materialization :values value])))
-        (throw (ex-info "planned source completion requires its exact opaque Object operand"
+        (throw (ex-info "planned source completion requires its exact current physical operand"
                         {:reason :link-ordered-source-completion-input})))
-      (let [result ((get-in adapter [:region :invoke]) (:source operand))]
+      (let [input (case (:input-kind adapter) :opaque (:source operand) :scalar (:value operand))
+            result ((get-in adapter [:region :invoke]) input)]
         (assert-current!)
-        {:type :float :value result}))))
+        (case (:result-kind adapter)
+          :opaque result
+          :scalar {:type :float :value result}
+          (throw (ex-info "source completion adapter has no supported result representation"
+                          {:reason :link-ordered-source-completion-result})))))))
+
+(defn- execute-ordered-program-result-import! [executable source-state]
+  (let [execution-state (:execution-state executable)
+        initial @execution-state
+        {:keys [compilation caller-options import-replay]} (:ordered initial)
+        epoch (:value-epoch initial)
+        packet (invocation-link/prepare-program-result-import source-state caller-options)
+        step (:step packet)
+        plan (get-in source-state [:materialization :plan])
+        adapter (get-in compilation [:program-result-import-adapters (:id step)])
+        validate! (requiring-resolve
+                   'raster.compiler.passes.scalar.source-import/validate-program-result-import-step!)
+        assert-current! #(do (ordered-import-current! executable source-state epoch import-replay)
+                             (validate! adapter (:semantic compilation) (:emitted compilation) plan step))
+        key [(:id (:equation packet)) (:result packet)]
+        record (get-in initial [:ordered :completed-results key])
+        payload-class (:payload-class adapter)
+        payload-carrier (:payload-carrier adapter)
+        expected-dtype (get {Float :float Double :double} payload-class)]
+    (assert-current!)
+    (when-not (and record (= epoch (:epoch record)) (identical? import-replay (:replay record))
+                   (identical? (:equation packet) (:equation record))
+                   (identical? (:equation packet) (:emitted-producer adapter))
+                   (= (:storage packet) (:storage record)) (= (:result packet) (:result record))
+                   expected-dtype (= expected-dtype (:dtype adapter)
+                                     (dtype/canon (get-in packet [:value :dtype]))
+                                     (dtype/canon (get-in record [:view :dtype])))
+                   (identical? payload-carrier (get {Float Float/TYPE Double Double/TYPE} payload-class)))
+      (throw (ex-info "result import lacks its exact successful current-replay FP producer"
+                      {:reason :link-ordered-result-import-producer :result (:result packet)})))
+    (let [check-resident!
+          (fn []
+            (assert-current!)
+            (let [current (get-in @execution-state [:ordered :completed-results key])
+                  binding (ordered-result-binding! executable (:storage record) (:view record))]
+              (when-not (and (identical? current record) (:resident-ready? current)
+                             (identical? (:backend-buffer binding) (:backend-buffer record))
+                             (identical? (:backend-owner binding) (:backend-owner record))
+                             (= (:root binding) (:root record)) (= (:resident binding) (:resident record))
+                             (= (:session-id binding) (:session-id record))
+                             (bview/covered-contiguous? (:view record)
+                                                       (get-in @execution-state [:ordered :initialized])))
+                (throw (ex-info "result import's uncaptured resident value was overwritten or replaced"
+                                {:reason :link-ordered-result-import-readiness})))
+              binding))
+          root
+          (if (contains? record :root-object)
+            (:root-object record)
+            (let [binding (check-resident!)
+                  host (if (identical? payload-class Float) (float-array 1) (double-array 1))]
+              ;; This is the sole internal transfer. Its source is the exact checked
+              ;; singleton view, not a whole root or a dtype-derived payload guess.
+              (gpu/download-range! (:session executable) (:resident binding) host {:elements 1})
+              (check-resident!)
+              (let [payload (java.lang.reflect.Array/get host 0)
+                    root ((get-in adapter [:region :box-region :invoke]) payload)]
+                (check-resident!)
+                (when-not (identical? payload-class (class root))
+                  (throw (ex-info "result root boxing disagrees with its authenticated normal-return Class"
+                                  {:reason :link-ordered-result-import-box})))
+                (swap! execution-state assoc-in [:ordered :completed-results key :root-object] root)
+                root)))
+          _ (assert-current!)
+          _ (when-not (identical? payload-class (class root))
+              (throw (ex-info "captured result root has a different builtin FP Class"
+                              {:reason :link-ordered-result-import-box})))
+          result ((get-in adapter [:region :return-region :invoke]) root)
+          _ (assert-current!)
+          outer (completion/object-input-parts (:expression adapter))
+          returned (:contract (completion/canonical-parts (:operand outer)))
+          target (when (= :jvm-bytecode-floating-input (:source-context returned)) (:target-carrier returned))
+          result-class (if target (get {Float/TYPE Float Double/TYPE Double} target) payload-class)
+          _ (when-not (and (identical? result-class (class result))
+                           (or target (identical? root result)))
+              (throw (ex-info "result snapshot did not preserve its exact canonical return recipe"
+                              {:reason :link-ordered-result-import-return})))
+          completed (invocation-link/complete-program-result-import source-state step result caller-options)]
+      (assert-current!)
+      completed)))
 
 (defn- run-ordered-invocation! [executable]
   (let [execution-state (:execution-state executable)
@@ -1401,7 +1591,8 @@
           captured (into #{} (keep (fn [[id role]] (when (not= :input role) id))) entry-refresh)
           initialized (vec (distinct (filter #(contains? captured (get-in % [:allocation :id]))
                                              initialized)))]
-      (swap! execution-state update :ordered assoc :current initial :initialized initialized)
+      (swap! execution-state update :ordered assoc :current initial :initialized initialized
+             :import-replay (Object.) :completed-results {})
       (loop [state initial]
         (swap! execution-state assoc-in [:ordered :current] state)
         (if-let [entry (nth (:source-order state) (:source-cursor state) nil)]
@@ -1409,6 +1600,8 @@
                            (some #(when (= id (:id %)) %) (get-in state [:program :equations])))
                 next-state
                 (cond
+                  (:program-result-import entry)
+                  (execute-ordered-program-result-import! executable state)
                   (or (:storage entry)
                       (= :result-allocation (get-in state [:source-realizations (:source-cursor state) :kind])))
                   (run-ordered-allocation! executable state)

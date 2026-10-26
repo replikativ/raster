@@ -67,6 +67,76 @@
 (defn- reason [f]
   (try (f) nil (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
 
+(defn- ordered-result-import-fixture []
+  (let [snapshot (completion/complete-value completion/object-input-contract 'total)
+        cast (completion/complete-value
+              (completion/source-floating-cast-contract :float {:unchecked-math false}) 'saved)
+        source (list 'let* ['total '(raster.par/reduce acc 0.0 i 3 (+ acc (clojure.core/aget xs i)))
+                           'saved snapshot 'rounded cast
+                           (with-meta 'out {:tag 'floats :raster.type/tag 'floats}) '(clojure.core/float-array 1)
+                           'written '(raster.par/map-void! i 1 (clojure.core/aset out i rounded))] 'out)
+        options {:dtype :double :target-dialect :opencl-portable :resident-reductions? true
+                 :preserve-declared-array-storage? true
+                 :values {'xs (av/tensor {:dtype :double :shape [3]})}
+                 :public-parameters '[xs] :active-params '[xs] :array-types {'xs :double} :scalar-types {}}
+        numerical (:program (typed-route/attempt source :double {'xs :double} options))
+        semantic (route/promote-program numerical options)
+        emitted (:program (program-c-family/emit-program (route/schedule-program semantic options) options))
+        initial (invocation-link/begin-ordered-realization
+                 {:semantic semantic :emitted emitted :target :ocl:0} [(double-array [1 2 3])] nil)
+        position (first (keep-indexed #(when (:program-result-import %2) %1) (:source-order initial)))
+        entry (nth (:source-order initial) position)
+        step (first (filter #(= (:invocation-step entry) (:id %))
+                            (get-in initial [:materialization :plan :steps])))
+        token [:test-result-storage (:result step)]
+        state (-> initial (assoc :source-cursor position)
+                  (assoc-in [:realized :buffers (:result step)] token))]
+    {:initial initial :state state :step step :entry entry :token token}))
+
+(deftest ordered-program-result-import-is-a-pure-exact-cursor-transition
+  (let [{:keys [initial state step entry token]} (ordered-result-import-fixture)
+        callbacks (atom 0)
+        forbidden (fn [& _] (swap! callbacks inc) (throw (AssertionError. "pure import cannot execute resources")))
+        hostile (proxy [Object] []
+                  (equals [_] (throw (AssertionError. "payload equality")))
+                  (hashCode [] (throw (AssertionError. "payload hash")))
+                  (toString [] (throw (AssertionError. "payload print"))))]
+    (is (identical? initial (invocation-link/validate-ordered-source-actions! initial)))
+    (with-redefs [materialization/materialize-next forbidden]
+      (let [prepared (invocation-link/prepare-program-result-import state nil)]
+        (is (identical? state (:state prepared)))
+        (is (identical? step (:step prepared)))
+        (is (= entry (:entry prepared)))
+        (is (= (:equation step) (get-in prepared [:equation :id])))
+        (is (= (:result step) (:result prepared)))
+        (is (= token (:storage prepared)))
+        (is (empty? (:acquired-storage (:state prepared))))
+        (is (nil? (:pending (:state prepared)))))
+      (doseq [payload [nil hostile]]
+        (let [completed (invocation-link/complete-program-result-import state step payload nil)
+              wrapper (get-in completed [:materialization :values (:id step)])]
+          (is (identical? payload (:source wrapper)))
+          (is (= (:id step) (:id wrapper)))
+          (is (= (inc (:source-cursor state)) (:source-cursor completed)))
+          (is (= 1 (get-in completed [:materialization :next-step])))
+          (is (identical? (:realized state) (:realized completed)))
+          (is (identical? (:acquired-storage state) (:acquired-storage completed)))
+          (is (some? (reason #(invocation-link/complete-program-result-import completed step payload nil)))))))
+    (is (zero? @callbacks))
+    (is (= :invocation-ordered-import-step
+           (reason #(invocation-link/complete-program-result-import state (into {} step) hostile nil))))
+    (is (= :invocation-ordered-next-host
+           (reason #(invocation-link/advance-host-source state forbidden forbidden nil))))
+    (doseq [[changed caller-options expected]
+            [[state {:math :changed} :invocation-ordered-request]
+             [(assoc state :pending {:equation :prior}) nil :invocation-ordered-pending]
+             [(assoc state :source-cursor 0) nil :invocation-ordered-next-import]
+             [(update-in state [:realized :buffers] dissoc (:result step)) nil :invocation-ordered-import-storage]
+             [(update-in state [:source-order (:source-cursor state) :program-result-import]
+                         assoc :result 'wrong) nil :invocation-ordered-import-source]
+             [(update state :source-order #(vec (reverse %))) nil :invocation-ordered-import-source]]]
+      (is (= expected (reason #(invocation-link/prepare-program-result-import changed caller-options)))))))
+
 (deftest ordered-preparation-requirement-is-static-and-owner-checked
   (let [late (equation-first/compile #'fixture/write-before-shape {:target :ocl:0 :dtype :double})
         simple (equation-first/compile #'shape-before-first-stage {:target :ocl:0 :dtype :double})

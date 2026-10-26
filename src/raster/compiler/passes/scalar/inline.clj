@@ -539,16 +539,6 @@
 ;; value+grad / grad inlining
 ;; ================================================================
 
-(defn ^:no-doc expand-original-helper-source
-  "Use ordinary hygiene, qualification and call-by-value placement for an isolated
-   authenticated helper component. This does not enable a new ordinary inline route
-   or discharge argument/result completion obligations."
-  [frontend caller arguments result-symbol source-env]
-  (let [{:keys [params tags source-ns]} (:source-entry frontend)
-        imported (prepare-inline-source frontend (:body frontend) params tags source-ns)]
-    (check-inline-arity! caller params arguments caller)
-    (build-inline-expansion (assoc imported :params params)
-                            arguments source-env subst-syms result-symbol caller)))
 
 (declare inline-deftm-calls inline-invk flatten-nested-lets)
 

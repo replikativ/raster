@@ -6,6 +6,8 @@
             [raster.par :as par]
             [raster.compiler.core.method-entry :as entry]
             [raster.compiler.core.util :as util]
+            [raster.compiler.core.value-completion :as completion]
+            [raster.compiler.ir.semantic-fingerprint :as semantic]
             [raster.compiler.backend.jvm.bytecode :as bytecode]))
 
 (deftm response [a :- Double k :- Double x :- Double] :- Double
@@ -41,6 +43,70 @@
     (:params template) (:tags template) (:return-tag template) input-body
     (the-ns 'raster.compiler.backend.jvm.binding-context-owner-test)
     (:typed-interface template) 'input-owner-observation-test)))
+
+(deftest whole-source-observation-does-not-borrow-a-split-method-body
+  (let [template (emitted #'float-reduced)
+        cast (completion/complete-value
+              (completion/source-floating-cast-contract
+               :float {:unchecked-math false})
+              '(clojure.core/aget xs 0))
+        bindings (reduce (fn [pairs i]
+                           (let [result (symbol (str "pass_" i))]
+                             (conj pairs result
+                                   (list 'raster.par/map! 'xs 'index 4 'float
+                                         (list '+ (list 'clojure.core/aget 'xs 'index)
+                                               '(float 1.0))))))
+                         [] (range 12))
+        input-body [(list 'let* (conj bindings 'answer cast) 'answer)]
+        emit (fn [emitter]
+               (:emission
+                (core/emit-owned-bytecode!
+                 emitter "raster.compiled.WholeSourceObservation"
+                 (:params template) (:tags template) 'Object input-body
+                 (the-ns 'raster.compiler.backend.jvm.binding-context-owner-test)
+                 (:typed-interface template) 'whole-source-observation)))
+        ordinary (emit bytecode/compile-typed-impl!)
+        whole (emit bytecode/compile-whole-source-impl!)
+        bridge (bytecode/retained-boxed-entry-bridge whole)
+        default-method (:compute-method (first (:typed-return-bridges ordinary)))
+        methods (.getDeclaredMethods (.getDeclaringClass ^java.lang.reflect.Method default-method))]
+    (is (some #(.startsWith (.getName ^java.lang.reflect.Method %) "par_") methods)
+        "ordinary compilation still extracts this above-threshold body")
+    (is (nil? (bytecode/retained-input-body-context ordinary input-body))
+        "lexical extraction alone is not a whole-body equivalence proof")
+    (is (some? bridge))
+    (is (some? (bytecode/retained-input-body-context whole input-body)))
+    (is (nil? (bytecode/retained-input-body-context whole (mapv identity input-body))))
+    (is (nil? (bytecode/retained-boxed-entry-bridge (dissoc whole :body-contexts))))
+    (doseq [emission [ordinary whole]]
+      (is (= (float 13.0) ((:implementation emission) (float-array [1 2 3 4]) 4))))))
+
+(deftest derived-source-detaches-only-owned-emission-occurrences
+  (let [token (Object.)
+        expression (with-meta '(clojure.core/+ x 1.0)
+                     {:tag 'double :raster.op/original 'raster.numeric/+
+                      :raster.compiler.backend.jvm.bytecode/call-occurrence token})
+        quoted (list 'quote expression)
+        detached (bytecode/detach-emission-occurrences expression)
+        contract (completion/source-floating-cast-contract :float {:unchecked-math false})
+        completed (with-meta (completion/complete-value contract expression)
+                    {:tag 'float :raster.compiler.backend.jvm.bytecode/completion-occurrence token})
+        detached-completion (bytecode/detach-emission-occurrences completed)]
+    (is (= expression detached))
+    (is (identical? token (:raster.compiler.backend.jvm.bytecode/call-occurrence (meta expression))))
+    (is (= {:tag 'double :raster.op/original 'raster.numeric/+} (meta detached)))
+    (is (identical? quoted (bytecode/detach-emission-occurrences quoted)))
+    (is (identical? contract (second detached-completion)))
+    (is (= {:tag 'float} (meta detached-completion)))
+    (is (nil? (:raster.compiler.backend.jvm.bytecode/call-occurrence
+               (meta (nth detached-completion 2)))))
+    (is (pos? (alength ^bytes (semantic/canonical-bytes detached-completion))))
+    (is (= :semantic-fingerprint-unsupported
+           (try (semantic/canonical-bytes (bytecode/detach-emission-occurrences quoted)) nil
+                (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))
+    (is (identical? token (:user/semantic-owner
+                          (meta (bytecode/detach-emission-occurrences
+                                 (vary-meta expression assoc :user/semantic-owner token))))))))
 
 (defn- input-observer-owner-negatives [observe template input-body original emission]
   (let [copied-node (with-meta (apply list original) (meta original))

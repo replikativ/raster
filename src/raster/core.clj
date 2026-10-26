@@ -527,10 +527,12 @@
   [body params tags source-ns]
   (if (some '#{raster.ad.reverse/value+grad raster.ad.reverse/grad}
             (tree-seq coll? seq body))
-    (me/call-with-independent-definition-inputs
-     #(binding [*ns* (or source-ns *ns*)]
-        (mapv (fn [expression]
-                (@inline-ad-applications-fn expression (zipmap params tags))) body)))
+    ((requiring-resolve 'raster.ad.reverse/call-with-original-source-projection)
+     #(me/call-with-independent-definition-inputs
+       (fn []
+         (binding [*ns* (or source-ns *ns*)]
+           (mapv (fn [expression]
+                   (@inline-ad-applications-fn expression (zipmap params tags))) body)))))
     body))
 
 (clojure.core/defn ^:no-doc prepare-original-static-source!

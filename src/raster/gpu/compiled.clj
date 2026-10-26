@@ -1078,6 +1078,7 @@
         initial (invocation-link/validate-ordered-source-actions!
                  (invocation-link/begin-ordered-realization compilation args caller-options))
         _ (gpu-link/validate-ordered-source-completions! compilation invocation-plan)
+        _ (gpu-link/validate-ordered-program-result-imports! compilation invocation-plan)
         available (materialization/prefix-bindings (:materialization initial))
         buffers (:program-buffers available)
         parameters (:parameters invocation-plan)
@@ -1130,7 +1131,11 @@
         ;; These are candidates, not physical output claims. Alias deduplication and surviving
         ;; key checks occur once at the final checked boundary, just as on the eager path.
         out-tree (mapv (fn [{:keys [sym] :as entry}]
-                         (assoc entry :value sym :abstract (candidate-value sym))) candidates)
+                         (let [value (candidate-value sym)]
+                           ;; Logical type/shape are already proved, even when
+                           ;; source ordering defers the physical buffer view.
+                           (merge entry (select-keys value [:dtype :shape])
+                                  {:value sym :abstract value}))) candidates)
         project-boundary (fn [candidate]
                            (when-not (= outputs (mapv first (get-in candidate [:attributes :semantic-outputs])))
                              (throw (ex-info "completed semantic outputs differ from prepared intent"

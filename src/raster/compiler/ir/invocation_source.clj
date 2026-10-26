@@ -26,6 +26,23 @@
    :long ['clojure.core/long-array 'longs 'long]
    :byte ['clojure.core/byte-array 'bytes 'byte]})
 
+(defn program-result-source
+  "The numerical port of a closed Object-return recipe, without executing it.
+   In addition to a direct snapshot, a constructed helper may retain its actual
+   ref-to-FP compute-return conversion before boxing. This grammar establishes
+   neither the port's payload Class nor permission to read or adapt device data;
+   an owned runtime importer still has to discharge those obligations."
+  [expression]
+  (when-let [object (completion/object-input-parts expression)]
+    (let [operand (:operand object)
+          returned (completion/canonical-parts operand)
+          contract (:contract returned)
+          source (if (and (= :jvm-bytecode-floating-input (:source-context contract))
+                          (= :ref (:expected-input-carrier contract)))
+                   (:operand returned)
+                   operand)]
+      (when (symbol? source) source))))
+
 (defn reference-identity-source
   "The explicit normalized reference-identity grammar, not a JVM Class proof.
    Source admission owns normalization of the binder's physical completion.

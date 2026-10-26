@@ -20,6 +20,29 @@
 (defn- array-value [dtype extent]
   (av/tensor {:dtype dtype :shape [extent] :representation {:kind :plain}}))
 
+(deftest source-boxing-keeps-invocation-representation-separate-from-numerical-facts
+  (let [logical (scalar :float)
+        box (completion/complete-value completion/object-input-contract 'coefficient)
+        unbox (completion/complete-value
+               (completion/bytecode-boxed-parameter-contract Float/TYPE) 'boxed)
+        options {:id :source-boxing :parameters '[coefficient]
+                 :parameter-values {'coefficient logical}
+                 :bindings [['boxed box] ['completed unbox]]
+                 :binding-values {'boxed logical 'completed logical}
+                 :program-values {'boxed logical 'completed logical}
+                 :program-inputs '[completed] :program-outputs '[completed]}
+        plan (invocation/from-prefix options)
+        [boxed completed] (:steps plan)]
+    (is (every? invocation/source-completion? (:steps plan)))
+    (is (= :opaque (get-in boxed [:value :kind])))
+    (is (= logical (get-in plan [:values 'boxed])) "logical numerical Float facts are not overwritten")
+    (is (= :opaque (get-in plan [:values (:id boxed) :kind])))
+    (is (= logical (:value completed)))
+    (is (= :invocation-program-input-contract
+           (try (invocation/from-prefix (assoc options :program-inputs '[boxed])) nil
+                (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+        "an opaque invocation slot cannot satisfy a numerical Float port")))
+
 (defn- reason-of [thunk]
   (try (thunk) nil
        (catch clojure.lang.ExceptionInfo exception
@@ -93,7 +116,7 @@
                                               :target-dialect :typed-invocation})]
       (is (invocation/source-free-program? source-free))
       (check-both source-free-plan source-free))
-    (is (= :invocation-prefix-unsupported
+    (is (= :invocation-prefix-free-value
            (reason-of #(invocation/from-prefix (dissoc options :result-imports)))))
     (is (= :invocation-program-result-import
            (reason-of #(invocation/from-prefix

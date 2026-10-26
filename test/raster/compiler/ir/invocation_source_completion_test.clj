@@ -65,6 +65,84 @@
                     :value (apply (:invoke region)
                                   (map #(get-in operands [% :source]) (:parameters region)))}))}})))
 
+(defn- opaque-completion-plan []
+  (let [boxed (completion/complete-value completion/object-input-contract 'value)
+        checked (completion/complete-value
+                 (completion/source-floating-cast-contract :float {:unchecked-math false}) 'alias)]
+    (invocation/from-prefix
+     {:id :opaque-source-completion
+      :parameters '[value] :parameter-values {'value (scalar :float)}
+      :bindings [['boxed boxed] ['alias 'boxed] ['rounded checked]]
+      :binding-values {'boxed (opaque) 'alias (opaque) 'rounded (scalar :float)}
+      :program-values {'rounded (scalar :float)}
+      :program-inputs '[rounded] :program-outputs '[rounded]})))
+
+(deftest opaque-source-completions-preserve-raw-reference-and-alias-identity
+  (let [plan (opaque-completion-plan)
+        [box alias checked] (:steps plan)
+        hostile (proxy [Object] []
+                  (equals [_] (throw (AssertionError. "opaque equality")))
+                  (hashCode [] (throw (AssertionError. "opaque hash")))
+                  (toString [] (throw (AssertionError. "opaque print"))))]
+    (is (invocation/source-completion? box))
+    (is (invocation/value-alias? alias))
+    (is (invocation/source-completion? checked))
+    (doseq [payload [nil hostile (float -0.0)]]
+      (let [calls (atom 0)
+            execute {:source-completion (fn [_ _] (swap! calls inc) payload)}
+            initial (materialization/begin-materialization plan [(float 0.25)])
+            boxed (materialization/materialize-next initial execute)
+            aliased (materialization/materialize-next boxed execute)
+            wrapper (get-in boxed [:values (:id box)])]
+        (is (materialization/materialized-opaque? wrapper))
+        (is (= (:id box) (:id wrapper)))
+        (is (identical? payload (:source wrapper)))
+        (is (identical? wrapper (get-in aliased [:values (:id alias)])))
+        (is (identical? boxed (materialization/validate-state! boxed)))
+        (is (identical? aliased (materialization/validate-state! aliased)))
+        (materialization/prefix-bindings aliased)
+        (is (= 1 @calls) "validation, prefix projection and aliases never repeat Object completion")
+        (let [again (materialization/materialize-next initial execute)]
+          (is (= 2 @calls) "explicitly replaying an earlier state performs a fresh completion")
+          (is (not (identical? wrapper (get-in again [:values (:id box)])))))
+        (doseq [forged [(assoc-in boxed [:values (:id box) :id] [:foreign-completion])
+                        (assoc-in boxed [:values (:id box)] {:type :float :value (float 0.25)})
+                        (assoc-in aliased [:values (:id alias)]
+                                  (materialization/->MaterializedOpaque (:id wrapper) (:value wrapper) payload))]]
+          (is (some? (try (materialization/validate-state! forged) nil
+                          (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))
+        (is (= 2 @calls))))))
+
+(deftest opaque-completion-then-checked-float-has-no-validation-reconversion
+  (let [plan (opaque-completion-plan)
+        [box alias checked] (:steps plan)
+        calls (atom [])
+        execute {:source-completion
+                 (fn [step operands]
+                   (swap! calls conj (:symbol step))
+                   (if (identical? step box)
+                     (get-in operands ['value :value])
+                     {:type :float :value (float (get-in operands ['alias :source]))}))}
+        initial (materialization/begin-materialization plan [(float -0.0)])
+        states (take 4 (iterate #(materialization/materialize-next % execute) initial))
+        final-state (last states)
+        finished (materialization/finish-materialization final-state)
+        wrapper (get-in finished [:values (:id box)])]
+    (is (= '[boxed rounded] @calls))
+    (is (= (Float/floatToRawIntBits (float -0.0))
+           (Float/floatToRawIntBits (get-in finished [:program-scalars 'rounded :value]))))
+    (is (identical? wrapper (get-in finished [:values (:id alias)])))
+    (is (identical? finished (materialization/validate! finished)))
+    (is (identical? final-state (materialization/validate-state! final-state)))
+    (doseq [forged [(assoc-in finished [:values (:id box) :id] [:foreign-completion])
+                    (assoc-in finished [:values (:id alias)]
+                              (materialization/->MaterializedOpaque
+                               (:id wrapper) (:value wrapper) (:source wrapper)))
+                    (assoc-in finished [:values (:id checked) :value] (double -0.0))]]
+      (is (some? (try (materialization/validate! forged) nil
+                      (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))
+    (is (= '[boxed rounded] @calls))))
+
 (deftest floating-completions-use-the-same-ordered-host-materialization-contract
   (doseq [unchecked? [false true]]
     (let [{:keys [plan execute]} (fixture :float unchecked?)

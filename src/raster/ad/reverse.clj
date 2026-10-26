@@ -86,6 +86,17 @@
 
 (def ^:private ^:dynamic *generated-product-context* nil)
 
+(def ^:private generated-source-construction-token (Object.))
+
+(defn ^:no-doc call-with-original-source-projection
+  "Original-source publication must not inherit a target-local construction.
+   Other projection/transposition contexts are retained exactly, not cleared."
+  [f]
+  (if (identical? generated-source-construction-token
+                  (::source-construction-token *generated-product-context*))
+    (binding [*generated-product-context* nil] (f))
+    (f)))
+
 (defn- gradient-bearing-array-read?
   "Only reads from differentiated arrays need scatter cotangents. Reads from
   explicitly constant parameter arrays stay ordinary scalar expressions."
@@ -6185,6 +6196,145 @@
                     :elements (if (= mode :value+grad) results gradients)}]
     {:qualified qualified :hygienic hygienic :projected projected :projection projection}))
 
+(defn- project-default-prepared-call
+  [{:keys [params source-ns] :as prepared} arguments mode param-env caller]
+  (source-owner/assert-portable-source! prepared)
+  (assert-prepared-program-source! prepared)
+  (let [owner (::generated-program-owner prepared)
+        source (flat-prepared-call-source! prepared arguments mode caller owner)
+        argument-plan
+        (if owner
+          ((requiring-resolve 'raster.compiler.backend.jvm.generated-body/instantiate-boxed-entry-inputs)
+           (prepared-bytecode-entry prepared) params (vec arguments))
+          (inline/prepare-call-arguments :prepared-reverse-ad params arguments param-env))
+        projection (:projection (project-flat-prepared-call source params source-ns argument-plan mode))]
+    ;; Commit input history only after successful shape/arity/projection work.
+    ;; Hygiene is not an entry/return conversion or device realization proof.
+    (adopt-prepared-program-inputs! prepared)
+    projection))
+
+(defn- object-float-source-continuation?
+  "Select only an actual top-level Object-to-Float source completion in the
+   authenticated prepared JVM adapter, possibly behind its lexical staging
+   let tail. Never search staging initializers, branches or kernel bodies. This
+   query never prepares code."
+  [{:keys [emission input-body]}]
+  (let [[scope] input-body
+        [head bindings] (when (seq? scope) scope)]
+    (and (= 1 (count input-body)) (= 'let* head)
+         (vector? bindings) (even? (count bindings))
+         (boolean
+          (some (fn [initializer]
+                  (let [expression
+                        (loop [tail initializer]
+                          (let [[head bindings & body] (when (seq? tail) tail)]
+                            (if (and (contains? #{'let 'let* 'clojure.core/let 'clojure.core/let*} head)
+                                     (vector? bindings) (even? (count bindings))
+                                     (every? symbol? (take-nth 2 bindings))
+                                     (= 1 (count body)))
+                              (recur (first body))
+                              tail)))
+                        contract (:contract (value-completion/canonical-parts expression))]
+                    (when (and (= :source-floating-cast (:source-context contract))
+                               (= 'float (value-completion/source-cast-result-tag contract)))
+                      (let [observed
+                            ((requiring-resolve
+                              'raster.compiler.backend.jvm.bytecode/retained-input-completion-context)
+                             emission input-body expression)]
+                        (and (identical? expression (:source-input observed))
+                             (= contract (:contract observed))
+                             (= :ref (:input-carrier observed))
+                             (= :float (:completion-carrier observed)))))))
+                (take-nth 2 (rest bindings)))))))
+
+(defn- project-generated-float-source
+  [terminal-consumer prepared arguments mode _param-env caller]
+  (method-entry/call-with-independent-definition-inputs
+   (fn []
+     (source-owner/assert-portable-source! prepared)
+     (let [_ (when-not (assert-prepared-program-source! prepared)
+               (throw (ex-info "Derived AD source requires an owned preparation"
+                               {:reason :ad-generated-source-construction-entry})))
+           core (assert-generated-producer-core! prepared)
+           owner (::generated-program-owner prepared)
+           _ (when-not (and owner core)
+               (throw (ex-info "Derived AD source requires its actual generated core"
+                               {:reason :ad-generated-source-construction-entry})))
+           physical (prepared-bytecode-entry prepared)
+           {:keys [params source-ns]} prepared
+           view ((requiring-resolve 'raster.compiler.backend.jvm.generated-body/physical-entry-view)
+                 physical params)
+           method (get-in view [:bridge :invocation-method])
+           _ (when-not (instance? java.lang.reflect.Method method)
+               (throw (ex-info "Derived AD source requires its actual prepared core and entry"
+                               {:reason :ad-generated-source-construction-entry})))
+           _ (flat-prepared-call-source! prepared arguments mode caller owner)
+           normalized ((requiring-resolve 'raster.compiler.backend.jvm.generated-body/normalize-program)
+                       core method capture-selected-helper-emission
+                       {:consume-terminal-reduction terminal-consumer :terminal-only? true})
+           _ (when (and normalized
+                        (not (and (identical? core (:raster.compiler.backend.jvm.generated-body/normalization-input
+                                                   normalized))
+                                  (every? #(identical? (get core %) (get normalized %))
+                                          [:params :tags :source-ns :source-policy :result-sym :param-adj-syms])
+                                  (identical? (last (first (:walked-body core)))
+                                              (last (first (:walked-body normalized)))))))
+               (throw (ex-info "Derived AD source changed its actual generated producer boundary"
+                               {:reason :ad-generated-source-construction-correspondence})))
+           ;; Abstention keeps the authenticated prepared adapter projection,
+           ;; not an unadapted core or a compatibility backend fallback.
+           source (flat-prepared-call-source! (or normalized prepared) arguments mode caller owner)
+           argument-plan
+           ((requiring-resolve 'raster.compiler.backend.jvm.generated-body/instantiate-boxed-entry-inputs)
+            physical params (vec arguments))
+           _ (when-not (and (= (count arguments) (count (:slots argument-plan)))
+                            (every? true? (map identical? arguments
+                                             (map :original-argument (:slots argument-plan)))))
+               (throw (ex-info "Derived AD entry changed the actual positional arguments"
+                               {:reason :ad-generated-source-construction-entry})))
+           result (:projection (project-flat-prepared-call source params source-ns argument-plan mode))]
+       (assert-prepared-program-source! prepared)
+       (when-not (identical? core (assert-generated-producer-core! prepared))
+         (throw (ex-info "Derived AD source lost its original core"
+                         {:reason :ad-generated-source-construction-correspondence})))
+       (adopt-prepared-program-inputs! prepared)
+       result))))
+
+(defn- project-generated-source-construction
+  [terminal-consumer prepared arguments mode param-env caller]
+  (source-owner/assert-portable-source! prepared)
+  (let [owned (assert-prepared-program-source! prepared)
+        physical (when owned (prepared-bytecode-entry prepared))]
+    (if (and physical (object-float-source-continuation? physical))
+      (project-generated-float-source terminal-consumer prepared arguments mode param-env caller)
+      (project-default-prepared-call prepared arguments mode param-env caller))))
+
+(defn ^:no-doc call-with-generated-source-construction
+  "Construct local derived AD source without changing its cached prepared/runtime entry.
+   `terminal-consumer` constructs complete owned helper return source; `consume!`
+   runs under this scoped prepared-call projector. Existing projection/transposition
+   contexts conflict rather than being silently replaced. Only successful source
+   construction adopts history. The resulting source still needs its actual new
+   emission/binding audit and numerical/transfer consumer; this grants no GPU proof."
+  [terminal-consumer consume!]
+  (when *generated-product-context*
+    (throw (ex-info "Derived AD source cannot replace an existing product projection context"
+                    {:reason :ad-generated-source-construction-context})))
+  (when-not method-entry/*emission-inputs*
+    (throw (ex-info "Derived AD source requires its enclosing compiler owner"
+                    {:reason :ad-generated-source-construction-owner})))
+  (when-not (and (fn? terminal-consumer) (fn? consume!))
+    (throw (ex-info "Derived AD source requires actual constructing consumers"
+                    {:reason :ad-generated-source-construction-consumer})))
+  (method-entry/call-with-optional-definition-inputs
+   #(binding [*generated-product-context*
+              {::source-construction-token generated-source-construction-token
+               :project-prepared-call
+               (fn [prepared arguments mode param-env caller]
+                 (project-generated-source-construction
+                  terminal-consumer prepared arguments mode param-env caller))}]
+      (consume!))))
+
 (defn- register-entry-construction! [context construction]
   (let [prepared (:prepared construction)
         physical (prepared-bytecode-entry prepared)
@@ -6468,25 +6618,10 @@
    caller construction, numerical realization, placement or device semantics."
   ([prepared arguments mode param-env]
    (project-prepared-value+grad-call prepared arguments mode param-env nil))
-  ([{:keys [params source-ns] :as prepared} arguments mode param-env caller]
+  ([prepared arguments mode param-env caller]
   (if-let [project! (:project-prepared-call *generated-product-context*)]
     (project! prepared arguments mode param-env caller)
-    (do
-  (source-owner/assert-portable-source! prepared)
-  (assert-prepared-program-source! prepared)
-  (let [owner (::generated-program-owner prepared)
-        source (flat-prepared-call-source! prepared arguments mode caller owner)
-        argument-plan
-          (if owner
-            ((requiring-resolve 'raster.compiler.backend.jvm.generated-body/instantiate-boxed-entry-inputs)
-             (prepared-bytecode-entry prepared) params (vec arguments))
-            (inline/prepare-call-arguments :prepared-reverse-ad params arguments param-env))
-        {:keys [qualified hygienic projected projection]}
-        (project-flat-prepared-call source params source-ns argument-plan mode)]
-      ;; Commit input history only after successful shape/arity/projection work.
-      ;; Hygiene is not an entry/return conversion or device realization proof.
-      (adopt-prepared-program-inputs! prepared)
-      projection)))))
+    (project-default-prepared-call prepared arguments mode param-env caller))))
 
 (defn- emit-generated-program-entry! [program frontend]
   (let [{:keys [params tags walked-body source-ns]} program

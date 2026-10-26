@@ -1021,7 +1021,13 @@
                                       {:symbol symbol :source identity-source}))
                            program-value (get program-values symbol)
                            host-value (or identity-value (get host-values symbol))
+                           completion-value (invocation/source-completion-value
+                                             expression (or identity-value host-value program-value))
                            value (cond
+                                   ;; Invocation reference/scalar representation is
+                                   ;; independent of a numerical Float annotation.
+                                   ;; Preserve the program's logical facts below.
+                                   completion-value completion-value
                                    ;; An exact lexical alias keeps one runtime storage identity.
                                    ;; Its program-side symbolic shape remains authoritative and
                                    ;; materialization later proves both symbolic extents resolve to
@@ -1073,6 +1079,10 @@
                :parameter-values parameter-values
                :bindings prefix
                :binding-values binding-values
+               ;; These are source-ordered liveness demands only. Execution
+               ;; still needs the exact producer's completed view and owned
+               ;; source return adapter; planning grants no implicit readback.
+               :result-imports (invocation/result-import-demands parallel-program prefix)
                :program-values program-values
                :program-inputs (:inputs parallel-program)
                :program-storage external-result-storage

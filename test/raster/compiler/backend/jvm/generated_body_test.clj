@@ -2,16 +2,20 @@
   (:require [clojure.test :refer [deftest is]]
             [raster.core :as core :refer [deftm]]
             [raster.ad.reverse :as reverse]
+            [raster.par :as par]
             [raster.compiler.backend.jvm.bytecode :as bytecode]
             [raster.compiler.backend.jvm.generated-body :as generated]
             [raster.compiler.core.call-boundary :as boundary]
             [raster.compiler.core.method-entry :as entry]
+            [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.source-policy :as source-policy]
             [raster.compiler.core.types :as types]
             [raster.compiler.core.util :as util]
             [raster.compiler.core.value-completion :as completion]
+            [raster.compiler.ir.par :as par-ir]
             [raster.compiler.passes.scalar.pe :as pe]
             [raster.compiler.passes.scalar.simplify :as simplify]
+            [raster.compiler.passes.scalar.source-import :as source-import]
             [raster.compiler.fixtures.distributed-training :as training]
             [raster.compiler.fixtures.mixed-storage :as storage]))
 
@@ -31,6 +35,12 @@
     nil
     (when negative? (aset alias 1 (float -1.0)))
     alias))
+
+(deftm unused-terminal-array [values :- (Array double) unused :- (Array double)] :- Double
+  (par/reduce total 0.0 i (alength values) (+ total (aget values i))))
+
+(deftm transparent-double-energy [coefficient :- Double values :- (Array double)] :- Double
+  (par/dot-product (par/scale coefficient values) values))
 
 (defn- interface-method [tags]
   (let [interface (types/ensure-fn-interface! tags)]
@@ -191,6 +201,277 @@
            (try (gradient (float 2) (double-array [1.0e20])) nil
                 (catch Throwable error (class error)))))))
 
+(defn- fp-output-bits [values]
+  (mapv (fn [value]
+          (cond (instance? Float value) [:float (Float/floatToRawIntBits value)]
+                (instance? Double value) [:double (Double/doubleToRawLongBits value)]
+                :else value)) values))
+
+(defn- projected-program [prepared projection]
+  {:params '[events coefficient values] :tags '[Object Object Object]
+   :source-ns *ns* :source-policy (:source-policy prepared)
+   ;; Actual completion contexts are audited by the common test emitter. No
+   ;; pre-projection binder expectation is asserted after whole-form hygiene.
+   :raster.compiler.backend.jvm.generated-body/binding-facts {}
+   :walked-body [(list 'let* (vec (mapcat identity (:bindings projection)))
+                       (:result-form projection))]})
+
+(deftest scoped-derived-ad-source-keeps-the-actual-prepared-runtime-entry
+  (entry/call-with-definition-inputs
+   (fn []
+     (let [callable (reverse/value+grad #'storage/mixed-scale-energy :wrt [0])
+           prepared (:prepared (reverse/captured-prepared-callable callable (meta callable)))
+           physical (reverse/prepared-bytecode-entry prepared)
+           core (:raster.ad.reverse/producer-core prepared)
+           core-body (:walked-body core)
+           prepared-body (:walked-body prepared)
+           arguments ['(do (clojure.core/swap! events conj :coefficient) coefficient)
+                      '(do (clojure.core/swap! events conj :values) values)]
+           calls (atom 0)
+           consumer (fn [request]
+                      (swap! calls inc)
+                      (source-import/construct-contextual-terminal-return request))
+           baseline (reverse/project-prepared-value+grad-call prepared arguments :value+grad {})
+           normalize generated/normalize-program
+           normalization (atom nil)
+           derived (with-redefs [generated/normalize-program
+                                 (fn [& arguments]
+                                   (let [result (apply normalize arguments)]
+                                     (when (= 4 (count arguments))
+                                       (reset! normalization {:program (first arguments)
+                                                              :options (last arguments) :result result}))
+                                     result))]
+                     (reverse/call-with-generated-source-construction
+                      consumer
+                      #(reverse/project-prepared-value+grad-call prepared arguments :value+grad {})))
+           original (emit (projected-program prepared baseline))
+           compiled (emit (projected-program prepared derived))
+           after (reverse/project-prepared-value+grad-call prepared arguments :value+grad {})
+           unchanged (emit (projected-program prepared after))
+           outcome (fn [function coefficient values]
+                     (let [events (atom [])
+                           value (try [:value (fp-output-bits (invoke function [events coefficient values]))]
+                                      (catch java.lang.reflect.InvocationTargetException error
+                                        [:error (class (.getCause error))])
+                                      (catch Throwable error [:error (class error)]))]
+                       [value @events]))]
+       (is (= 2 @calls) "the mixed Float continuation constructs both selected terminal helpers")
+       (is (true? (get-in @normalization [:options :terminal-only?])))
+       (is (identical? core (:program @normalization)))
+       (let [original-pairs (partition 2 (second (first (:walked-body core))))
+             normalized-pairs (partition 2 (second (first (get-in @normalization [:result :walked-body]))))
+             ordinary (filter #(= 'raster.par/scale
+                                   (:semantic-op (descriptor/call-description (second %)))) original-pairs)
+             contextual (filter (fn [[_ expression]]
+                                  (let [{:keys [contract operand]} (completion/canonical-parts expression)]
+                                    (and (= :jvm-bytecode-result-context (:source-context contract))
+                                         (= :ref (:result-carrier contract))
+                                         (par-ir/par-reduce-form? operand)))) normalized-pairs)]
+         (is (seq ordinary) "the actual mixed gradient contains an ordinary array scale helper")
+         (doseq [[binder initializer] ordinary]
+           (let [retained (first (filter #(identical? binder (first %)) normalized-pairs))]
+             (is (identical? initializer (second retained))
+                 "ordinary array helpers remain literal calls for the normal GPU inliner")))
+         (is (seq contextual) "only authenticated terminal reductions acquire protected return bindings"))
+       (is (< (count (:bindings baseline)) (count (:bindings derived))))
+       (is (= 2 (count (filter #(= :jvm-object-input
+                                    (get-in (completion/canonical-parts (second %))
+                                            [:contract :source-context]))
+                              (take 2 (:bindings derived)))))
+           "every caller argument is snapshotted before wrapper conversions")
+       (is (identical? physical (reverse/prepared-bytecode-entry prepared)))
+       (is (identical? core (:raster.ad.reverse/producer-core prepared)))
+       (is (identical? core-body (:walked-body core)))
+       (is (identical? prepared-body (:walked-body prepared)))
+       (is (identical? prepared (:prepared (reverse/captured-prepared-callable callable (meta callable)))))
+       (is (= [28.0 (float 14.0) nil] (callable (float 2) (double-array [1 2 3]))))
+       (is (= [[:value (fp-output-bits [28.0 (float 14.0) nil])] [:coefficient :values]]
+              (outcome compiled (float 2) (double-array [1 2 3]))))
+       (doseq [[coefficient values] [[(float 2) (double-array [1 2 3])]
+                                     [(float -0.0) (double-array [1 2 3])]
+                                     [(float 2) (double-array [Double/NaN])]
+                                     [(float 2) (double-array [1.0e20])]
+                                     [nil (double-array [1 2 3])]
+                                     ["wrong coefficient" (double-array [1 2 3])]
+                                     [(float 2) (float-array [1 2 3])]]]
+         (is (= (outcome original coefficient values)
+                (outcome compiled coefficient values)
+                (outcome unchanged coefficient values))))
+       (let [before @calls]
+         (reverse/project-prepared-value+grad-call prepared arguments :grad {})
+         (is (= before @calls) "the scoped consumer is absent from ordinary projection"))
+       (let [projection (reverse/call-with-generated-source-construction
+                         consumer #(reverse/project-prepared-value+grad-call prepared arguments :grad {}))]
+         (is (= [[:value (fp-output-bits [(float 14.0) nil])] [:coefficient :values]]
+                (outcome (emit (projected-program prepared projection))
+                         (float 2) (double-array [1 2 3])))))))))
+
+(deftest transparent-double-ad-keeps-its-original-source-projection
+  (entry/call-with-definition-inputs
+   (fn []
+     (let [callable (reverse/value+grad #'transparent-double-energy :wrt [0])
+           prepared (:prepared (reverse/captured-prepared-callable callable (meta callable)))
+           physical (reverse/prepared-bytecode-entry prepared)
+           core (:raster.ad.reverse/producer-core prepared)
+           arguments '[coefficient values]
+           baseline (reverse/project-prepared-value+grad-call prepared arguments :value+grad {})
+           project-flat @#'reverse/project-flat-prepared-call
+           projected-source (atom nil)
+           derived (with-redefs-fn
+                     {#'generated/normalize-program
+                      (fn [& _] (throw (AssertionError. "transparent Double AD must not query terminal normalization")))
+                      #'reverse/project-generated-float-source
+                      (fn [& _] (throw (AssertionError. "transparent Double AD must not enter derived-core construction")))
+                      #'reverse/project-flat-prepared-call
+                      (fn [source & args]
+                        (reset! projected-source source)
+                        (apply project-flat source args))}
+                     #(reverse/call-with-generated-source-construction
+                       (fn [& _] (throw (AssertionError. "transparent Double AD must not construct terminal returns")))
+                       (fn [] (reverse/project-prepared-value+grad-call prepared arguments :value+grad {}))))
+           topology (fn [projection]
+                      (frequencies
+                       (keep (fn [node]
+                               (or (when-let [contract (:contract (completion/canonical-parts node))]
+                                     [:completion (:source-context contract)])
+                                   (when-let [operation (:semantic-op (descriptor/call-description node))]
+                                     [:operation operation])))
+                             (tree-seq coll? seq [(:bindings projection) (:result-form projection)]))))
+           original (emit (projected-program prepared baseline))
+           compiled (emit (projected-program prepared derived))
+           values (double-array [1 2 3])]
+       (is (identical? (first (:walked-body prepared)) @projected-source)
+           "the exact existing adapter, not a reconstructed numerical core, supplies source")
+       (is (= (topology baseline) (topology derived))
+           "ordinary kernel calls and return contexts have unchanged topology")
+       (is (= (fp-output-bits [28.0 14.0 nil])
+              (fp-output-bits (invoke original [(atom []) 2.0 values]))
+              (fp-output-bits (invoke compiled [(atom []) 2.0 values]))
+              (fp-output-bits (callable 2.0 values))))
+       (is (identical? physical (reverse/prepared-bytecode-entry prepared)))
+       (is (identical? core (:raster.ad.reverse/producer-core prepared)))
+       (is (identical? prepared (:prepared (reverse/captured-prepared-callable callable (meta callable)))))
+       (let [reason (fn [project]
+                      (try (project) nil
+                           (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+             invalid #(reverse/project-prepared-value+grad-call prepared '[coefficient] :value+grad {})
+             before @entry/*emission-inputs*]
+         (is (= (reason invalid)
+                (reason #(reverse/call-with-generated-source-construction
+                          (fn [& _] (throw (AssertionError. "must not derive"))) invalid))))
+         (is (identical? before @entry/*emission-inputs*)
+             "the common default arity refusal adopts no new history"))))))
+
+(deftest original-source-projection-fence-preserves-unrelated-contexts-and-restores-on-errors
+  (let [context {:project-prepared-call (fn [& _] :unrelated)}
+        failure (Exception. "original construction failed")]
+    (with-bindings {#'reverse/*generated-product-context* context}
+      (is (identical? context (reverse/call-with-original-source-projection
+                              #(deref #'reverse/*generated-product-context*))))
+      (is (identical? failure
+                      (try (reverse/call-with-original-source-projection #(throw failure))
+                           (catch Exception error error))))
+      (is (identical? context @#'reverse/*generated-product-context*)))
+    (entry/call-with-definition-inputs
+     #(reverse/call-with-generated-source-construction
+       source-import/construct-contextual-terminal-return
+       (fn []
+         (let [target-context @#'reverse/*generated-product-context*]
+           (is (nil? (reverse/call-with-original-source-projection
+                      (fn [] @#'reverse/*generated-product-context*))))
+           (is (identical? failure
+                           (try (reverse/call-with-original-source-projection (fn [] (throw failure)))
+                                (catch Exception error error))))
+           (is (identical? target-context @#'reverse/*generated-product-context*))))))))
+
+(deftest cold-original-ad-publication-does-not-inherit-target-local-construction
+  (let [scope (create-ns (gensym "raster.original-ad-publication."))]
+    (try
+      (binding [*ns* scope]
+        (refer 'clojure.core)
+        (eval '(raster.core/deftm cold-gradient
+                 [coefficient :- Float values :- (Array double)] :- Float
+                 (let [gradient ((raster.ad.reverse/value+grad
+                                  (var raster.compiler.fixtures.mixed-storage/mixed-scale-energy) :wrt [0])
+                                 coefficient values)]
+                   (nth gradient 1)))))
+      (let [generic (ns-resolve scope 'cold-gradient)
+            source (core/resolve-deftm-var generic)
+            receiver (ns-resolve scope (symbol (str (:name (meta source)) "-impl")))
+            calls (atom 0)
+            consumer (fn [request]
+                       (swap! calls inc)
+                       (source-import/construct-contextual-terminal-return request))]
+        (is (nil? (:raster.core/bytecode-emission (meta receiver))) "this original publisher starts cold")
+        (entry/call-with-definition-inputs
+         #(reverse/call-with-generated-source-construction
+           consumer
+           (fn []
+             (core/ensure-current-owned-bytecode! receiver)
+             (is (zero? @calls) "JIT publication uses only the original source projector")
+             (let [implementation @receiver
+                   emission (:raster.core/bytecode-emission (meta receiver))
+                   contextual (filter (fn [node]
+                                        (let [{:keys [contract operand]} (completion/canonical-parts node)]
+                                          (and (= :jvm-bytecode-result-context (:source-context contract))
+                                               (par-ir/par-reduce-form? operand))))
+                                      (tree-seq coll? seq (:body emission)))
+                   prepared (reverse/prepare-value+grad #'storage/mixed-scale-energy [0])]
+               (is (some? emission))
+               (is (seq (:body emission)))
+               (is (empty? contextual) "original cached source contains no target-local reduction contexts")
+               (is (some? (reverse/project-prepared-value+grad-call
+                           prepared '[coefficient values] :value+grad {})))
+               (is (= 2 @calls) "the surrounding target-local projector remains active after publication")
+               (core/ensure-current-owned-bytecode! receiver)
+               (is (identical? implementation @receiver))
+               (is (identical? emission (:raster.core/bytecode-emission (meta receiver))))))))
+        (is (= (float 14.0) (@generic (float 2) (double-array [1 2 3])))))
+      (finally (remove-ns (ns-name scope))))))
+
+(deftest derived-ad-source-abstention-and-failure-do-not-replace-existing-owners
+  (entry/call-with-definition-inputs
+   (fn []
+     (let [prepared (reverse/prepare-value+grad #'storage/mixed-scale-energy [0])
+           arguments '[coefficient values]
+           consumer source-import/construct-contextual-terminal-return
+           project #(reverse/project-prepared-value+grad-call prepared arguments :value+grad {})
+           project-flat @#'reverse/project-flat-prepared-call
+           actual-source (atom nil)]
+       (with-redefs-fn
+         {#'generated/normalize-program (fn [& _] nil)
+          #'reverse/project-flat-prepared-call
+          (fn [source & args] (reset! actual-source source) (apply project-flat source args))}
+         #(is (some? (reverse/call-with-generated-source-construction consumer project))))
+       (is (identical? (first (:walked-body prepared)) @actual-source)
+           "normalization abstention projects the actual prepared adapter, not an unadapted core")
+       (let [before @entry/*emission-inputs*
+             failure (Exception. "consumer rejected after projection")]
+         (is (nil? (reverse/call-with-generated-source-construction
+                    consumer #(do (project) nil))))
+         (is (identical? before @entry/*emission-inputs*))
+         (is (identical? failure
+                         (try (reverse/call-with-generated-source-construction
+                               consumer #(do (project) (throw failure))) nil
+                              (catch Exception error error))))
+         (is (identical? before @entry/*emission-inputs*)))
+       (is (= :ad-generated-source-construction-context
+              (try (reverse/call-with-generated-source-construction
+                    consumer #(reverse/call-with-generated-source-construction consumer project)) nil
+                   (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))
+       (let [conflict {:project-prepared-call (fn [& _] (throw (AssertionError. "must not override")))}]
+         (with-bindings {#'reverse/*generated-product-context* conflict}
+           (is (= :ad-generated-source-construction-context
+                  (try (reverse/call-with-generated-source-construction consumer project) nil
+                       (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))))
+       (is (= :ad-prepared-program-mismatch
+              (try (reverse/call-with-generated-source-construction
+                    consumer #(reverse/project-prepared-value+grad-call
+                               (assoc prepared :raster.ad.reverse/producer-core
+                                      (into {} (:raster.ad.reverse/producer-core prepared)))
+                               arguments :value+grad {})) nil
+                   (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))))))
+
 (defn- helper-program [source]
   (let [operation (symbol (str (ns-name (.ns source))) (str (:name (meta source))))
         source (core/resolve-deftm-var source)
@@ -203,6 +484,117 @@
      :walked-body [(list 'let* ['result (with-meta (list '.invk receiver-symbol 'state 'x)
                                          {:raster.op/original operation})]
                          'result)]}))
+
+(defn- terminal-helper-program [generic]
+  (let [operation (symbol (str (ns-name (.ns generic))) (str (:name (meta generic))))
+        source (core/resolve-deftm-var generic)
+        receiver (ns-resolve (.ns source) (symbol (str (:name (meta source)) "-impl")))
+        _ (core/ensure-current-owned-bytecode! receiver)
+        emission (:raster.core/bytecode-emission (meta receiver))
+        parameters (mapv #(symbol (str "argument" %)) (range (count (:params emission))))
+        receiver-symbol (with-meta (symbol (str (ns-name (.ns receiver))) (str (:name (meta receiver))))
+                          {:tag (:typed-interface emission)})
+        outputs '[result]]
+    {:params parameters :tags (vec (repeat (count parameters) 'Object)) :source-ns *ns*
+     :walked-body [(list 'let* ['result (with-meta (list* '.invk receiver-symbol parameters)
+                                         {:raster.op/original operation})] outputs)]}))
+
+(defn- consume-terminal-for-jvm
+  [{:keys [return-contract argument-bindings instantiated-body binding-facts]}]
+  ;; This test consumer keeps the complete original result-context recipe.
+  ;; In particular it does not extract the reduction or erase its Object context.
+  {:expression (list 'let* argument-bindings
+                     (util/subst-syms {(:value-port return-contract) instantiated-body}
+                                     (:recipe return-contract)))
+   :binding-facts binding-facts})
+
+(deftest terminal-static-return-needs-an-explicit-constructing-consumer
+  (entry/call-with-definition-inputs
+   (fn []
+     (doseq [helper [#'par/sum #'unused-terminal-array]]
+       (let [program (terminal-helper-program helper)
+             method (interface-method (:tags program))
+             seen (atom [])
+             events (atom [])
+             query source-import/terminal-reduction-return-contract
+             allocate util/*fresh-binder*
+             before @entry/*emission-inputs*
+             _ (is (nil? (generated/normalize-program program method capture!)))
+             _ (is (identical? before @entry/*emission-inputs*))
+             normalized
+             (with-redefs [source-import/terminal-reduction-return-contract
+                           (fn [request] (swap! events conj :authenticate) (query request))]
+               (binding [util/*fresh-binder* (fn [id] (swap! events conj :hygiene) (allocate id))]
+                 (generated/normalize-program
+                  program method capture!
+                  {:consume-terminal-reduction
+                   (fn [request]
+                     (swap! seen conj request)
+                     (consume-terminal-for-jvm request))})))
+             request (first @seen)
+             returned (:return-contract request)
+             original (emit program)
+             compiled (emit normalized)]
+         (is (some? normalized))
+         (is (= 1 (count @seen)))
+         (is (= :authenticate (first @events)))
+         (is (some #{:hygiene} @events))
+         (is (identical? returned (source-import/validate-terminal-reduction-return! returned)))
+         (is (identical? (:frontend request) (:frontend returned)))
+         (is (identical? (nth (second (first (:walked-body program))) 1) (:expression request)))
+         (is (instance? java.lang.reflect.Method (get-in request [:invocation :method])))
+         (is (= (count (:params program)) (count (:inputs request)) (count (:input-values request))))
+         (is (every? #(= :ref (:type %)) (vals (:locals request))))
+         (is (every? #(identical? Object (:reference-class %)) (vals (:locals request))))
+         (is (every? #(identical? (.arrayType Double/TYPE) (get-in % [:contract :target-carrier]))
+                     (:inputs request))
+             "every actual formal array CHECKCAST remains in its positional recipe")
+         (is (= (bytecode/retained-input-body-context (:emission returned) (:input-body returned))
+                (:saved-return-context request)))
+         (is (identical? (last (first (:walked-body program)))
+                         (last (first (:walked-body normalized))))
+             "the actual caller's output object survives construction")
+         (is (identical? program (:raster.compiler.backend.jvm.generated-body/normalization-input normalized)))
+         (doseq [arguments (if (= 1 (count (:params program)))
+                             [[(double-array [1 2 3])] [(float-array 1)]]
+                             [[(double-array [1 2 3]) (double-array 0)]
+                              [(double-array [1 2 3]) (float-array 0)]])]
+           (let [observe (fn [function]
+                           (try [:value (invoke function arguments)]
+                                (catch java.lang.reflect.InvocationTargetException error
+                                  [:error (class (.getCause error))])
+                                (catch Throwable error [:error (class error)])))]
+             (is (= (observe original) (observe compiled)))))
+         (is (= [6.0] (invoke compiled (vec (repeat (count (:params program)) (double-array [1 2 3])))))))))))
+
+(deftest terminal-consumer-cannot-erase-arguments-or-activate-a-foreign-frontend
+  (entry/call-with-definition-inputs
+   (fn []
+     (let [program (terminal-helper-program #'par/sum)
+           _ (terminal-helper-program #'unused-terminal-array)
+           foreign (entry/original-source-frontend (core/resolve-deftm-var #'unused-terminal-array))
+           method (interface-method (:tags program))
+           calls (atom 0)
+           consumer (fn [request] (swap! calls inc) (consume-terminal-for-jvm request))]
+       (with-redefs [entry/original-source-frontend (fn [_] foreign)]
+         (is (= :unowned-checked-result-frontend
+                (try (generated/normalize-program program method capture!
+                                                  {:consume-terminal-reduction consumer}) nil
+                     (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+             "selected capture rejects the foreign frontend before optional construction"))
+       (is (zero? @calls))
+       (let [before @entry/*emission-inputs*]
+         (is (nil? (generated/normalize-program
+                    program method capture!
+                    {:consume-terminal-reduction
+                     (fn [request]
+                       (assoc (consume-terminal-for-jvm request) :expression
+                              (list 'let* [] (:instantiated-body request))))})))
+         (is (identical? before @entry/*emission-inputs*)))
+       (is (= :generated-body-unsupported
+              (try (generated/normalize-program program method capture!
+                                                {:consume-terminal-reduction true}) nil
+                   (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))))))
 
 (deftest anchored-statement-spines-preserve-discard-context-and-local-facts
   (entry/call-with-definition-inputs
@@ -424,6 +816,46 @@
                [actual actual-events] (result implementation arguments)]
            (is (= expected actual))
            (is (= events actual-events))))))))
+
+(deftest terminal-only-keeps-ordinary-calls-and-rolls-back-refused-capture-history
+  (entry/call-with-definition-inputs
+   (fn []
+     (let [program (helper-program #'ordered-body-helper)
+           method (interface-method (:tags program))
+           [binder initializer] (take 2 (second (first (:walked-body program))))
+           checks (atom 0)
+           marker (reify entry/RetainedProducerInput
+                    (assert-producer-current! [this] (swap! checks inc) this))
+           captures (atom 0)
+           normalized
+           (generated/normalize-program
+            program method
+            (fn [& arguments]
+              (swap! captures inc)
+              (entry/adopt-definition-inputs! {:producer-inputs [marker]})
+              (apply capture! arguments))
+            {:terminal-only? true
+             :consume-terminal-reduction
+             (fn [_] (throw (AssertionError. "ordinary reference helper is not a terminal reduction")))})
+           [actual-binder actual-initializer] (take 2 (second (first (:walked-body normalized))))
+           original (emit program)
+           compiled (emit normalized)]
+       (is (some? normalized))
+       (is (pos? @captures))
+       (is (identical? binder actual-binder))
+       (is (identical? initializer actual-initializer))
+       (is (not-any? #(identical? marker %) (:producer-inputs @entry/*emission-inputs*)))
+       (reset! checks 0)
+       (entry/assert-definition-inputs-current! @entry/*emission-inputs*)
+       (is (zero? @checks) "a preserved call does not retain a rejected import's capture history")
+       (doseq [x [2.75 -3.25]]
+         (let [left (float-array [10 20]) right (aclone left)]
+           (is (identical? left (invoke original [left x])))
+           (is (identical? right (invoke compiled [right x])))
+           (is (= (vec left) (vec right)))))
+       (is (= :generated-body-unsupported
+              (try (generated/normalize-program program method capture! {:terminal-only? true}) nil
+                   (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))))))
 
 (deftest unsupported-new-program-shapes-do-not-invent-physical-facts
   (let [method (interface-method '[Object Object])

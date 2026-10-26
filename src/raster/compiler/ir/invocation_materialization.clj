@@ -79,9 +79,11 @@
 
 (defn- checked-opaque-step [{:keys [id value] :as step} actual]
   (checked-opaque id value actual)
-  (when (and (invocation/program-result-import? step) (not= id (:id actual)))
-    (fail! :invocation-materialization-import-identity
-           "imported source value belongs to a different invocation step"
+  (when (and (or (invocation/program-result-import? step) (invocation/source-completion? step))
+             (not= id (:id actual)))
+    (fail! (if (invocation/program-result-import? step)
+             :invocation-materialization-import-identity :invocation-materialization-source-identity)
+           "opaque source value belongs to a different invocation step"
            {:step id :actual (:id actual)}))
   actual)
 
@@ -243,7 +245,7 @@
 (defn- checked-computed-scalar [step value]
   (when (invocation/source-completion? step)
     (let [contract (:contract (completion/canonical-parts (:expression step)))
-          carrier (get types/primitive-info (completion/source-cast-result-tag contract))]
+          carrier (get types/primitive-info (:tag (completion/invocation-result-description contract)))]
       ;; A source completion already performed its actual conversion. A
       ;; dtype label is not permission to silently convert its result again.
       (when-not (and (typed-scalar? value) carrier
@@ -252,6 +254,11 @@
                "source completion executor did not return its declared physical result"
                {:step (:id step) :expected carrier :actual (some-> (:value value) class)}))))
   (checked-scalar (:id step) (:value step) value))
+
+(defn- checked-completed-value [step value]
+  (if (opaque-value? (:value step))
+    (checked-opaque-step step value)
+    (checked-computed-scalar step value)))
 
 (defn- source-completion-producers
   "Follow only explicit invocation value aliases to their source completion.
@@ -334,10 +341,14 @@
     ;; materialization is validated again at a later boundary.
     (doseq [{:keys [id value] :as slot} (concat (:parameters plan) (:steps plan))
             :when (scalar-value? value)]
-      (checked-computed-scalar (get completion-producers id slot) (get values id)))
+      (checked-completed-value (get completion-producers id slot) (get values id)))
     (doseq [{:keys [id value] :as slot} (concat (:parameters plan) (:steps plan))
             :when (opaque-value? value)]
-      (checked-opaque-step slot (get values id)))
+      (checked-completed-value (get completion-producers id slot) (get values id))
+      (when (and (invocation/value-alias? slot)
+                 (not (identical? (get values id) (get values (:source slot)))))
+        (fail! :invocation-materialization-alias
+               "opaque aliases must retain their producer's exact wrapper" {:value-id id})))
     (let [storage-values (set (map :program-value (:storage-bindings plan)))
           materialized-values (set/union (set (:program-inputs plan)) storage-values)]
       (when-not (= materialized-values
@@ -367,7 +378,7 @@
     (doseq [{:keys [program-value invocation-value]}
             (concat (:bindings plan) (:storage-bindings plan))]
       (when-let [producer (get completion-producers invocation-value)]
-        (checked-computed-scalar producer (get program-scalars program-value)))
+        (checked-completed-value producer (get program-scalars program-value)))
       (when-not (= (get values invocation-value)
                    (or (get program-buffers program-value)
                        (get program-scalars program-value)))
@@ -531,7 +542,11 @@
 
           (invocation/source-completion? step)
           (let [execute (source-completion-executor evaluate-scalar id)]
-            (checked-computed-scalar step (execute step (step-operand-values step values))))
+            (let [result (execute step (step-operand-values step values))]
+              (checked-completed-value
+               step (if (opaque-value? (:value step))
+                      (->MaterializedOpaque id (:value step) result)
+                      result))))
 
           (invocation/program-result-import? step)
           (fail! :invocation-materialization-program-result
@@ -600,18 +615,18 @@
             parameter-lexical (into {} (map (juxt :symbol :id)) parameters)
             parameter-values (select-keys values (map :id parameters))
             scalar-values (into {} (filter (comp typed-scalar? val)) parameter-values)
-            check-scalar! (fn [{:keys [id] :as slot} actual]
-                            (when-not (typed-scalar? actual)
+            check-completed! (fn [{:keys [id] :as slot} actual]
+                            (when (and (scalar-value? (:value slot)) (not (typed-scalar? actual)))
                               (fail! :invocation-materialization-state-scalar
                                      "retained scalar state requires a typed value"
                                      {:value-id id :actual actual}))
-                            (checked-computed-scalar (get completion-producers id slot) actual))]
+                            (checked-completed-value (get completion-producers id slot) actual))]
         (doseq [{:keys [id value] :as parameter} parameters]
           (let [actual (get values id)]
             (cond
               (opaque-value? value) (checked-opaque id value actual)
               (scalar-value? value)
-              (check-scalar! parameter actual)
+              (check-completed! parameter actual)
               :else (do
                 (validate-buffer! id actual value)
                 (let [expected (->MaterializedBuffer
@@ -641,14 +656,14 @@
                      (update :next-step inc)))
 
                (or (invocation/scalar-compute? step) (invocation/source-completion? step))
-               (do (check-scalar! step actual)
+               (do (check-completed! step actual)
                    (-> prior
                        (assoc-in [:values id] actual)
                        (assoc-in [:lexical symbol] id)
                        (update :next-step inc)))
                :else
                (let [_ (when-let [producer (get completion-producers id)]
-                         (checked-computed-scalar producer actual))
+                         (checked-completed-value producer actual))
                      expected (advance-materialization prior nil)]
                  (when-not (if (opaque-value? value)
                              (identical? actual (get-in expected [:values id]))
@@ -746,7 +761,8 @@
 
    This eager convenience entry uses the same step interpreter as incremental materialization.
    A function evaluator receives pure ScalarCompute steps. An explicit executor map may provide
-   :scalar and :source-completion functions separately; each returns one typed scalar. Source
+   :scalar and :source-completion functions separately. Source completions return a typed
+   scalar or, for an opaque result, the raw host reference (including nil). Source
    execution authority belongs to the caller's exact prepared owner, never this semantic plan.
    Plans requiring a source executor refuse before evaluating any step when it is absent.
    Executors are not retained or called for shapes, allocations or aliases."

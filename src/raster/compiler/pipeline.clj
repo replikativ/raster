@@ -44,6 +44,7 @@
             [raster.compiler.backend.gpu.wgsl :as wgsl-emit]
             [raster.compiler.passes.scalar.soa-lower :as soa-lower]
             [raster.compiler.passes.scalar.local-products :as local-products]
+            [raster.compiler.passes.scalar.source-import :as source-import]
             [raster.compiler.passes.parallel.structured-control-route :as structured-route]
             [raster.compiler.passes.parallel.resident-program-projection :as resident-projection]
             [raster.compiler.passes.parallel.typed-soac-frontend :as typed-soac-frontend]
@@ -893,13 +894,65 @@
              (vector? (second source))
              (some (fn [[_ expression]]
                      (or (value-completion/object-input-parts expression)
-                         (value-completion/boxed-reference-input-parts expression)))
+                         (value-completion/reference-input-parts expression)))
                    (partition 2 (second source))))
     (when-let [source-emitter (find-ns 'raster.compiler.backend.jvm.bytecode)]
       (when-let [policy (ns-resolve source-emitter 'binding-completion-plan)]
         (binding-completion/capture-resolution-context policy)))))
 
-(defn- semantic-program-attempt
+(defn- contextual-reduction-constructor
+  "One request-local witness per exact current source candidate, not per binding."
+  [opts]
+  (let [owners (java.util.IdentityHashMap.)
+        original (volatile! nil)
+        parameters (or (:public-parameters opts) (:active-params opts))
+        options (assoc opts :lexical-inputs parameters)
+        original! (fn []
+                    (let [source-var (:source-var opts)]
+                      (if-let [prepared @original]
+                        (do (me/assert-frontend-source! prepared source-var)
+                            (me/assert-frontend-selection! prepared source-var)
+                            prepared)
+                        (do
+                          ;; Source queries consume physical evidence, never
+                          ;; prepare it. Do that explicitly in orchestration
+                          ;; before the first current-source witness, including
+                          ;; reduction requests preceding the public footer.
+                          (rcore/prepare-emission-source-walk! source-var)
+                          (let [prepared (me/prepare-frontend-source!
+                                          (me/original-source-frontend source-var) source-var
+                                          rcore/ensure-current-owned-bytecode!)]
+                            (vreset! original prepared)
+                            prepared)))))
+        owner! (fn [source]
+                 (or (.get owners source)
+                     (let [_ (original!)
+                           created (source-import/prepare-contextual-source-witness source options)]
+                       (.put owners source created)
+                       created)))]
+    (fn [{:keys [kind source ordinal binder expression accept?]}]
+      (if (= kind :terminal-float-publication)
+        (when (source-import/terminal-float-publication-candidate? source)
+          (me/call-with-optional-definition-inputs
+           (fn []
+             (let [original (original!)
+                   bridge (me/frontend-boxed-entry-bridge original)]
+               ;; Actual return ABI, not a frontend annotation, selects this
+               ;; construction. Original preparation must precede a new witness.
+               (when (identical? Float/TYPE (:payload-carrier bridge))
+                 (let [returned (source-import/original-public-float-return-contract original (owner! source))
+                       publication (try (source-import/observe-terminal-float-publication returned)
+                                        (catch clojure.lang.ExceptionInfo error
+                                          (if (= :terminal-float-publication (:reason (ex-data error)))
+                                            nil (throw error))))]
+                   (when publication
+                     (source-import/construct-terminal-float-publication publication))))))))
+        (let [owner (owner! source)]
+        (if (= kind :reference-provenance)
+          (source-import/observe-reference-provenance! owner ordinal binder expression accept?)
+          (source-import/observe-contextual-reduction! owner ordinal binder expression)))))))
+
+(defn- semantic-program-attempt*
   "Try the finite semantic-program variants in specificity order.
 
    Structured control is currently GPU-only until the equation-first JVM schedule lands. A
@@ -912,6 +965,7 @@
         source (if (device/gpu-target? (:target-device opts))
                  (inline/flatten-nested-lets source)
                  source)
+        binding-context (source-binding-resolution-context source)
         ;; A public array's backing capacity is independent of each traversal.
         ;; Semantic owners must prove their logical access footprint separately.
         values (merge (when (device/gpu-target? (:target-device opts))
@@ -927,6 +981,7 @@
                 :resident-uniform-input-loads? (device/gpu-target? (:target-device opts))
                 :source-ns (:source-ns opts)
                 :source-var (:source-var opts)
+                :source-binding-context binding-context
                 :return-tag (:return-tag opts)
                 :preserve-declared-array-storage? (:preserve-declared-array-storage? opts)
                 :values values
@@ -950,7 +1005,7 @@
                     :values values
                     :source-ns (:source-ns opts)
                     :source-var (:source-var opts)
-                    :source-binding-context (source-binding-resolution-context source)
+                    :source-binding-context binding-context
                     :abstract-machine abstract-machine}
                      (some? (:public-parameters common))
                      (assoc :lexical-inputs (:public-parameters common))))
@@ -965,6 +1020,14 @@
         (cond-> (or typed {})
           (:declined structured)
           (assoc :structured-control-declined (:declined structured)))))))
+
+(defn- semantic-program-attempt
+  [source opts abstract-machine]
+  (if (and (device/gpu-target? (:target-device opts)) (var? (:source-var opts)))
+    (typed-soac-frontend/call-with-contextual-reduction-constructor
+     (contextual-reduction-constructor opts)
+     #(semantic-program-attempt* source opts abstract-machine))
+    (semantic-program-attempt* source opts abstract-machine)))
 
 (defn- unfused-compatibility
   "Keep unsupported source byte-for-byte while exposing why no certified fusion ran."
@@ -1378,6 +1441,21 @@
     (let [result (gensym "parallel_result_")]
       (with-meta (list 'let* [result source] result) (meta source)))))
 
+(def ^:private ^:dynamic *gpu-source-construction* false)
+
+(defn ^:no-doc call-with-gpu-source-construction
+  "Share one local generated-source constructor across a GPU frontend request.
+   Derived AD code carries executable return computations, not early-node proof
+   metadata. Cached AD/runtime programs stay unchanged. Numerical admission and
+   current-region emission still have to consume and validate that source."
+  [target consume!]
+  (if (or *gpu-source-construction* (not (device/gpu-target? target)))
+    (consume!)
+    (me/call-with-definition-inputs
+     #(raster.ad.reverse/call-with-generated-source-construction
+       source-import/construct-contextual-terminal-return
+       (fn [] (binding [*gpu-source-construction* true] (consume!)))))))
+
 (defn schedule-parallel-form
   "Construct the same TypedSOAC/SegOp boundary used by the ordinary compiler for an already
    walked form whose caller needs scheduled kernels rather than a compiled host function.
@@ -1388,7 +1466,10 @@
    in the counted compatibility `ParallelProgram`; supported map/reduce/scan forms retain their
    validated TypedSOAC algorithm and are scheduled exactly once before backend emission."
   [source {:keys [dtype array-types scalar-types target-device] :as opts}]
-  (let [source (top-level-binding-form source)
+  (call-with-gpu-source-construction
+   target-device
+   (fn []
+    (let [source (top-level-binding-form source)
         ;; GPU sessions enter with a walked deftm body, bypassing the forward pipeline's
         ;; fixpoint/expand stages. Reuse that same shared expansion here so scalar helpers
         ;; and source constants reach TypedSOAC as expressions, not opaque calls/vars.
@@ -1416,7 +1497,7 @@
               (assoc :typed-soac-declined (:declined typed))
               (:structured-control-declined typed)
               (assoc :typed-structured-control-declined
-                     (:structured-control-declined typed))))))
+                     (:structured-control-declined typed))))))))
 
 ;; ================================================================
 ;; Mode configurations (declarative pass vectors)

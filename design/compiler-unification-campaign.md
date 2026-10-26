@@ -17,7 +17,7 @@ rather than adding a route for each workload.
 | Source buffer returns | Whole-buffer projection locally corrected; full branch and subsequent helper-consumption gates remain open | Capacity-eight/domain-two direct/alias/tuple returns and local zero allocations pass local device checks; initialized-tail, nominal keys and ordered stages are independently qualified below; helper-consuming-all-eight remains the next integration |
 | Source omission and repeatability | Constructor preservation and stale-read CSE locally corrected; exact-checkpoint/full qualification and broader partiality remain | Constructor failure ordering and original intrinsic ownership; public JVM AOT read/write/read oracle and collection/alias controls; keep safe dead-work elimination and measure retained dynamic work |
 | RK4 | Full qualification of unified ordered program stages | Local Intel Arc OpenCL/Level Zero recurrence and discrete RK4 oracle pass; affected/fresh/full gates remain pending |
-| Float/Object results | Completed numerical result to invocation-value import, then owned source completion and distinct result publication | Actual checked Float result, overflow/failure order, original occurrence ownership; CUDA/HIP fixture pair |
+| Float/Object results | Full public mixed-gradient vertical and obsolete-path cleanup locally qualified; branch/CI landing remain | Post-cleanup fresh gate: 358 tests / 4,445 assertions with required OpenCL and Level Zero; existing public compilation/invocation, changed replay, root identity, single transfer and failure controls pass. Nine generated kernels each compile with nvcc/PTX and hipcc/device-code. No NVIDIA/AMD execution or performance claim; full CI remains pending |
 | Remaining AD/native consumers | Causal producer families, product transpose and typed JVP | Numerical/finite-difference controls plus alias, conversion and code-quality checks |
 | Generic core array overloads | Array family/hints do not retain selected `RT/aset` overload | Object-valued loop stores with observable operands; distinguish typed CHECKCAST contracts from arbitrary Clojure overload fidelity |
 | Compile cost and full qualification | GSDM timeout and incomplete CI denominator | Phase profiling, complete exact-head shards/corpus/device/compiler gates; separate cold/prepare/replay/device timings |
@@ -26,23 +26,27 @@ This ledger is the current plan. The dated sections below retain implementation
 evidence and historical decisions; they do not independently authorize obsolete
 execution paths or relax the original campaign's acceptance obligations.
 
-The follow-up independent review orders the next acceptance bundles as follows:
+The independent review of `b3d7756af` orders the next acceptance bundles as follows:
 
-1. Repair whole-buffer source returns through the common checked output/storage
-   projection, preserving numerical prefix and initialization evidence separately.
-2. Consume analyzed helper components in actual caller scope. Select a numerical
-   result, whole destination or effect-only return before rebasing IDs; retain
-   source order and liveness through fusion. Preserve selected calls only with
-   this consumer, not as unused early hooks or receipts across rewrites.
-   Before that integration, close the demonstrated upstream omission/repeatability
-   defects through the shared scalar source contracts; later source ownership
-   cannot recover an expression already erased or replaced by a stale read.
-3. Close result import, owned completion and actual Float output publication
-   together. A transparent numerical chain must retain baseline fusion/no readback;
-   an observable checked conversion must run exactly once at its source cursor.
-4. Close deferred resident composition as a separate vertical, including AMR
+1. Close the existing mixed-gradient's source-return vertical: owned helper return,
+   contextual reduction, exact result import, checked Float completion, and distinct
+   Float output publication. This case already has a typed/fused reduction; general
+   child-program assembly is not a prerequisite. Keep the helper's original result
+   context and actual positional Method input checks, including unused arguments.
+   The optional helper-construction branch is unqualified and must not land without
+   its production source-fold/import consumer. A transparent numerical chain must
+   retain baseline fusion/no readback; an observable conversion runs at its cursor.
+2. Consolidate the demonstrated construction: discharge original selected-helper
+   equivalence once, expressing return conversion and boxing as executable canonical
+   source computations. At the live fold, construct the current contextual reduction's
+   numerical equation and import relation together, using current-region carrier
+   evidence. Do not transport an early-node receipt through every rewrite or infer
+   payload Class from an AV. Remove an isolated helper-import constructor if it
+   remains unused and has no distinct demonstrated consumer. Broaden component
+   assembly only for an actual remaining workload; add no numerical IR or executor.
+3. Close deferred resident composition as a separate vertical, including AMR
    state/scratch and distributed consumers, without child host staging.
-5. Finish normalized AD/training and remaining workload gates. Compile-cost
+4. Finish normalized AD/training and remaining workload gates. Compile-cost
    measurement and exact-head full CI accounting run alongside every bundle.
 
 This consolidates existing analyzed entries, InvocationPlan and runtime ownership;
@@ -50,15 +54,102 @@ it does not add a numerical IR or executor. Source-action reads contribute to
 liveness, but only actual observable execution obligations partition fusion.
 All eight original campaign objectives remain acceptance requirements.
 
-The second independent review against `2473d88d3` confirms that the isolated
-selected-helper import adapter still has no production consumer, ordered result
-import/completion is not admitted, and deferred composition still requires a
-concrete preparation. These are implementation gaps, not merely missing tests.
-The next substantive unit must consume the source/component relation and close
-transparent versus observable return execution together; do not add another
-unused receipt layer or numerical IR. Existing source-inlined helpers are not
-thereby unsupported: the bounded whole-buffer `map!` then `par/sum` probe below
-already executes correctly. Keep that positive path while extending composition.
+The result-import implementation separates four authorities: final-source
+ownership, emitted numerical producer correspondence, successful execution in the
+current replay, and source snapshot adaptation. All four now pass the local public
+vertical, including a fresh JVM with required device gates. Initialization alone grants
+no readback permission. One captured producer Object is shared by its direct
+snapshots; each snapshot's return recipe executes separately at its source cursor.
+Captured Objects survive physical storage reuse, while replay resets all producer
+readiness and root caches. Unsupported imports must refuse before session creation.
+This is local acceptance of the landing candidate, not full-CI or release evidence.
+The final emitted-peer analysis compares attached InvocationPlan correspondence by
+exact identity and fingerprints only the numerical boundary without that field.
+Class-bearing source contracts do not become portable numerical facts; every
+equation, schedule, allocation, effect and output check remains in place.
+
+The obsolete isolated helper-component constructor and its one-use inline wrapper
+have now been removed. Their three dedicated tests were deleted; the direct causal
+prefix and production return-receipt tests remain. No public `deftm` or `par`
+surface semantics changed. The post-cleanup exact-snapshot gate passes 358 tests /
+4,445 assertions, with both local backends required; the decrease of three tests
+and 58 assertions removes only the obsolete path. This is the local landing
+candidate gate; full branch/CI qualification remains separate.
+
+Next execution order remains: finish this bundle's fresh/branch/CI qualification;
+then close deferred resident composition (including AMR and distributed consumers)
+without child host staging; then remaining normalized AD/training consumers.
+Compile-cost evidence and complete CI/shard accounting run alongside these, not
+as an additional semantic IR redesign. Local source-continuation success does not
+complete the other original campaign objectives.
+
+October 26 local construction checkpoint (uncommitted, not a landing gate):
+the scoped derived helper constructor, current-source binding witnesses and
+reconstruction of contextual reductions pass warm controls (21 tests / 308
+assertions; 184 / 1,385; result-import grammar 3 / 26). Original/JIT publication
+suppresses only the marked target-local projector; ordinary AD contexts remain
+unchanged. The target-local scope covers the semantic pass groups around SoA,
+not original source walking or final target compilation. The public mixed-gradient
+now retains its return contexts after reconstruction but still refuses the final
+Float source result. Numerical result import, checked conversion and distinct
+Float publication remain the required next acceptance bundle. These local results
+do not qualify PR #1566 or replace its exact-head CI/device gates.
+
+The subsequent live-boundary experiment constructs a separate Float singleton
+writer/read footer and passes ordinary scalar naming plus the unchanged whole-spine
+residency audit. Source-public checkpoint selection preserves internal reduction
+and array liveouts; those are not additional public returns. The experiment now
+refuses at the missing numerical-result import rather than at source-result
+coverage. This remains a prototype, not enabled production admission or a device
+execution claim. Original Float bits/errors, misleading hints and output selection
+controls pass together (30 tests / 343 assertions). Borrowed JVM occurrence tokens
+are detached only when constructing new numerical helper source after original
+equivalence is discharged; fingerprints still reject arbitrary opaque metadata.
+
+### Architecture and current qualification boundary
+
+```text
+source values / observable actions
+  -> TypedSOAC / ParallelProgram numerical equations
+  -> scheduled KernelBody and physical views / LinkPlan
+  -> current replay's completed values / publishable leases
+```
+
+InvocationPlan relates source actions to numerical and storage ports; it is not a
+second numerical IR. SourceCompletion and ProgramResultImport make the two sides
+of an observable numerical-to-source boundary explicit. Compiler receipts and
+compiled adapters are owner-local construction/freshness evidence, not portable
+type facts or evidence that a device producer has completed.
+
+A persistent buffer has an allocation owner, view/version and initialization
+state. A reusable program binds current semantic ports on each replay. Composition
+may share allocations, but must preserve versions, completion and outstanding
+leases. The concrete path does this; deferred ordered composition still requires
+implementation and cannot be enabled merely by removing preparation guards.
+
+The immediate missing relation is: this numerical result implements this owned
+source return, and its completed singleton storage may supply this exact import
+under this return recipe. A Double AV does not prove a boxed JVM Double; initialized
+input storage does not prove a producer completed in this replay. Keep those facts
+separate. Runtime import must check cursor, producer completion, physical view,
+initialization, owner and epoch across the transfer and owned return adaptation.
+
+At pushed `b3d7756af`, unit job 34993 has 15 completed shards and one incomplete
+shard: 6,975 tests, 28 failures and 41 errors across 51 failing Vars in completed
+shards. The incomplete shard's 436 observed Vars are excluded. Compared with job
+34986, 6,606 common completed Vars have no newly failing or recovered Vars; the
+noncommon and incomplete sets are not a coverage trend. Setup/build pass; unit,
+OpenCL CPU and public-source emission fail. PR #1566 remains unqualified.
+The incomplete shard timed out after ten minutes without output while running
+`gsdm-fused-train-step-converges`; it did not produce a final suite summary.
+
+The dated sections below are historical evidence, not current landing order. In
+particular, claims that all source-completion execution is unimplemented predate
+`b3d7756af`. Existing source-inlined helpers are not generally unsupported: the
+whole-buffer `map!` then `par/sum` probe already works and must remain fused without
+new intermediate readback. The public mixed-gradient, cold/warm agreement, actual
+OpenCL/Level Zero values, CUDA/HIP emission, overflow/prefix-write ordering and
+ordinary JVM/C admission are the next bundle's acceptance gates.
 
 ### Causal source-value projection (October 25)
 
