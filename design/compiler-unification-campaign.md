@@ -132,6 +132,29 @@ cache keys are unchanged. Pipeline/fingerprint suites pass 36 tests / 267
 assertions; independent review found no blocker. This establishes domain-correct
 convergence, not a measured GSDM speedup or an alpha-equivalence relaxation.
 
+Completed-boundary access and first ordered output leasing are now implemented
+through the same eager/ordered owner, replay and lease machinery. Successful
+execution retains the checked plan, matching effect evidence, physical projection
+and completion epoch together. Mutation or failure invalidates that observation.
+The accessor validates actual public output geometry only; it is not an input-byte
+frontier, source replay permission or proof for arbitrary internal views. Ordered
+lease admission checks owner/capability before source execution and actual owned
+outputs afterward, without fabricating a Prepared plan. Eager early ownership
+refusals remain intact. Nil allocation device specializes only to the plan target.
+
+The combined affected runtime/lease suites pass 66 tests / 1,231 assertions;
+the two migrated ordered-preparation cases separately pass 78 assertions. Both
+local backends execute first-lease, same-owner feedback, lease exclusion and
+failure-publication checks. Independent review caught and corrected invalid
+skeletal fixtures and an overly strict device-specialization comparison.
+
+AMR's two-cycle comparison now consumes returned public DeviceArrays and passes
+four field-size/numerical assertions against the independent PDE oracle. Its
+checkpoint path still errors honestly at `execution-identity`: the existing
+exact-bound-program identity cannot describe a deferred source producer. Source
+identity, completed-output evidence and semantic-port restore provenance remain
+the next migration; no input snapshots or parent continuity may be fabricated.
+
 The next address-proof repair must transport exact integral InvocationPlan
 producer relationships into sliced scheduled bodies as executable equality
 constraints. Both read-footprint proofs and runtime graph preconditions must

@@ -1,6 +1,7 @@
 (ns raster.gpu.output-lease-test
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.ir.link-plan :as plan]
+            [raster.compiler.ir.link-plan-test :as plan-fixture]
             [raster.gpu.compiled :as compiled]
             [raster.gpu.core :as gpu]
             [raster.gpu.test-lifecycle]
@@ -10,13 +11,23 @@
 (defn- executable
   ([] (executable :owned true))
   ([ownership owns-session?]
+   ;; Pure canonical geometry/effect proof, with replay/release/output projection
+   ;; mocked by the lifecycle tests below. This is not a native execution fixture.
+   (let [original (#'plan-fixture/valid-plan)
+         nodes (assoc-in (:nodes original) [:out :view :allocation :ownership] ownership)
+         {:keys [plan effect-evidence]}
+         (plan/make-with-effect-evidence {:id :resident-result :target (:target original)
+                                          :nodes nodes :instances (:instances original) :outputs [:out]})
+         descriptor (get-in nodes [:out :view])
+         buffer {:dtype :float :n-elements 16 :byte-size 64}
+         session (atom {:session-id :lease-fixture :closed? false
+                        :buffers {:out buffer} :allocations {:out (:allocation descriptor)}})]
    (raster.gpu.test-lifecycle/linked-executable
-    {:plan {:id :resident-result :outputs [:out]
-            :nodes {:out {:view {:allocation {:ownership ownership}}}}}
-     :session (atom {}) :owns-session? owns-session? :graph-key :graph
+    {:plan plan :node-views {:out (gpu/->ResidentBufferView :lease-fixture :out descriptor)}
+     :session session :owns-session? owns-session? :graph-key :graph
      :pending-inputs (atom #{}) :tainted-inputs (atom #{}) :closed? (atom false)
-     :lifetime-lock (Object.) :execution-state (atom {:value-epoch 0}) :completed-replays (atom 0)
-     :output-leases (atom 0) :output-ready? (atom false)})))
+     :lifetime-lock (Object.) :execution-state (atom {:value-epoch 0 :effect-evidence effect-evidence})
+     :completed-replays (atom 0) :output-leases (atom 0) :output-ready? (atom false)}))))
 
 (defn- reason [f]
   (try (f) nil (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
@@ -31,6 +42,75 @@
     (is (zero? @(:completed-replays executable)))
     (is (false? @(:output-ready? executable)))
     (is (zero? @(:output-leases executable)))))
+
+(deftest completed-boundary-requires-current-effect-owner-and-physical-geometry
+  (let [executable (executable)
+        original @(:session executable)
+        evidence (:effect-evidence @(:execution-state executable))]
+    (is (= :link-completed-boundary-unavailable (reason #(link/completed-boundary executable))))
+    (with-redefs [gpu/replay! (fn [& _]) link/outputs (fn [_] {:out :resident-view})]
+      (link/run! executable))
+    (let [boundary (link/completed-boundary executable)]
+      (is (identical? (:plan executable) (:plan boundary)))
+      (is (identical? evidence (:effect-evidence boundary)))
+      (is (= [1 1] [(:epoch boundary) (:replay boundary)])))
+    (swap! (:execution-state executable) assoc :effect-evidence (with-meta evidence (meta evidence)))
+    (is (= :link-completed-boundary-effects (reason #(link/completed-boundary executable))))
+    (swap! (:execution-state executable) assoc :effect-evidence evidence)
+    (swap! (:session executable) assoc-in [:buffers :out :byte-size] 0)
+    (is (= :link-completed-boundary-geometry (reason #(link/completed-boundary executable))))
+    (reset! (:session executable) original)
+    (#'link/begin-mutation! executable)
+    (is (= :link-completed-boundary-unavailable (reason #(link/completed-boundary executable))))))
+
+(deftest ordered-capability-and-replay-count-cannot-fabricate-a-completed-boundary
+  ;; Lifecycle double deliberately supplies no source or physical plan. Capability
+  ;; preflight must not manufacture either merely to enter the invocation callback.
+  (let [executable (assoc (executable) :plan nil)
+        calls (atom 0)]
+    (swap! (:execution-state executable) assoc :ordered {:leaseable-output? true})
+    (is (= :link-runtime-boundary-unavailable
+           (reason #(link/execute-and-lease!
+                     executable :fake-completion
+                     (fn [] (swap! calls inc)
+                       (swap! (:completed-replays executable) inc)
+                       (reset! (:output-ready? executable) true))))))
+    (is (= 1 @calls))
+    (is (zero? @(:output-leases executable)))))
+
+(deftest completed-output-specializes-only-an-unspecified-device-to-the-plan-target
+  (let [original (executable)
+        old-plan (:plan original)
+        {:keys [plan effect-evidence]}
+        (plan/make-with-effect-evidence
+         {:id :unspecified-device :target (:target old-plan)
+          :nodes (update-vals (:nodes old-plan) #(assoc-in % [:view :allocation :device] nil))
+          :instances (:instances old-plan) :outputs (:outputs old-plan)})
+        executable (assoc original :plan plan)]
+    (swap! (:execution-state executable) assoc :effect-evidence effect-evidence)
+    (with-redefs [gpu/replay! (fn [& _]) link/outputs (fn [_] {:out :resident-view})]
+      (link/run! executable))
+    (is (identical? plan (:plan (link/completed-boundary executable))))
+    (let [allocation (assoc (get-in @(:session executable) [:allocations :out]) :device :ocl:0)
+          resident (assoc-in (get-in executable [:node-views :out]) [:view :allocation] allocation)
+          changed (assoc-in executable [:node-views :out] resident)]
+      (swap! (:session executable) assoc-in [:allocations :out] allocation)
+      (is (= :link-completed-boundary-geometry (reason #(link/completed-boundary changed)))))))
+
+(deftest output-lease-deref-refuses-an-invalidated-runtime-epoch
+  (let [executable (executable)]
+    (with-redefs [gpu/replay! (fn [& _])
+                  link/outputs (fn [_] {:out :resident-view})
+                  link/output-values (fn [_] {:out :resident-view})]
+      (link/run! executable)
+      (let [lease (link/output-lease! executable)]
+        (try
+          ;; Simulate illicit out-of-band invalidation; public mutations are
+          ;; independently checked above/below to refuse while a lease is live.
+          (#'link/begin-mutation! executable)
+          (is (= :link-output-lease-stale (reason #(deref lease))))
+          (finally (.close ^java.io.Closeable lease)))
+        (is (= :link-output-lease-released (reason #(deref lease))))))))
 
 (deftest output-lease-pins-a-completed-replay-until-every-holder-releases
   (let [executable (executable)

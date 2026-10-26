@@ -1996,18 +1996,30 @@
    operation. This is a synchronous output-lifetime contract, not a value-version snapshot or
    authorization for private temporary reuse."
   [^Compiled c inputs]
-  (require-concrete-preparation! c :invoke-leased)
-  (let [output-nodes (set (get-in c [:executable :plan :outputs]))
+  (let [ordered? (boolean (get-in c [:prepared :ordered-invocation]))
+        output-nodes (set (get-in c [:executable :plan :outputs]))
         projected-nodes (mapv :node (:out-tree c))
-        _ (when-not (and (seq projected-nodes)
-                         (every? output-nodes projected-nodes))
+        _ (when-not (or ordered? (and (seq projected-nodes)
+                                      (every? output-nodes projected-nodes)))
             (throw (ex-info "leased compiled results must project declared LinkPlan outputs"
                             {:reason :compiled-output-lease-boundary
                              :projected projected-nodes :outputs output-nodes})))
         {:keys [result lease]}
         (gpu-link/execute-and-lease!
          (:executable c) :invoke-leased
-         #(invoke-compiled-unleased c inputs))
+         (fn []
+           (let [result (invoke-compiled-unleased c inputs)
+                 boundary (gpu-link/completed-boundary (:executable c))
+                 entries (if ordered? (get-in boundary [:projection :out-tree]) (:out-tree c))
+                 nodes (mapv :node entries)
+                 output-set (set (get-in boundary [:plan :outputs]))]
+             (when-not (and (seq entries) (= (count entries) (count (set (map :key entries))))
+                            (= (set (keys result)) (set (map :key entries)))
+                            (every? output-set nodes)
+                            (or (not ordered?) (= nodes (get-in boundary [:plan :outputs]))))
+               (throw (ex-info "leased results differ from the current completed output projection"
+                               {:reason :compiled-output-lease-boundary})))
+             result)))
         released? (atom false)]
     (reify
       java.io.Closeable

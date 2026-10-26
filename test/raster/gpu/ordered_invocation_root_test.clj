@@ -472,16 +472,73 @@
         (value/free! alias))
       (finally (value/free! foreign) (compiled/close! artifact)))))
 
+(defn- check-first-ordered-output-lease! [target]
+  (let [prepared (compiled/lower #'source-zero-observed
+                                 [(double-array [7.0]) (double-array 1) 1]
+                                 {:target target :dtype :double :compiler :equation-first})
+        artifact (compiled/instantiate! prepared)
+        executable (:executable artifact)]
+    (try
+      (is (nil? (:lowering prepared)) "no physical plan is fabricated before source execution")
+      (is (= :link-runtime-boundary-unavailable (reason #(link/completed-boundary executable))))
+      (let [lease (compiled/invoke-leased artifact {})
+            output (first (vals @lease))
+            boundary (link/completed-boundary executable)]
+        (try
+          (is (= [1.0] (vec (value/->host output))))
+          (is (= 1 (:replay boundary)))
+          (is (identical? (:plan boundary) (get-in @(:execution-state executable) [:resident-boundary :plan])))
+          (is (seq (:effect-evidence boundary)))
+          (is (= (mapv :node (get-in boundary [:projection :out-tree])) (get-in boundary [:plan :outputs])))
+          (is (= :link-output-lease-active (reason #(artifact {:x output}))))
+          (is (= :link-output-lease-active
+                 (reason #(link/run-ordered-with-inputs! executable {'x output} nil))))
+          (is (= :link-output-lease-active (reason #(compiled/close! artifact))))
+          (is (value/live? output))
+          (finally (.close ^java.io.Closeable lease)))
+        (is (not (value/live? output)))
+        (is (= :compiled-output-lease-released (reason #(deref lease)))))
+      (let [previous (first (vals (artifact {})))
+            alias (value/alias-of previous)
+            lease (compiled/invoke-leased artifact {:x alias})
+            output (first (vals @lease))]
+        (try
+          (is (not (value/live? previous)))
+          (is (not (value/live? alias)))
+          (is (value/live? output))
+          (let [early (get-in @(:execution-state executable) [:ordered :current :realized :buffers 'early])]
+            (is (= [2.0] (vec (link/download executable early))))
+            (is (= 3 (:replay (link/completed-boundary executable)))))
+          (is (= :link-output-lease-active (reason #(link/run! executable))))
+          (finally (.close ^java.io.Closeable lease) (value/free! alias))))
+      (artifact {})
+      (is (= 4 (:replay (link/completed-boundary executable))))
+      (finally (compiled/close! artifact))))
+  (let [compilation (equation-first/compile #'source-zero-observed {:target target :dtype :double})
+        failure (ex-info "injected final output projection failure" {:reason :test-final-projection})
+        executable (link/instantiate-ordered-invocation!
+                    compilation [(double-array [7.0]) (double-array 1) 1]
+                    {:project-boundary (fn [_] (throw failure))})]
+    (try
+      (is (identical? failure (try (link/run-and-lease! executable)
+                                  nil (catch Throwable error error))))
+      (is (zero? @(:output-leases executable)))
+      (is (zero? @(:completed-replays executable)))
+      (is (false? @(:output-ready? executable)))
+      (is (nil? (:resident-boundary @(:execution-state executable))))
+      (is (= :link-execution-poisoned (reason #(link/completed-boundary executable))))
+      (finally (link/close! executable)))))
+
 (deftest opencl-ordered-resident-inputs-use-one-checked-device-handoff
   (if @ocl-probe/opencl-available?
     (do (check-resident-input-handoff! :ocl:0) (check-resident-input-batch-preflight! :ocl:0)
-        (check-compiled-resident-output-feedback! :ocl:0))
+        (check-compiled-resident-output-feedback! :ocl:0) (check-first-ordered-output-lease! :ocl:0))
     (ocl-probe/opencl-skip! "ordered resident input handoff")))
 
 (deftest level-zero-ordered-resident-inputs-use-one-checked-device-handoff
   (if @ze-probe/gpu-available?
     (do (check-resident-input-handoff! :ze:0) (check-resident-input-batch-preflight! :ze:0)
-        (check-compiled-resident-output-feedback! :ze:0))
+        (check-compiled-resident-output-feedback! :ze:0) (check-first-ordered-output-lease! :ze:0))
     (ze-probe/gpu-skip! "ordered resident input handoff")))
 
 (deftest opencl-owned-root-obeys-source-order-and-replay

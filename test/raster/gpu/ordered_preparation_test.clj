@@ -779,9 +779,16 @@
           (is (not (value/live? first)) "successful mutation retires earlier public output aliases")))
       (let [third (:result (c))]
         (is (= [10.0] (vec (value/->host third))) "omitted x uses the original Prepared default, not 21")
-        (is (= :compiled-deferred-phase (reason #(compiled/invoke-leased c {}))))
-        (is (value/live? third)))
-      (is (= 3 @(:completed-replays (:executable c))))
+        (is (value/live? third))
+        (let [lease (compiled/invoke-leased c {})
+              output (:result @lease)]
+          (try
+            (is (= [10.0] (vec (value/->host output))))
+            (is (not (value/live? third)))
+            (is (= :link-output-lease-active (reason #(c {}))))
+            (finally (.close ^java.io.Closeable lease)))
+          (is (not (value/live? output)))))
+      (is (= 4 @(:completed-replays (:executable c))))
       (is (= [100.0] (vec state)))
       (finally (compiled/close! c))))
   (let [prepared (compiled/lower #'fixture/write-before-shape
@@ -789,7 +796,9 @@
                                  {:compiler :equation-first :target target :dtype :double})
         c (compiled/instantiate! prepared)]
     (try
-      (is (instance? ArithmeticException (try (c) nil (catch Throwable error error))))
+      (is (instance? ArithmeticException
+                     (try (compiled/invoke-leased c {}) nil (catch Throwable error error))))
+      (is (zero? @(:output-leases (:executable c))))
       (let [executable (:executable c)
             state @(:execution-state executable)
             token (get-in state [:ordered :current :realized :buffers 'first-output])

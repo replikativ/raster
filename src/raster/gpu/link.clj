@@ -505,7 +505,8 @@
                                         (atom 0)
                                         (atom 0)
                                         (atom false)
-                                        (atom {:value-epoch 0}))))
+                                        (atom {:value-epoch 0 :effect-evidence (:effect-evidence validated)
+                                               :caller-options caller-options}))))
                (catch Throwable error
                  (when-not owns-session?
                    (do
@@ -606,14 +607,15 @@
     (throw (ex-info "linked executable lacks execution state"
                     {:reason :link-execution-state-missing})))
   (swap! (:execution-state executable)
-         #(cond-> (update % :value-epoch inc) (:ordered %) (dissoc :resident-boundary)))
+         #(cond-> (-> % (update :value-epoch inc) (dissoc :completed-epoch :completed-replay))
+            (:ordered %) (dissoc :resident-boundary)))
   (reset! (:output-ready? executable) false))
 
 (defn- poison-execution! [executable error]
   ;; Reentrant restoration may already have poisoned this owner. Preserve the first backend
   ;; failure rather than replacing it with an outer already-poisoned wrapper.
   (swap! (:execution-state executable)
-         #(cond-> (if (:failure %) % (assoc % :failure error))
+         #(cond-> (dissoc (if (:failure %) % (assoc % :failure error)) :completed-epoch :completed-replay)
             (:ordered %) (dissoc :resident-boundary)))
   (reset! (:output-ready? executable) false)
   (throw error))
@@ -627,7 +629,9 @@
      (try
        (begin-mutation! executable)
        (let [result (execute!)]
-         (swap! (:completed-replays executable) inc)
+         (let [replay (swap! (:completed-replays executable) inc)]
+           (swap! (:execution-state executable)
+                  #(assoc % :completed-epoch (:value-epoch %) :completed-replay replay)))
          (reset! (:output-ready? executable) true)
          result)
        (catch Throwable error (poison-execution! executable error))
@@ -668,7 +672,8 @@
   (let [state (some-> (:execution-state executable) deref)
         boundary (if (:ordered state)
                    (:resident-boundary state)
-                   {:plan (:plan executable) :node-views (:node-views executable)})]
+                   {:plan (:plan executable) :node-views (:node-views executable)
+                    :effect-evidence (:effect-evidence state)})]
     (when-not (map? (:plan boundary))
       (throw (ex-info "linked executable has no concrete resident boundary"
                       {:reason :link-runtime-boundary-unavailable :operation operation})))
@@ -679,6 +684,63 @@
       (throw (ex-info "linked executable has no such node"
                       {:reason :link-runtime-node :node node-id
                        :nodes (set (keys node-views))}))))
+
+(defn- checked-invocation-output-projection! [plan projection]
+  (let [entries (:out-tree projection)]
+    (when-not (and (= :typed-invocation (get-in plan [:attributes :source]))
+                   (vector? entries) (= (:outputs plan) (mapv :node entries))
+                   (= (count entries) (count (set (map :key entries)))))
+      (throw (ex-info "public output projection requires its completed invocation boundary"
+                      {:reason :link-invocation-output-projection})))
+    projection))
+
+(defn completed-boundary
+  "Observe one current, successfully completed physical boundary under its runtime owner.
+   The returned plan/projection/effect facts are not source replay authority or a lifetime pin;
+   callers needing stable use must hold the existing output lease or owner execution lock.
+   Native geometry is checked for public outputs; this is not an audit of every internal view."
+  [executable]
+  (let [executable (ensure-live! executable :completed-boundary)]
+    (locking (:lifetime-lock executable)
+      (ensure-live! executable :completed-boundary)
+      (let [state @(:execution-state executable)
+            epoch (:value-epoch state)
+            replay @(:completed-replays executable)
+            {:keys [plan effect-evidence] :as boundary}
+            (resident-boundary! executable :completed-boundary)
+            request (if (:ordered state) (get-in state [:ordered :caller-options]) (:caller-options state))]
+        (when-not (and @(:output-ready? executable) (pos? replay)
+                       (= epoch (:completed-epoch state)) (= replay (:completed-replay state))
+                       (or (not (:ordered state))
+                           (and (= epoch (:epoch boundary)) (= replay (:replay boundary)))))
+          (throw (ex-info "physical boundary is not the current completed replay"
+                          {:reason :link-completed-boundary-unavailable})))
+        (when-not (link-plan/retained-effect-evidence? plan effect-evidence request)
+          (throw (ex-info "completed physical boundary lost its exact checked effect owner"
+                          {:reason :link-completed-boundary-effects})))
+        (when (some? (:projection boundary))
+          (checked-invocation-output-projection! plan (:projection boundary)))
+        (doseq [id (:outputs plan)
+                :let [expected (bview/validate-view! (get-in plan [:nodes id :view]))
+                      resident (boundary-node-view! boundary id)
+                      actual (bview/validate-view! (:view resident))
+                      session @(:session executable)
+                      allocation (get-in session [:allocations (:key resident)])
+                      buffer (get-in session [:buffers (:key resident)])]]
+          (when-not (and (not (:closed? session))
+                         (= (:session-id session) (:session-id resident))
+                         (= allocation (:allocation actual)) buffer
+                         (= (select-keys expected [:dtype :shape :strides :byte-offset :byte-length])
+                            (select-keys actual [:dtype :shape :strides :byte-offset :byte-length]))
+                         (= (-> (into {} (:allocation expected)) (dissoc :id)
+                                (update :device #(or % (:target plan))))
+                            (dissoc (into {} allocation) :id))
+                         (= (dtype/canon (:dtype buffer)) (:dtype actual))
+                         (<= (bview/byte-end actual) (:byte-size buffer)))
+            (throw (ex-info "completed output no longer has its checked physical geometry"
+                            {:reason :link-completed-boundary-geometry :node id})))
+          (when-let [owner (cleanup/lifetime-owner buffer)] (cleanup/assert-live! owner)))
+        (assoc boundary :epoch epoch :replay replay)))))
 
 (defn node-view
   "Return a stable ResidentBufferView for one public or internal LinkNode."
@@ -1026,15 +1088,8 @@
    preparation's unresolved output candidates. Resident views remain available through outputs."
   [executable]
   (let [executable (ensure-live! executable :invocation-output-projection)
-        {:keys [plan projection]} (resident-boundary! executable :invocation-output-projection)
-        entries (:out-tree projection)]
-    (when-not (and (= :typed-invocation (get-in plan [:attributes :source]))
-                   (vector? entries)
-                   (= (:outputs plan) (mapv :node entries))
-                   (= (count entries) (count (set (map :key entries)))))
-      (throw (ex-info "public output projection requires its completed invocation boundary"
-                      {:reason :link-invocation-output-projection})))
-    projection))
+        {:keys [plan projection]} (resident-boundary! executable :invocation-output-projection)]
+    (checked-invocation-output-projection! plan projection)))
 
 (defn- require-owned-output-boundary! [executable]
   (when (some-> executable :execution-state deref :exclusive-mutation?)
@@ -1047,6 +1102,19 @@
                            (:outputs plan)))
       (throw (ex-info "output leases require owned resident outputs in an owned session"
                       {:reason :link-output-lease-ownership :plan (:id plan)})))))
+
+(defn- require-output-lease-capability! [executable]
+  ;; Ordered source has no physical output plan before its first invocation. Only
+  ;; this existing owned-root capability can admit execution; actual ownership is
+  ;; checked again against the completed boundary after synchronous success.
+  (when (some-> executable :execution-state deref :exclusive-mutation?)
+    (throw (ex-info "output leases cannot escape an exclusive mutation scope"
+                    {:reason :link-mutation-scope-active})))
+  (if-let [ordered (:ordered @(:execution-state executable))]
+    (when-not (and (:owns-session? executable) (:leaseable-output? ordered))
+      (throw (ex-info "output leases require owned resident outputs in an owned session"
+                      {:reason :link-output-lease-ownership})))
+    (require-owned-output-boundary! executable)))
 
 (defn output-lease!
   "Pin one completed replay's owned resident outputs until the returned Closeable is released.
@@ -1065,9 +1133,10 @@
         (throw (ex-info "output lease requires a completed replay"
                         {:reason :link-output-lease-before-replay
                          :plan (get-in executable [:plan :id])})))
-      (let [result {:outputs (outputs executable)
+      (let [{:keys [epoch replay]} (completed-boundary executable)
+            result {:outputs (outputs executable)
                     :values (output-values executable)
-                    :replay @(:completed-replays executable)}
+                    :replay replay}
             released? (atom false)]
         (swap! (:output-leases executable) inc)
         (reify
@@ -1082,6 +1151,12 @@
               (when @released?
                 (throw (ex-info "output lease has been released"
                                 {:reason :link-output-lease-released})))
+              (ensure-live! executable :output-lease-deref)
+              (when-not (and @(:output-ready? executable)
+                             (= epoch (:value-epoch @(:execution-state executable)))
+                             (= replay @(:completed-replays executable)))
+                (throw (ex-info "output lease no longer denotes its completed replay"
+                                {:reason :link-output-lease-stale})))
               result)))))))
 
 (defn execute-and-lease!
@@ -1095,13 +1170,14 @@
   (with-unleased-execution!
    executable operation
    (fn []
-     (require-owned-output-boundary! executable)
+     (require-output-lease-capability! executable)
      (let [before @(:completed-replays executable)
            result (invoke!)]
        (when-not (= (inc before) @(:completed-replays executable))
          (throw (ex-info "leased invocation must complete exactly one linked replay"
                          {:reason :link-leased-invocation-replay-count
                           :before before :after @(:completed-replays executable)})))
+       (completed-boundary executable)
        {:result result :lease (output-lease! executable)}))))
 
 (defn run!
@@ -1142,11 +1218,7 @@
   (let [executable (ensure-live! executable :run-and-lease!)]
     (locking (:lifetime-lock executable)
       (ensure-live! executable :run-and-lease!)
-      (if-let [ordered (some-> (:execution-state executable) deref :ordered)]
-        (when-not (and (:owns-session? executable) (:leaseable-output? ordered))
-          (throw (ex-info "output leases require owned resident outputs in an owned session"
-                          {:reason :link-output-lease-ownership})))
-        (require-owned-output-boundary! executable))
+      (require-output-lease-capability! executable)
       (run! executable)
       (output-lease! executable))))
 
@@ -1495,7 +1567,10 @@
     (let [storage (realize-plan-storage! plan (:session executable) execution-id groups {}
                                         ledger timings roots)]
       (swap! execution-state assoc :resident-boundary {:plan plan :node-views (:node-views storage)
-                                                      :projection (:projection final)}))))
+                                                      :projection (:projection final)
+                                                      :effect-evidence (:effect-evidence final)
+                                                      :epoch (:value-epoch @execution-state)
+                                                      :replay (inc @(:completed-replays executable))}))))
 
 (defn- execute-ordered-source-completion
   "Execute one authenticated bounded numeric-entry/reference recipe at its source cursor.
