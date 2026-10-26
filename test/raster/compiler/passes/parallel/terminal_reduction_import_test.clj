@@ -152,6 +152,9 @@
                        :caller-expression (list* '.invk receiver arguments)
                        :array-types {'scaled :double 'input :double})
         supplied-scaled (av/tensor {:dtype :double :shape [4]})
+        at-call (atom nil)
+        imported-at-call (atom nil)
+        advance @#'frontend/advance-source-description
         source (list 'let*
                      ['scaled '(raster.par/pmap i 4 double
                                  (* (double coefficient) (clojure.core/aget input i)))
@@ -159,16 +162,28 @@
                       'scaled '(clojure.core/println scaled)
                       'later '(raster.par/pmap j 17 double (double j))]
                      [(:result-symbol request) 'later])
-        analyzed (frontend/form->program-components
-                  source {:dtype :double :array-types {'input :double}
+        analyzed (with-redefs-fn
+                   {#'frontend/advance-source-description
+                    (fn [dtype segmented? state [ordinal _ :as binding]]
+                      (when (and (= 1 ordinal)
+                                 (identical? (:caller-expression request) (second (second binding))))
+                        ;; Consume the preceding map's facts BEFORE the helper
+                        ;; or any suffix description has been analyzed.
+                        (let [before (get-in state [:source-value-analysis :values])]
+                          (reset! at-call before)
+                          (reset! imported-at-call (construct (assoc request :values before)))))
+                      (advance dtype segmented? state binding))}
+                   #(frontend/form->program-components
+                    source {:dtype :double :array-types {'input :double}
                           :scalar-types {'coefficient :float}
                           :values {'input (av/tensor {:dtype :double :shape [4]})
                                    'coefficient (av/tensor {:dtype :float :shape []})
                                    'scaled supplied-scaled
                                    'later (av/tensor {:dtype :double :shape [17]})}
-                          :lexical-inputs '[input coefficient] :segmented-plans? true})
+                          :lexical-inputs '[input coefficient] :segmented-plans? true}))
         before (get-in analyzed [:preceding-values 1])
-        imported (construct (assoc request :values before))]
+        imported @imported-at-call]
+    (is (= before @at-call) "the published prefix is the actual input to next-binding analysis")
     (is (= #{'input 'coefficient} (set (keys (get-in analyzed [:preceding-values 0])))))
     (is (= :double (get-in before ['scaled :dtype])))
     (is (= [4] (get-in before ['scaled :shape])))

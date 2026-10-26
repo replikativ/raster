@@ -111,6 +111,44 @@ a coverage trend. Public-source emission job 34923 emits 170/172 fixtures; the
 two failures are the same mixed-scale gradient's source-result boundary on CUDA
 and HIP, before the vendor compiler gates. PR #1566 remains unqualified.
 
+### Causal source assembly before the next binding (October 25)
+
+The review found that the preceding-value table above was reconstructed only
+after all descriptions and global input inference. It could not supply a live
+helper's arguments while its next binding was being described. The existing
+description/extent fold now carries that source-value state immediately. Only
+actual lexical inputs and admitted numerical producer results enter it; ordinary
+source-only scalars, Object snapshots and checked Float completions stay unknown.
+Global storage requirements and final numerical AV inference remain separate.
+
+The fold reuses the existing operation/result projector instead of introducing
+another result-type registry. Exact immutable description identity permits final
+equation reuse, including semantic metadata; the storage pass preserves that
+identity when unchanged. Indexed-storage reclassification requires one rebuild.
+Thus the qualified construction counts are one projection per unchanged
+operation and at most one additional projection when storage classification
+changes, not a claim that every analysis is now deduplicated. Description-only
+coverage/normalization consumers construct no numerical equations.
+
+Optional early projections use checkpoints confined to the complete projection's
+unpublished compiler collector. Declines discard local observations; success
+retains them until one existing outer validation/adoption fence. Stale/unstable
+ownership exceptions propagate. Nested successful observations are still discarded
+if the whole source projection declines, and a definition becoming stale before
+publication refuses. There is no public unchecked-proof API or new IR owner.
+An inherited-history counter stays constant between 2 and 16 numerical bindings.
+
+The actual dot-helper import constructor consumes a preceding functional map's
+contracts before the helper binding is parsed, without prefix reanalysis. This
+is a tested consuming-construction seam, not yet automatic selected-call
+preservation, caller/component return assembly, ordered result supply or Float
+publication. The mixed-gradient public return remains refused until those
+obligations close. Existing inlined helpers retain their established route.
+
+The warm affected bundle passes 724 tests / 7,647 assertions; the two additional
+nested rollback/stale-publication controls pass 2 tests / 7 assertions. Independent
+fresh and device qualification remain required before this checkpoint is pushed.
+
 ### Whole-buffer source-return correction (October 25, branch qualification)
 
 The shared complete-source return projector now selects the certified physical

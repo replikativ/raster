@@ -4750,26 +4750,52 @@
              {:descriptions [] :extents {} :scalar-representatives {}}
              descriptions))))
 
-(defn- source-descriptions
+(declare initial-source-value-analysis advance-source-value-analysis)
+
+(defn- analyze-source-descriptions
   "Parse and normalize each binding in source order. Type/definition transfer
    still uses the original expression; extent transfer sees only its preceding
-   normalized state. No growing prefix is reparsed or normalized again."
-  [pairs default-dtype array-types scalar-types segmented-plans? shape-equalities values]
+   normalized state. The consuming path additionally retains source-value facts
+   before describing the next binding; description-only callers do no equation
+   work. No growing prefix is reparsed or normalized again."
+  [pairs default-dtype array-types scalar-types segmented-plans? shape-equalities values
+   source-value-options]
   (let [context (extent-normalization-context (set (map first pairs)) shape-equalities values)]
-    (:descriptions
-     (reduce
+    (reduce
       (fn [state binding]
         (let [described (advance-source-description default-dtype segmented-plans? state binding)
               descriptions (:descriptions described)
               normalized (advance-extent-normalization
                           context
                           (assoc (:extent-normalization state) :descriptions (pop descriptions))
-                          (peek descriptions))]
-          (assoc described :descriptions (:descriptions normalized)
-                           :extent-normalization (dissoc normalized :descriptions))))
-      (assoc (initial-source-description-state array-types scalar-types)
-             :extent-normalization {:extents {} :scalar-representatives {}})
-      (map-indexed vector pairs)))))
+                          (peek descriptions))
+              description (peek (:descriptions normalized))
+              ;; Storage classification may later retain indexed captures. Give
+              ;; unchanged descriptors an explicit empty set so that pass can
+              ;; preserve their identity and reuse this exact projection.
+              description (if (and source-value-options
+                                   (contains? #{:map :reduce :scan} (:kind description)))
+                            (update description :storage-inputs #(or % #{}))
+                            description)]
+          (cond-> (assoc described
+                         :descriptions (conj (pop (:descriptions normalized)) description)
+                         :extent-normalization (dissoc normalized :descriptions))
+            source-value-options
+            (assoc :source-value-analysis
+                   (advance-source-value-analysis (:source-value-analysis state) description
+                                                  default-dtype (:array-types described))))))
+      (cond-> (assoc (initial-source-description-state array-types scalar-types)
+                     :extent-normalization {:extents {} :scalar-representatives {}})
+        source-value-options
+        (assoc :source-value-analysis
+               (initial-source-value-analysis pairs (:lexical-inputs source-value-options) values)))
+      (map-indexed vector pairs))))
+
+(defn- source-descriptions
+  "Description-only view; coverage and source normalization need no numerical projections."
+  [pairs default-dtype array-types scalar-types segmented-plans? shape-equalities values]
+  (:descriptions (analyze-source-descriptions pairs default-dtype array-types scalar-types
+                                             segmented-plans? shape-equalities values nil)))
 
 (defn- generated-scaffolding?
   [description physical-outputs]
@@ -6164,7 +6190,10 @@
             (-> state
                 (assoc :shapes (reduce #(assoc %1 %2 (if (= :reduce kind) [] [extent])) shapes results))
                 (update :descriptions conj
-                        (assoc description :storage-inputs storage-inputs))))))
+                        (if (and (contains? description :storage-inputs)
+                                 (= (:storage-inputs description) storage-inputs))
+                          description
+                          (assoc description :storage-inputs storage-inputs)))))))
 
 (defn- preserve-map-storage-inputs
   "Use indexed captures in maps, reductions and scans when element-shape equality is not established.
@@ -6294,8 +6323,17 @@
   ([pairs dtype array-types scalar-types segmented-plans? values shape-equalities]
    (source-storage-analysis pairs dtype array-types scalar-types segmented-plans? values shape-equalities nil))
   ([pairs dtype array-types scalar-types segmented-plans? values shape-equalities lexical-inputs]
-  (let [descriptions (source-descriptions pairs dtype array-types scalar-types segmented-plans?
-                                          shape-equalities values)
+   (source-storage-analysis pairs dtype array-types scalar-types segmented-plans? values shape-equalities
+                            lexical-inputs nil))
+  ([pairs dtype array-types scalar-types segmented-plans? values shape-equalities lexical-inputs
+    source-value-options]
+  (let [source-analysis (when source-value-options
+                          (analyze-source-descriptions
+                           pairs dtype array-types scalar-types segmented-plans? shape-equalities values
+                           source-value-options))
+        descriptions (or (:descriptions source-analysis)
+                         (source-descriptions pairs dtype array-types scalar-types segmented-plans?
+                                              shape-equalities values))
         source-scalar-types
         (reduce (fn [types {:keys [kind sym scalar-dtype]}]
                   (if (and (= :scalar kind) scalar-dtype)
@@ -6358,8 +6396,10 @@
                           (merge-value known sym capacity shape-equalities)
                           known)
                         known)) values descriptions))]
-    {:descriptions (preserve-map-storage-inputs descriptions values)
-     :values values :allocations allocations})))
+    (cond-> {:descriptions (preserve-map-storage-inputs descriptions values)
+             :values values :allocations allocations}
+      source-value-options
+      (assoc :source-value-analysis (:source-value-analysis source-analysis))))))
 
 (defn- retain-allocation-projections [allocations values]
   (mapv (fn [{:keys [source-expression] :as allocation}]
@@ -6672,35 +6712,86 @@
                        (set/subset? (set/intersection source-bindings (util/free-syms contract)) ready)))
           contracts)))
 
-(defn- preceding-numerical-values
-  "Retain logical value facts before each source entry. Seed only actual lexical
-   inputs and publish only typed equation results, never consumer-inferred input
-   shapes or whole-body allocation facts. This is not execution/Class evidence.
-   Source-only results remain unknown until their own producer is represented."
-  [entries produced-values lexical-inputs input-values]
+(defn- initial-source-value-analysis
+  [pairs lexical-inputs input-values]
   (let [inputs (set lexical-inputs)
-        source-bindings (into inputs (map #(get-in % [:description :sym])) entries)]
-   (reduce (fn [{:keys [values available] :as state} {:keys [kind equation-id description]}]
-            (let [available (conj available (:sym description))
-                  results (when (= :typed-soac kind)
-                            (source-available-contracts
-                             (causal-producer-results description (get produced-values equation-id) values)
-                             source-bindings available))
-                  state (assoc-in state [:boundaries (:id description)] values)
-                  ;; Source-only bindings also invalidate their predecessor and
-                  ;; dependent extents/layout facts, not just their own AV.
-                  state (reduce forget-dependent-value-facts state
-                                (conj (set (keys results)) (:sym description)))]
-              (-> (retain-produced-value-facts state results)
-                  (assoc :available (into available (when (= :typed-soac kind)
-                                                     (keys (get produced-values equation-id))))))))
-          (retain-produced-value-facts {:values {} :boundaries {} :references {} :dependents {}
-                                       :available inputs}
-                                      (source-available-contracts (select-keys input-values inputs)
-                                                                  source-bindings inputs))
-          entries)))
+        source-bindings (into inputs (map first pairs))]
+    (retain-produced-value-facts
+     {:values {} :boundaries {} :references {} :dependents {} :available inputs
+      :source-bindings source-bindings :equation-projections {}}
+     (source-available-contracts (select-keys input-values inputs) source-bindings inputs))))
 
-(defn- form->program*
+(def ^:dynamic ^:private *source-value-owner*
+  "The unpublished collector of one complete source projection. Never an IR fact."
+  nil)
+
+(defn- optional-source-equation
+  "Checkpoint only this unpublished construction's observations. The enclosing
+   ordinary optional transaction validates/adopts the complete history once;
+   numerical binding count must not multiply inherited-history validation.
+   Outside that private scope, retain the ordinary fully checked transaction."
+  [construct]
+  (let [owner method-entry/*emission-inputs*]
+    (if (and owner (identical? owner *source-value-owner*))
+      (let [historical @owner
+            local (atom historical)
+            result (binding [method-entry/*emission-inputs* local] (construct))]
+        (when-not (identical? historical @owner)
+          (throw (ex-info "source projection owner changed during optional equation construction"
+                          {:reason :unstable-definition-proof-input})))
+        (when (and result (not (compare-and-set! owner historical @local)))
+          (throw (ex-info "source projection owner changed before equation adoption"
+                          {:reason :unstable-definition-proof-input})))
+        result)
+      (method-entry/call-with-optional-definition-inputs construct))))
+
+(defn- advance-source-value-analysis
+  "One causal transfer, before the next binding is described. Source-only scalar
+   results remain unknown. Numerical results use the existing equation projector,
+   not global input/access inference or a second result-type switch. A projection
+   unavailable before storage classification is optional; final admission still
+   reconstructs and validates its ordinary equation."
+  [{:keys [values available source-bindings] :as state} description default-dtype array-types]
+  (let [projection
+        (when (soac-description? description)
+          (optional-source-equation
+           (fn []
+             (when (supported-description? #{} description)
+               (try
+                 (let [equation (operation-equation description)]
+                   {:description description :equation equation
+                    :results (equation-result-values equation (dialect/operation-parts equation)
+                                                    default-dtype array-types)})
+                 ;; Optional semantic coverage can wait for indexed storage.
+                 ;; Ownership failures must never become an unknown value fact.
+                 (catch clojure.lang.ExceptionInfo exception
+                   (when-not (source-decline? exception) (throw exception)))
+                 (catch Exception _ nil)
+                 (catch StackOverflowError _ nil))))))
+        available (conj available (:sym description))
+        results (source-available-contracts
+                 (causal-producer-results description (:results projection) values)
+                 source-bindings available)
+        state (assoc-in state [:boundaries (:id description)] values)
+        ;; Source-only bindings also invalidate their predecessor and dependent
+        ;; extents/layout facts. Persistent earlier snapshots stay unchanged.
+        state (reduce forget-dependent-value-facts state
+                      (conj (set (keys results)) (:sym description)))]
+    (cond-> (-> (retain-produced-value-facts state results)
+                (assoc :available (into available (keys (:results projection)))))
+      projection (assoc-in [:equation-projections (:id description)] projection))))
+
+(defn- projected-operation-equation
+  "Reuse only the very description projected by this construction. The storage
+   pass preserves its identity when unchanged, including semantic metadata.
+   Indexed-storage changes (or any replacement) require a fresh equation."
+  [projections description]
+  (let [projection (get projections (:id description))]
+    (if (identical? description (:description projection))
+      (:equation projection)
+      (operation-equation description))))
+
+(defn- construct-source-program
   [source {:keys [dtype array-types scalar-types values shape-equalities segmented-plans? lexical-inputs
                  preserve-declared-array-storage? host-scalars?]
            :or {dtype :double array-types {} scalar-types {} values {} shape-equalities {}}}]
@@ -6709,9 +6800,12 @@
           [_ bindings & body] source
           pairs (vec (partition 2 bindings))
           array-types (binder-array-types pairs array-types dtype preserve-declared-array-storage?)
-          {descriptions :descriptions storage-values :values allocations :allocations}
+          {descriptions :descriptions storage-values :values allocations :allocations
+           source-value-analysis :source-value-analysis}
           (source-storage-analysis pairs dtype array-types scalar-types segmented-plans?
-                                   values shape-equalities lexical-inputs)
+                                   values shape-equalities lexical-inputs
+                                   {:lexical-inputs (if (some? lexical-inputs) lexical-inputs
+                                                       (util/free-syms source))})
           descriptions (consumer-descriptions descriptions segmented-plans?)]
       (when (and (even? (count bindings))
                  (seq descriptions)
@@ -6746,7 +6840,9 @@
                           (assoc types sym scalar-dtype)
                           types))
                       scalar-types descriptions)
-              operation-equations (mapv operation-equation operation-descriptions)
+              operation-equations
+              (mapv (partial projected-operation-equation (:equation-projections source-value-analysis))
+                    operation-descriptions)
               operation-equations-by-id (zipmap (map :id operation-descriptions)
                                                 operation-equations)
               outputs (terminal-results descriptions body source-entries)
@@ -6870,24 +6966,17 @@
                                      needed)]
                   (if (= expanded needed) (select-keys storage-values needed)
                       (recur expanded))))
-              {inferred-values :values produced-values :produced-values}
-              (reduce (fn [{:keys [values] :as state} equation]
+              inferred-values
+              (reduce (fn [values equation]
                         (let [{:keys [inputs results]}
                               (equation-value-projection equation dtype array-types'
                                                          source-scalar-types values)]
-                          (-> state
-                              (assoc :values (reduce-kv #(merge-value %1 %2 %3 shape-equalities)
-                                                       values (merge inputs results)))
-                              (assoc-in [:produced-values (second equation)] results))))
-                      {:values (merge destination-values
-                                      (contraction-storage-values equations dtype array-types' values)
-                                      published-storage-values)
-                       :produced-values {}}
+                          (reduce-kv #(merge-value %1 %2 %3 shape-equalities)
+                                     values (merge inputs results))))
+                      (merge destination-values
+                             (contraction-storage-values equations dtype array-types' values)
+                             published-storage-values)
                       equations)
-              preceding-values (preceding-numerical-values
-                                entries produced-values
-                                (if (some? lexical-inputs) lexical-inputs (util/free-syms source))
-                                values)
               extent-environments (when (seq swr-descriptions)
                                     (source-extent-environments descriptions equations
                                                                 inferred-values source-scalar-types))
@@ -6989,8 +7078,14 @@
             {:typed-program typed-program
              :segmented-plans? segmented?
              :entries entries
-             :preceding-values (:boundaries preceding-values)
+             :preceding-values (:boundaries source-value-analysis)
              :outputs outputs
              :values values
              :facts facts
              :source source}))))))
+
+(defn- form->program*
+  [source options]
+  (method-entry/call-with-optional-definition-inputs
+   #(binding [*source-value-owner* method-entry/*emission-inputs*]
+      (construct-source-program source options))))

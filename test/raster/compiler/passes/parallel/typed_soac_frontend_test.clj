@@ -116,11 +116,193 @@
                       z (raster.par/pmap j n float (+ (clojure.core/aget y j) 1.0))] z)
               {:dtype :float :array-types {'x :float} :scalar-types {'n :long}}]]]
       (let [actual (frontend/form->program source options)
-            expected (with-redefs-fn {#'frontend/source-descriptions original-schedule}
+            analyze @#'frontend/analyze-source-descriptions
+            expected (with-redefs-fn
+                       {#'frontend/analyze-source-descriptions
+                        (fn [& arguments]
+                          ;; Replace the description schedule, not the independent
+                          ;; causal fact transfer now consumed by production.
+                          (assoc (apply analyze arguments) :descriptions
+                                 (apply original-schedule (take 7 arguments))))}
                        #(frontend/form->program source options))]
         (is (some? actual) (pr-str source))
         (is (semantic/equivalent? actual expected)
             "interleaving must preserve types, extents, effects, storage and source metadata")))))
+
+(deftest causal-equations-are-reused-unless-storage-selection-changes
+  (doseq [[capacity expected-constructions] [[2 1] [8 2]]]
+    (let [source '(let* [a (raster.par/pmap i 2 float (aget input i))
+                        final (raster.par/pmap j 1 float 0.0)] a)
+          calls (atom {})
+          project @#'frontend/operation-equation
+          projection (with-redefs-fn
+                       {#'frontend/operation-equation
+                        (fn [description]
+                          (swap! calls update (:id description) (fnil inc 0))
+                          (project description))}
+                       #(frontend/form->program-components
+                         source {:dtype :float :array-types {'input :float}
+                                 :values {'input (av/tensor {:dtype :float :shape [capacity]})}
+                                 :lexical-inputs '[input] :segmented-plans? true}))]
+      (is (some? (:typed-program projection)))
+      (is (= {0 expected-constructions 1 1} @calls)
+          "one early projection is reused; changed indexed storage needs exactly one rebuild")
+      (is (= [2] (get-in projection [:preceding-values 1 'a :shape])))
+      (is (= [capacity] (get-in projection [:preceding-values 1 'input :shape]))))))
+
+(defn- discarded-causal-observation [x] x)
+
+(deftest unavailable-early-projection-does-not-reject-final-storage-admission
+  (let [source '(let* [a (raster.par/pmap i 2 float (aget input i))
+                      final (raster.par/pmap j 1 float 0.0)] a)
+        options {:dtype :float :array-types {'input :float}
+                 :values {'input (av/tensor {:dtype :float :shape [8]})}
+                 :lexical-inputs '[input] :segmented-plans? true}
+        ordinary (frontend/form->program-components source options)
+        calls (atom 0)
+        owner (atom {:static [] :values []})
+        unused #'discarded-causal-observation
+        project @#'frontend/operation-equation
+        delayed (binding [entry/*emission-inputs* owner]
+                  (with-redefs-fn
+                  {#'frontend/operation-equation
+                   (fn [description]
+                     (if (and (= 0 (:id description)) (= 1 (swap! calls inc)))
+                       (do
+                         (entry/observe-definition-input! unused (.ns ^clojure.lang.Var unused)
+                                                          'discarded-causal-observation)
+                         (throw (ex-info "requires later storage classification"
+                                         {:reason :typed-soac-stable-read-alias})))
+                       (project description)))}
+                  #(frontend/form->program-components source options)))]
+    (is (some? (:typed-program delayed)))
+    (is (semantic/equivalent? (:typed-program ordinary) (:typed-program delayed)))
+    (is (not (contains? (:definition-proofs @owner) unused))
+        "discarded early projection observations are not final executable dependencies")
+    (is (not (contains? (get-in delayed [:preceding-values 1]) 'a))
+        "failed optional construction supplies no causal fact")))
+
+(deftest source-projection-validation-does-not-multiply-inherited-history
+  (let [visits (fn [size]
+                 (let [checks (atom 0)
+                       inherited (reify entry/RetainedProducerInput
+                                   (assert-producer-current! [this] (swap! checks inc) this))
+                       owner (atom {:static [] :values [] :producer-inputs [inherited]})
+                       ids (mapv #(symbol (str "a" %)) (range size))
+                       source (list 'let* (vec (mapcat (fn [id]
+                                                        [id '(raster.par/pmap i 1 double 0.0)]) ids))
+                                    (peek ids))]
+                   (binding [entry/*emission-inputs* owner]
+                     (is (some? (:typed-program
+                                 (frontend/form->program-components
+                                  source {:dtype :double :segmented-plans? true})))))
+                   @checks))
+        small (visits 2) large (visits 16)]
+    (is (pos? small) "the complete projection still validates inherited dependencies")
+    (is (= small large) "more numerical bindings do not revalidate the entire inherited history")))
+
+(deftest early-projection-ownership-failures-and-owner-drift-refuse
+  (let [source '(let* [a (raster.par/pmap i 1 double 0.0)] a)
+        options {:dtype :double :segmented-plans? true}
+        project @#'frontend/operation-equation
+        reason (fn [f] (try (f) nil (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))]
+    (is (= :stale-definition-proof-input
+           (with-redefs-fn {#'frontend/operation-equation
+                           (fn [_] (throw (ex-info "stale projection" {:reason :stale-definition-proof-input})))}
+             #(reason (fn [] (frontend/form->program-components source options))))))
+    (let [owner (atom {:static [] :values []})]
+      (binding [entry/*emission-inputs* owner]
+        (is (= :unstable-definition-proof-input
+               (with-redefs-fn {#'frontend/operation-equation
+                               (fn [description]
+                                 (swap! owner assoc :competing-owner-update true)
+                                 (project description))}
+                 #(reason (fn [] (frontend/form->program-components source options))))))))))
+
+(deftest whole-source-decline-discards-successful-nested-observations
+  (let [owner (atom {:static [] :values []})
+        observed? (atom false)
+        unused #'discarded-causal-observation
+        project @#'frontend/operation-equation
+        nested '(let* [inner (raster.par/pmap j 1 double 1.0)] inner)
+        source '(let* [a (raster.par/pmap i 1 double 0.0)
+                       unsupported (if flag (raster.par/pmap k 1 double 2.0) nil)] a)
+        options {:dtype :double :segmented-plans? true}
+        result (binding [entry/*emission-inputs* owner]
+                 (with-redefs-fn
+                   {#'frontend/operation-equation
+                    (fn [description]
+                      (cond
+                        (= [0.0] (:bodies description))
+                        (do
+                          (is (some? (:typed-program (frontend/form->program-components nested options))))
+                          (reset! observed? (contains? (:definition-proofs @entry/*emission-inputs*) unused)))
+                        (= [1.0] (:bodies description))
+                        (entry/observe-definition-input! unused (.ns ^clojure.lang.Var unused)
+                                                         'discarded-causal-observation))
+                      (project description))}
+                   #(frontend/form->program-components source options)))]
+    (is @observed? "the successful nested batch actually adopted its dependency locally")
+    (is (nil? result) "the enclosing hidden parallel region is still unsupported")
+    (is (not (contains? (:definition-proofs @owner) unused))
+        "whole-query decline publishes none of the successful nested observations")))
+
+(deftest successful-causal-observations-must-still-be-current-at-publication
+  (let [owner (atom {:static [] :values []})
+        unused #'discarded-causal-observation original-root @unused
+        observed? (atom false)
+        project @#'frontend/operation-equation
+        source '(let* [a (raster.par/pmap i 1 double 0.0)
+                       b (raster.par/pmap j 1 double 2.0)] b)
+        reason (try
+                 (binding [entry/*emission-inputs* owner]
+                   (with-redefs-fn
+                     {#'frontend/operation-equation
+                      (fn [description]
+                        (if (= 0 (:id description))
+                          (do
+                            (entry/observe-definition-input! unused (.ns ^clojure.lang.Var unused)
+                                                             'discarded-causal-observation)
+                            (reset! observed? true))
+                          (alter-var-root unused (constantly (fn [_] :changed))))
+                        (project description))}
+                     #(frontend/form->program-components source {:dtype :double :segmented-plans? true})))
+                 nil
+                 (catch clojure.lang.ExceptionInfo exception (:reason (ex-data exception)))
+                 (finally (alter-var-root unused (constantly original-root))))]
+    (is @observed?)
+    (is (= :stale-definition-proof-input reason))
+    (is (not (contains? (:definition-proofs @owner) unused))
+        "the stale batch never replaces the public owner's earlier history")))
+
+(deftest description-only-analysis-does-not-construct-numerical-equations
+  (let [source '(let* [a (raster.par/pmap i 2 float (aget input i))] a)]
+    (with-redefs-fn {#'frontend/operation-equation
+                    (fn [& _] (throw (AssertionError. "description-only equation construction")))}
+      (fn []
+        (let [analysis (frontend/source-fragment-analysis
+                        source {:dtype :float :array-types {'input :float}})]
+          (is (= :map (-> analysis :descriptions first :kind)))
+          (is (nil? (frontend/coverage-decline
+                     source {:dtype :float :array-types {'input :float}}))))))))
+
+(deftest cached-equations-cannot-ignore-description-metadata-changes
+  (let [source '(let* [a (raster.par/pmap i 2 float (aget input i))] a)
+        original (first (:descriptions (frontend/source-fragment-analysis
+                                       source {:dtype :float :array-types {'input :float}})))
+        changed (update-in original [:bodies 0] vary-meta assoc :raster.type/tag 'Object)
+        cached (#'frontend/operation-equation original)
+        calls (atom 0)
+        project @#'frontend/operation-equation]
+    (is (= original changed) "ordinary Clojure equality ignores the changed metadata")
+    (with-redefs-fn {#'frontend/operation-equation
+                    (fn [description] (swap! calls inc) (project description))}
+      #(do
+         (is (identical? cached (#'frontend/projected-operation-equation
+                                {0 {:description original :equation cached}} original)))
+         (#'frontend/projected-operation-equation
+          {0 {:description original :equation cached}} changed)))
+    (is (= 1 @calls) "only the identical immutable description may reuse its equation")))
 
 (deftest normalized-fragment-locals-avoid-nontextual-incoming-identities
   (let [incoming '#{rstr_extent_0 rstr_copy_effect_0_0 rstr_copy_index_0_0}
