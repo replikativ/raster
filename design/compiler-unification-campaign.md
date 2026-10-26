@@ -115,6 +115,23 @@ restart remains unqualified: leasing, byte evidence, semantic producer identity
 and capture/restore consumers must use the checked completed boundary, not an
 invented pre-source physical plan or plan-only replay.
 
+CI shard 3's missing completion is now classified: job 35077 entered
+`gsdm-fused-train-step-converges` and hit the ten-minute no-output limit. This is
+not evidence of removed tests or an OOM. The model is numerically small but has
+48 trainable array leaves; full AD and Adam generation create a substantial
+compiler program. Historical bounded probes reached repeated frontend/inlining
+work in the five-iteration fixpoint before bytecode emission. Current-head
+phase/call measurements remain necessary before attributing the full delay.
+
+One independent convergence-domain defect is corrected: compiler fixpoints now
+use pair-local retained-source equality, allowing exact immutable Class identity,
+instead of requiring portable serialization of Class metadata. Type/operation
+metadata, numeric carriers and bits remain significant; other opaque runtime
+objects still force the existing five-iteration cap. Portable fingerprints and
+cache keys are unchanged. Pipeline/fingerprint suites pass 36 tests / 267
+assertions; independent review found no blocker. This establishes domain-correct
+convergence, not a measured GSDM speedup or an alpha-equivalence relaxation.
+
 The next address-proof repair must transport exact integral InvocationPlan
 producer relationships into sliced scheduled bodies as executable equality
 constraints. Both read-footprint proofs and runtime graph preconditions must

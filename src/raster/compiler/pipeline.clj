@@ -477,11 +477,12 @@
 
 (defn- fixpoint-equivalent?
   "Convergence includes retained type/operation metadata and numeric carriers.
-   Runtime objects have no portable semantic encoding: keep iterating up to the
-   existing cap rather than treating printing, class names or Clojure = as proof."
+   This is a process-local source comparison, not a portable cache fingerprint:
+   retained Class tags compare by actual identity. Other unsupported runtime
+   objects still force the existing cap; no metadata is stripped to claim stability."
   [left right]
   (try
-    (semantic-fingerprint/equivalent? left right)
+    (semantic-fingerprint/retained-source-equivalent? left right)
     (catch clojure.lang.ExceptionInfo error
       (if (= :semantic-fingerprint-unsupported (:reason (ex-data error)))
         false

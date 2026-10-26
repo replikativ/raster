@@ -52,21 +52,38 @@
                        [(with-meta 'value {:raster.type/tag 'float})
                         (with-meta 'value {:raster.type/tag 'double})]
                        [(with-meta '[x] {:raster.type/element 'float})
-                        (with-meta '[x] {:raster.type/element 'double})]]]
+                        (with-meta '[x] {:raster.type/element 'double})]
+                       [(with-meta 'value {:tag Double})
+                        (with-meta 'value {:tag Float})]
+                       [(with-meta 'value {:tag Double})
+                        (with-meta 'value {:tag 'java.lang.Double})]
+                       [(with-meta 'call {:raster.op/original 'left})
+                        (with-meta 'call {:raster.op/original 'right})]]]
     (is (not (#'pipeline/fixpoint-equivalent? left right))))
   (is (#'pipeline/fixpoint-equivalent? Double/NaN Double/NaN)))
 
-(deftest unsupported-fixpoint-evidence-does-not-certify-stability
+(deftest fixpoint-converges-with-exact-retained-class-identity
   (let [input (with-meta '(let* [value 1.0] value) {:tag Double})
+        seen (atom 0)
+        result (isolated-fixpoint input
+                 (fn [form] (vary-meta form assoc :line (swap! seen inc))))]
+    (is (= 1 @seen) "an unchanged physical Class is valid process-local source evidence")
+    (is (zero? (get-in result [:stats :fixpoint-iterations])))
+    (is (= 1 (:line (meta (:form result)))))
+    (is (identical? Double (:tag (meta (:form result)))))))
+
+(deftest unsupported-fixpoint-evidence-does-not-certify-stability
+  (let [opaque (Object.)
+        input (with-meta '(let* [value 1.0] value) {:opaque opaque})
         seen (atom 0)
         result (isolated-fixpoint input
                  (fn [form] (vary-meta form assoc :line (swap! seen inc))))]
     (is (= 5 @seen) "unsupported runtime metadata uses the existing iteration cap")
     (is (= 5 (get-in result [:stats :fixpoint-iterations])))
     (is (= 5 (:line (meta (:form result)))))
-    (is (identical? Double (:tag (meta (:form result))))))
+    (is (identical? opaque (:opaque (meta (:form result))))))
   (let [failure (ex-info "unexpected fingerprint failure" {:reason :different-error})]
-    (with-redefs [semantic-fingerprint/equivalent? (fn [& _] (throw failure))]
+    (with-redefs [semantic-fingerprint/retained-source-equivalent? (fn [& _] (throw failure))]
       (is (identical? failure
                      (try (#'pipeline/fixpoint-equivalent? 'x 'x)
                           (catch clojure.lang.ExceptionInfo error error)))))))
