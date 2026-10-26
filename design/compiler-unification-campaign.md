@@ -54,6 +54,32 @@ it does not add a numerical IR or executor. Source-action reads contribute to
 liveness, but only actual observable execution obligations partition fusion.
 All eight original campaign objectives remain acceptance requirements.
 
+October 26 continuation: flat and mixed TypedSOAC routing now reuse the structured
+route's unchanged whole-source-return validator through a shared `source-result`
+pass. Fusion precedes return projection; only independently proved public return
+identities can demand output-only reduction residency. The existing realizer still
+audits producers, uses, effects and aliases and owns the representation certificate.
+Lexical scope alone, source-free fragments, void returns and disabled residency
+grant no implicit public demand. Mixed-algorithm foreign reads remain exclusions;
+component live-outs do not become public outputs. No new numerical IR, executor,
+loss-specific rule or surface syntax is introduced.
+
+Warm focused evidence: 4 tests / 97 assertions pass, including actual public
+softmax, backward, cross-entropy, softmax-cross-entropy and network-loss execution
+on both required local backends, plus Float/Double scalar and tuple return controls.
+Two direct-device fixture migrations pass 2 tests / 47 assertions. The affected
+routing suites report 169 tests / 1,977 assertions, with one environment error:
+the warm REPL lacks `jdk.incubator.vector`. A capped fresh gate with that module
+and both local GPU backends required passes: 170 tests / 2,019 assertions,
+zero failures or errors. This qualifies the local bundle, not the full campaign
+or merge. Exact pushed head `c9aa5c9d3` has green setup, build, emission,
+CUDA compilation and HIP compilation, but red unit and CPU-OpenCL checks.
+Deferred AMR/scratch composition and the training-entry failures remain open.
+Its unit job has 15 completed shards (7,093 tests, 31 failures, 38 errors,
+47 distinct failing Vars) and one incomplete shard; the latter's 339 observed
+Vars are not a completed-suite denominator. CPU-OpenCL has all four completed
+shards: 650 tests, 8,145 passing assertions, 7 failures and 30 errors.
+
 The result-import implementation separates four authorities: final-source
 ownership, emitted numerical producer correspondence, successful execution in the
 current replay, and source snapshot adaptation. All four now pass the local public

@@ -21,6 +21,7 @@
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.passes.parallel.device-scalar-schedule :as device-scalar]
             [raster.compiler.passes.parallel.effect-source :as effect-source]
+            [raster.compiler.passes.parallel.source-result :as source-result]
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
             [raster.compiler.passes.parallel.typed-soac-fusion :as fusion]
             [raster.compiler.passes.parallel.typed-soac-initialization :as initialization]
@@ -1730,13 +1731,63 @@
                         uniform-stats resident-stats initialization-stats
                         ownership-stats)})))
 
-(defn- optimize-typed-component
-  [typed-input {:keys [abstract-machine] :as options}]
+(defn- fuse-typed-component
+  [typed-input {:keys [abstract-machine]}]
   (let [[fused stats] (fusion/fusion-fixpoint typed-input abstract-machine)]
-    (update (realize-typed-component fused options) :stats
+    {:program fused :stats stats}))
+
+(defn- realize-fused-component
+  [{:keys [program stats]} options public-outputs]
+  (update (realize-typed-component program options public-outputs) :stats
             #(merge-with (fn [left right]
                            (if (and (number? left) (number? right)) (+ left right) right))
-                         stats %))))
+                         stats %)))
+
+(defn- public-source-return?
+  [options]
+  (and (:resident-reductions? options)
+       (seq (or (:public-parameters options) (:active-params options)))))
+
+(defn- source-return-demand
+  [typed-program provisional options]
+  (if (and typed-program (:source provisional) (public-source-return? options))
+    (let [projected (source-result/validate-source-result! provisional options)]
+      (resident/source-return-reduction-demand typed-program (:outputs projected)))
+    []))
+
+(defn- optimize-typed-component
+  [source typed-input options]
+  (let [{:keys [program] :as fused} (fuse-typed-component typed-input options)
+        provisional (when (public-source-return? options)
+                      (analyzed-program-envelope source program))
+        demand (source-return-demand program provisional options)]
+    (realize-fused-component fused options demand)))
+
+(defn- foreign-source-read-values
+  "Keep non-SOAC dependencies visible to the whole-program reduction-use audit.
+   These are conservative read exclusions, not additional execution or residency authority."
+  [projection]
+  (let [values (:values projection)
+        by-id (into {} (map (juxt second identity))
+                    (dialect/equations (:typed-program projection)))
+        aliases (into {} (keep (fn [[binding expression]]
+                                (when (symbol? expression) [binding expression])))
+                      (partition 2 (second (:source projection))))
+        resolve-alias (fn [value]
+                        (loop [value value seen #{}]
+                          (if (and (contains? aliases value) (not (contains? seen value)))
+                            (recur (get aliases value) (conj seen value))
+                            value)))]
+    (binding [util/*shadowing-locals* (into util/*shadowing-locals* (keys values))]
+      (into #{}
+            (comp (remove #(= :typed-soac (:kind %)))
+                  (mapcat (fn [entry]
+                            (concat (entry-operands by-id entry)
+                                    (when (= :segmented-weighted-reduction (:kind entry))
+                                      (util/free-syms (get-in entry [:description :expr]))))))
+                  (mapcat #(vector % (resolve-alias %)))
+                  (filter #(contains? values %)))
+            (:entries projection)))))
 
 (defn- realization-program
   [projection typed-components]
@@ -1750,8 +1801,11 @@
           outputs (vec (distinct (mapcat #(nth % 2) equations)))
           values (apply merge (:values projection) (map #(get-in (dialect/facts %) [:values]) programs))
           effects (reduce set/union #{} (map :effects (vals equation-facts)))
-          facts (assoc (:facts projection) :values values :inputs inputs
-                       :equations equation-facts :effects effects)]
+          facts (-> (:facts projection)
+                    (assoc :values values :inputs inputs
+                           :equations equation-facts :effects effects)
+                    (update-in [:attributes :host-read-values]
+                               #(vec (distinct (concat % (foreign-source-read-values projection))))))]
       (dialect/make facts equations outputs))))
 
 (defn- swr-equation
@@ -1781,16 +1835,9 @@
    form (mapv :description (filter #(= :segmented-weighted-reduction (:kind %)) entries))
    :protected-source-binding-mismatch))
 
-(defn- mixed-envelope
-  [form projection options]
-  (let [components (component-runs (:entries projection))
-        typed-components
-        (into []
-              (comp (filter #(= :typed-soac (:kind %)))
-                    (map #(optimize-typed-component
-                           (typed-component-program projection %) options)))
-              components)]
-    (if-let [decline (some :declined typed-components)]
+(defn- assemble-mixed-envelope
+  [form projection components typed-components]
+  (if-let [decline (some :declined typed-components)]
       {:declined decline}
       (let [form (retain-protected-source form (:entries projection))
             realization (realization-program projection typed-components)
@@ -1837,7 +1884,28 @@
                         :front-end :analyzed-source
                         :segmented-weighted-reductions
                         (count (filter #(= :segmented-weighted-reduction (:kind %))
-                                       components))})}))))
+                                       components))})})))
+
+(defn- mixed-envelope
+  [form projection options]
+  (let [components (component-runs (:entries projection))
+        fused-components
+        (into []
+              (comp (filter #(= :typed-soac (:kind %)))
+                    (map #(fuse-typed-component
+                           (typed-component-program projection %) options)))
+              components)
+        provisional (when (public-source-return? options)
+                      (:program (assemble-mixed-envelope form projection components fused-components)))
+        demand (set (source-return-demand
+                     (when provisional (realization-program projection fused-components))
+                     provisional options))
+        typed-components
+        (mapv (fn [{:keys [program] :as fused}]
+                (realize-fused-component fused options
+                                         (filterv demand (dialect/outputs program))))
+              fused-components)]
+    (assemble-mixed-envelope form projection components typed-components)))
 
 (defn program-envelope
   "Wrap an already constructed TypedSOAC program in the same ParallelProgram boundary used by
@@ -2023,13 +2091,10 @@
    (attempt form dtype {}))
   ([form dtype array-types]
    (attempt form dtype array-types {}))
-  ([form dtype array-types {:keys [resident-reductions? resident-initialization?
-                                   resident-uniform-input-loads?
-                                   scalar-types values lexical-inputs source-ns source-var source-binding-context
-                                   abstract-machine segmented-plans?
+  ([form dtype array-types {:keys [scalar-types values lexical-inputs source-ns source-var source-binding-context
+                                   segmented-plans?
                                    preserve-declared-array-storage? host-scalars?]
-                            :as options
-                            :or {resident-reductions? false}}]
+                            :as options}]
    (when (and (seq? form) (contains? #{'let 'let*} (first form)))
        (try
          (let [form (frontend/normalize-source
@@ -2048,27 +2113,22 @@
                {live-form :form :keys [projection typed-input admitted? bindings-removed
                                        terminal-scalars-materialized]}
                (validated-terminal-scalar-projection live-projection frontend-options)
-               form live-form]
+               form live-form
+               ;; Source completion belongs to the original public invocation context,
+               ;; not to the frontend's deliberately restricted operation options.
+               optimization-options (assoc options :array-types array-types)]
            (if-not admitted?
              (when-let [decline (frontend/coverage-decline form frontend-options)]
                {:declined decline})
              (if (:segmented-plans? projection)
-               (update (mixed-envelope form projection
-                                       {:resident-reductions? resident-reductions?
-                                        :resident-initialization? resident-initialization?
-                                        :resident-uniform-input-loads? resident-uniform-input-loads?
-                                        :abstract-machine abstract-machine})
+               (update (mixed-envelope form projection optimization-options)
                        :stats assoc :canonical-source-bindings-removed bindings-removed)
-               (let [optimization-options
-                     {:resident-reductions? resident-reductions?
-                      :resident-initialization? resident-initialization?
-                      :resident-uniform-input-loads? resident-uniform-input-loads?
-                      :abstract-machine abstract-machine}
-                     optimized (optimize-typed-component typed-input optimization-options)
+               (let [optimized (optimize-typed-component form typed-input optimization-options)
                      lost-terminal? (and (= 1 terminal-scalars-materialized)
                                          (not= 1 (get-in optimized [:stats :resident-terminal-scalars])))
                      optimized (if lost-terminal?
-                                 (optimize-typed-component (:typed-input live-projection)
+                                 (optimize-typed-component (:form live-projection)
+                                                           (:typed-input live-projection)
                                                            optimization-options)
                                  optimized)
                      form (if lost-terminal? (:form live-projection) form)

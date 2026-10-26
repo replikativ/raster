@@ -20,6 +20,7 @@
             [raster.gpu.value :as value]
             [raster.gpu.device-probe :as opencl]
             [raster.linalg.contract :as contract]
+            [raster.nn :as public-nn]
             [raster.ode.pde :as pde]))
 
 ;; ================================================================
@@ -144,6 +145,49 @@
                   (is (not (value/live? @result))
                       "the public scalar result has the executable's lifetime")))))))
 
+(defn- numeric-leaves [result]
+  (if (number? result) [(double result)] (mapcat numeric-leaves result)))
+
+(defn- check-public-softmax-and-losses! [device]
+  (doseq [[operation dtype arguments]
+          [[#'public-nn/softmax :float [(float-array [1.0 2.0 3.0])]]
+           [#'public-nn/softmax-backward :double
+            [(double-array [1.0 2.0 3.0]) (double-array [0.2 0.3 0.5])]]
+           [#'public-nn/cross-entropy :float
+            [(float-array [0.1 0.7 0.2]) (float-array [0.0 1.0 0.0])]]
+           [#'public-nn/softmax-cross-entropy :float
+            [(float-array [1.0 2.0 3.0]) (float-array [0.0 1.0 0.0])]]
+           [#'public-nn/loss-fn :float
+            [(float-array [0.1 0.2 0.3 0.4 0.5 0.6]) (float-array [0.0 0.0])
+             (float-array [0.1 0.2 0.3 0.4]) (float-array [0.0 0.0])
+             (float-array [1.0 2.0 3.0]) (float-array [0.0 1.0])]]]]
+    (testing (str (:name (meta operation)) " on " device)
+      (let [expected (vec (numeric-leaves (apply operation arguments)))
+            prepared (compiled/lower operation arguments
+                                     {:compiler :equation-first :target device :dtype dtype})
+            artifact (compiled/instantiate! prepared)]
+        (try
+          (let [outputs (artifact)
+                boundary (if (:ordered-invocation prepared)
+                           (:resident-boundary @(:execution-state (:executable artifact)))
+                           {:plan (compiled/plan prepared) :projection {:out-tree (:out-tree prepared)}})
+                tree (get-in boundary [:projection :out-tree])
+                actual (vec (mapcat #(numeric-leaves (value/->host (get outputs (:key %)))) tree))
+                tolerance (if (= dtype :double) 1.0e-12 1.0e-4)]
+            (is (link-plan/link-plan? (:plan boundary)))
+            (is (= (mapv :node tree) (get-in boundary [:plan :outputs])))
+            (is (= (count expected) (count actual)))
+            (is (every? #(< (Math/abs (double %)) tolerance) (map - expected actual))))
+          (finally (compiled/close! artifact)))))))
+
+(deftest public-softmax-and-losses-execute-through-the-public-owner
+  (doseq [[device available? skip!]
+          [[:ze:0 gp/gpu-available? gp/gpu-skip!]
+           [:ocl:0 opencl/opencl-fp64-available? #(opencl/opencl-skip! % :fp64)]]]
+    (if @available?
+      (check-public-softmax-and-losses! device)
+      (skip! (str "public softmax/loss completed owner on " device)))))
+
 (deftest softmax-counted-initializers-execute-through-the-direct-vertical
   (when-gpu "softmax-counted-initializers"
     (let [values [1000.0 1001.0 999.0 -1000.0 -998.0 -1001.0]
@@ -151,11 +195,11 @@
           _ (attention/softmax-rows! expected 2 3)
           compilation (equation-first/compile #'attention/softmax-rows!
                                               {:target :ze:0 :dtype :float})
-          plan (equation-first/lower compilation [(float-array values) 2 3])
-          executable (gpu-link/instantiate! plan)]
+          executable (gpu-link/instantiate-ordered-invocation!
+                      compilation [(float-array values) 2 3] {})]
       (try
-        (gpu-link/run! executable)
-        (let [actual (gpu-link/download executable (first (:outputs plan)))]
+        (let [outputs (gpu-link/run! executable)
+              actual (gpu-link/download executable (first (keys outputs)))]
           (doseq [i (range 6)]
             (is (< (Math/abs (- (aget expected i) (aget ^floats actual i))) 1.0e-4))))
         (finally (gpu-link/close! executable))))))
@@ -281,11 +325,11 @@
             _ (pde/heat-rhs-2d! expected input nx ny 0.25 4.0 9.0)
             compilation (equation-first/compile #'pde/heat-rhs-2d!
                                                 {:target :ze:0 :dtype :double})
-            plan (equation-first/lower compilation [output input nx ny 0.25 4.0 9.0])
-            executable (gpu-link/instantiate! plan)]
+            executable (gpu-link/instantiate-ordered-invocation!
+                        compilation [output input nx ny 0.25 4.0 9.0] {})]
         (try
-          (gpu-link/run! executable)
-          (let [actual (gpu-link/download executable (first (:outputs plan)))]
+          (let [outputs (gpu-link/run! executable)
+                actual (gpu-link/download executable (first (keys outputs)))]
             (doseq [i (range n)]
               (is (< (Math/abs (- (aget expected i) (aget ^doubles actual i))) 1.0e-10)
                   (str [nx ny] " cell " i))))

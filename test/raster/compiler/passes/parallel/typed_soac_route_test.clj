@@ -3588,6 +3588,46 @@
     (is (some #{'raster.par/reduce} (flatten (:source program))))
     (is (not-any? #{'raster.par/reduce-into} (flatten (:source program))))))
 
+(deftest output-only-reduction-residency-requires-the-whole-public-return
+  (doseq [[precision initializer element-type] [[:double 0.0 'double]
+                                               [:float '(float 0.0) 'float]]
+          tuple? [false true]]
+    (let [reduction (with-meta
+                      (list 'raster.par/reduce 'acc initializer 'j 'n
+                            '(+ acc (clojure.core/aget y j)))
+                      {:raster.type/elem-type precision})
+          source (list 'let*
+                       ['y (list 'raster.par/pmap 'i 'n element-type
+                                 '(clojure.core/aget x i))
+                        'total reduction]
+                       (if tuple? '[y total] 'total))
+          options {:resident-reductions? true :scalar-types {'n :long}}
+          source-free (route/attempt source precision {'x precision} options)
+          public (route/attempt source precision {'x precision}
+                                (assoc options :public-parameters '[x n]))
+          program (:program public)
+          returned (get-in program [:attributes :public-resident-reduction-outputs])
+          output (first returned)]
+      (is (:program source-free))
+      (is (zero? (get-in source-free [:stats :resident-reductions]))
+          "a source-free route has no implicit public-return demand")
+      (doseq [refused-options [(assoc options :lexical-inputs '[x n])
+                               (assoc options :public-parameters '[x n]
+                                              :resident-reductions? false)
+                               (assoc options :public-parameters '[x n] :return-tag 'void)]]
+        (is (zero? (get-in (route/attempt source precision {'x precision} refused-options)
+                          [:stats :resident-reductions]))
+            "lexical scope alone, disabled residency, and void returns grant no public demand"))
+      (is program)
+      (is (= 1 (get-in public [:stats :resident-reductions])))
+      (is (= 1 (count returned)))
+      (is (some #{output} (:outputs program)))
+      (is (= precision (get-in program [:values output :dtype])))
+      (is (= :resident-scalar-buffer
+             (get-in program [:values output :representation :kind])))
+      (is (= (if tuple? 2 1) (count (:outputs program))))
+      (is (some #{'raster.par/reduce-into} (flatten (:source program)))))))
+
 (deftest public-reduction-reused-on-device-keeps-a-scalar-source-return
   (let [source
         '(let* [left (raster.par/reduce sum (float 0.0) i n

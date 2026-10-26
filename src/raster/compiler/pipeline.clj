@@ -998,6 +998,8 @@
                     :segmented-plans? (true? (:segmented-plans? opts))
                     :preserve-declared-array-storage? (:preserve-declared-array-storage? opts)
                     :scalar-types (:scalar-types opts)
+                    :public-parameters (:public-parameters common)
+                    :return-tag (:return-tag common)
                     :values values
                     :source-ns (:source-ns opts)
                     :source-var (:source-var opts)
