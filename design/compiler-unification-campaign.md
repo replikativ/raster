@@ -4,6 +4,23 @@
 
 ### Current boundary ledger
 
+October 27 resumed checkpoint: pushed `3f173a424` remains **draft, not
+merge-ready**. Unit35385 completes all16 shards:7,785 tests /95,767 pass /
+52 failures /111 errors across131 failing Vars. CPU35386 completes all4:
+684 tests /7,745 pass /17 failures /73 errors across78 failing Vars. Compared
+with the previous checkpoint there are no newly failing Vars or removed
+outcomes. Emission35387 still fails on cold physical source preparation.
+
+The next original-producer migration includes primitive-array-only declarations
+in existing typed entry selection. It does not retrofit retained plain source.
+Argument/return checks and contextual Float arithmetic deliberately adopt the
+existing typed producer contract; Float overflow can therefore return infinity
+where the former plain path checked Double-to-Float conversion. See
+`array-only-typed-entry.md`. Fresh-process array-only qualification passes6/109;
+the expanded warm gate passes46 tests /928 assertions, including overflow,
+dispatch, selected carriers, source policy and physical ownership. No native C
+prototype is included. Full fresh-head CI remains required.
+
 October 27 continuation: exact head `cf317e9a5` is **draft, not merge-ready**.
 Unit job35382 completes all16 shards:7,784 tests /95,719 pass /52 failures /
 111 errors across131 failing Vars. All seven routing regressions from153 recover;

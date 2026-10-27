@@ -6,6 +6,28 @@
 (defn- reason [f]
   (try (f) nil (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
 
+(deftest a-plain-source-without-a-physical-producer-is-not-reported-as-producer-drift
+  (let [scope (create-ns (gensym "raster.plain-source-prerequisite."))
+        events (atom [])]
+    (try
+      (intern scope 'events events)
+      (binding [*ns* scope]
+        (refer 'clojure.core)
+        (eval '(raster.core/deftm plain [x :- Object] :- Object
+                 (do (swap! events conj :source-executed) x))))
+      (let [source (core/resolve-deftm-var (ns-resolve scope 'plain))
+            before (entry/call-with-definition-inputs #(entry/original-source-frontend source))]
+        (is (some? before))
+        (is (nil? (get-in before [:definition :receiver-var])))
+        (is (= :unavailable-original-source-emission
+               (reason #(entry/call-with-definition-inputs
+                         (fn [] (core/prepare-owned-source-frontend! source))))))
+        (let [after (entry/call-with-definition-inputs #(entry/original-source-frontend source))]
+          (is (identical? (:source-frontend before) (:source-frontend after)))
+          (is (identical? (:source-entry before) (:source-entry after))))
+        (is (empty? @events) "preparation never executes the source or invents a replacement"))
+      (finally (remove-ns (ns-name scope))))))
+
 (defn- with-cold-source [f]
   (let [scope (create-ns (gensym "raster.source-prerequisite."))
         events (atom [])]

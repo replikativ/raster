@@ -449,13 +449,22 @@
         params annotations))
 
 (defn has-primitive-annotations?
-  "Check if any annotations involve typed dispatch — primitive types,
+  "Check if any annotations involve typed dispatch — primitive scalars/arrays,
    (Fn [...]) annotations, or concrete reference types (not Object/nil).
-   When true, a typed IFn__ interface is generated for devirtualization."
+   Argument and return arrays use the same annotation->tag declaration contract.
+   Object/nominal arrays do not acquire primitive-array entry semantics here.
+   When true, the original producer generates a typed IFn__ interface, including
+   its entry/return checks and deferred source owner; this never upgrades an
+   already retained plain frontend."
   [annotations ret-type]
   (some (fn [ann]
           (or (and ann (contains? boxed->primitive-tag ann))
               (and ann (sequential? ann) (= 'Fn (first ann)))
+              (and ann
+                   (let [base (unwrap-leaf-wrapper ann)]
+                     (and (or (symbol? base)
+                              (and (sequential? base) (= 'Array (first base))))
+                          (contains? primitive-array-info (annotation->tag ann nil)))))
               (and ann (symbol? ann)
                    (not= ann 'Object)
                    (not (contains? #{'doubles 'floats 'longs 'ints
