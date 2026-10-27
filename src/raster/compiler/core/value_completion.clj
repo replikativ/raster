@@ -310,6 +310,18 @@
   (let [parts (canonical-parts expression)]
     (when (= object-input-contract (:contract parts)) parts)))
 
+(defn planned-compound-long-input-parts
+  "Recognize a declared owned input recipe, not its provenance or executability.
+   Actual Method/completion, current ports, callback closure and representation
+   correspondence must still be established by the source consumer."
+  [expression]
+  (let [{:keys [contract operand] :as parts} (canonical-parts expression)]
+    (when (and (= :jvm-bytecode-integral-input (:source-context contract))
+               (identical? Long/TYPE (:target-carrier contract))
+               (contains? #{:long :ref} (:expected-input-carrier contract))
+               (seq? operand))
+      parts)))
+
 (defn numeric-object-literal-carrier
   "Physical carrier of a direct primitive numeric literal in canonical Object input context.
    No cast, closed expression, logical hint or arbitrary Number conversion is evaluated. This

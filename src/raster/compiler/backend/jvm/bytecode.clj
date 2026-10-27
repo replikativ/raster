@@ -3962,6 +3962,12 @@
                  t1 (emit-form code (first args) locals ctx)]
              (case t1
                :long (do (let [t2 (emit-form code (second args) locals ctx)]
+                           (when (= t2 :long)
+                             (retain-binary-arithmetic!
+                              ctx "quot" args [:long :long]
+                              {:input-carriers [:long :long] :result-carrier :long}
+                              ;; This describes LDIV, not source `/` selection.
+                              (source-arithmetic/primitive-operation-policy "/" :long) locals))
                            (when (not= t2 :long) (emit-coerce code t2 :long)))
                          (.ldiv code) :long)
                :double (do (let [t2 (emit-form code (second args) locals ctx)]
@@ -6563,9 +6569,13 @@
         original-context (merge (apply dissoc ctx ::expected-completion-input-type
                                       completion/bytecode-operand-context-keys)
                                 (:operand-context contract))
+        input (when observation (physical-operand-input operand locals original-context))
+        operand-policy (when observation (source-policy/capture))
         actual (emit-argument-value code operand carrier locals original-context)]
     (when observation
       (vreset! observation {:input-carrier actual
+                            :operand-input input :operand-source-policy operand-policy
+                            :element-type (:element-type ctx)
                             :adaptation (if (= :diverge actual) :diverge
                                             (typed-input-adaptation actual carrier))
                             :operand-context (completion/bytecode-operand-context original-context)}))
@@ -7909,6 +7919,63 @@
     (audit! @observations)
     (guard)
     region))
+
+(defn ^:no-doc compile-owned-bytecode-completion-region
+  "Replay one CURRENT owned bytecode Long completion with actual Long/Object ports.
+   The original compound operand, evaluation contexts and source policy remain
+   executable. This proves physical replay/ownership only, NOT callback closure,
+   totality, source scheduling, transfer or permission to freeze mutable callees.
+   A source constructor must separately close callbacks before using this region."
+  [emission input-body original]
+  (let [record (retained-input-completion-context emission input-body original)
+        contract (:contract record)
+        input (:operand-input record)
+        ports (:ports input)
+        policy (:operand-source-policy record)
+        unowned! #(throw (ex-info "Bytecode completion needs its exact current Long occurrence"
+                                 {:reason :unowned-bytecode-completion-region}))]
+    (when-not (and record (= :jvm-bytecode-integral-input (:source-context contract))
+                   (completion/canonical-contract? contract)
+                   (identical? Long/TYPE (:target-carrier contract))
+                   (contains? #{:long :ref} (:input-carrier record))
+                   (= :long (:completion-carrier record) (:returned-carrier record))
+                   (false? (:object-parent? record))
+                   (= (typed-input-adaptation (:input-carrier record) Long/TYPE) (:adaptation record))
+                   (map? input) (map? ports) (seq ports)
+                   (every? (fn [[id port]]
+                             (and (symbol? id)
+                                  (or (= :long (:type port))
+                                      (and (= :ref (:type port)) (boolean? (:verified port))
+                                           (contains? #{Object Long} (:reference-class port))))
+                                  (= port (get (:locals-before record) id)))) ports)
+                   (false? (:unretained-sibling-calls? input))
+                   (= (:context input) (:operand-context record) (:operand-context contract))
+                   (completion/bytecode-operand-context? (:site-context record))
+                   (source-policy/valid? policy))
+      (unowned!))
+    (let [token (Object.)
+          recipe (vary-meta (completion/complete-value contract (:operand input))
+                            assoc ::completion-occurrence token)
+          audit-keys [:contract :input-carrier :completion-carrier :returned-carrier
+                      :adaptation :operand-context :site-context :object-parent? :operand-source-policy]
+          owner-guard (fn []
+                        (let [current (retained-input-completion-context emission input-body original)]
+                          (when-not (and current
+                                         (identical? (:source record) (:source current))
+                                         (identical? input (:operand-input current)))
+                            (unowned!))))
+          region (compile-planned-recipe-region
+                  emission input Long/TYPE recipe
+                  {:return-tag 'long :source-policy policy :element-type (:element-type record)
+                   ::body-input-context (:site-context record)}
+                  owner-guard
+                  (fn [observations]
+                    (let [actual (get-in observations [:completion-contexts token])]
+                      (when-not (and (= :known (:status actual))
+                                     (= (select-keys record audit-keys) (select-keys actual audit-keys)))
+                        (throw (ex-info "Outlined bytecode completion changed its physical recipe"
+                                        {:reason :bytecode-completion-replay-mismatch}))))))]
+      (assoc region :completion-contract contract :original-completion record))))
 
 (defn ^:no-doc compile-boxed-entry-parameter-region
   "Outline one actual generated IFn entry conversion, without its method body.

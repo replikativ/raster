@@ -199,6 +199,7 @@
         sites (filterv #(= (:symbol step) (first (second %))) (map-indexed vector pairs))
         [position [binder expression]] (first sites)
         {:keys [contract operand]} (completion/canonical-parts expression)
+        compound (completion/planned-compound-long-input-parts expression)
         result-description (completion/invocation-result-description contract)
         operands (:operands step)
         input (first operands)
@@ -207,10 +208,10 @@
         scalar-value? #(and (= :tensor (:kind %)) (contains? #{:float :double :long :int} (:dtype %))
                             (= [] (:shape %)))
         opaque-value? #(and (= :opaque (:kind %)) (= [] (:shape %)))
-        input-kind (cond literal-carrier :literal
+        input-kind (cond compound :scalar literal-carrier :literal
                          (scalar-value? input-value) :scalar (opaque-value? input-value) :opaque)
-        input-dtype (if literal-carrier literal-carrier
-                        (when (= :scalar input-kind) (:dtype input-value)))
+        input-dtype (cond compound :long literal-carrier literal-carrier
+                          (= :scalar input-kind) (:dtype input-value))
         result-kind (:kind result-description)
         result-dtype (some-> (:tag result-description) dtype/dtype-for-scalar-tag)
         entries (filterv #(= (:id step) (:invocation-step %)) order)]
@@ -225,6 +226,8 @@
                    (or (and (= :scalar result-kind) (contains? #{:float :double :long :int} result-dtype))
                        (= {:kind :opaque} result-description))
                    (or (and literal-carrier (empty? operands))
+                       (and compound (seq operands)
+                            (every? #(= :long (get-in plan [:values (:value %) :dtype])) operands))
                        (and (symbol? operand) (= 1 (count operands))
                             (identical? operand (:symbol input))))
                    input-kind
@@ -232,11 +235,11 @@
                        (and (scalar-value? (:value step)) (= result-dtype (get-in step [:value :dtype])))))
       (fail! :source-completion-step-source
              "completion requires its exact bounded lexical binding or numeric Object literal" {}))
-    {:source-position position :binder binder :expression expression
+    {:source-position position :binder binder :expression expression :compound? (boolean compound)
      :operand operand :operand-id (:value input) :input-kind input-kind :result-kind result-kind
      :input-dtype input-dtype :result-dtype result-dtype}))
 
-(declare validate-contextual-source-witness! current-source-binding!)
+(declare validate-contextual-source-witness! current-source-binding! current-compound-long-frame!)
 
 (defn ^:no-doc validate-source-completion-step!
   "Authenticate a complete owner-local adapter against the CURRENT execution boundary.
@@ -289,17 +292,25 @@
                       ((requiring-resolve
                         'raster.compiler.backend.jvm.bytecode/retained-input-completion-context)
                        (:emission witness) (:input-body witness) (:expression binding)))
+           compound-frame (when (:compound? binding)
+                            (when-not witness
+                              (fail! :source-completion-step-witness "compound input requires its final current witness" {}))
+                            (current-compound-long-frame! witness (:source-position binding) current observed))
            literal? (= :literal (:input-kind binding))
-           port (when (and current (not literal?)) (get (:before current) (:operand binding)))
+           port (when (and current (not literal?) (not (:compound? binding)))
+                  (get (:before current) (:operand binding)))
            _ (if witness
                (when-not (and observed
                               (identical? (:expression binding) (:source-input observed))
                               (= (:contract (completion/canonical-parts (:expression binding))) (:contract observed))
-                              (if literal?
+                              (cond
+                                (:compound? binding) (boolean compound-frame)
+                                literal?
                                 (and (nil? port)
                                      (= (:input-dtype binding)
                                         (completion/numeric-object-literal-carrier (:expression binding)))
                                      (= :ref (:input-carrier observed) (:completion-carrier observed)))
+                                :else
                                 (and (= port (get (:locals-before observed) (:operand binding)))
                                      (if (= :scalar (:input-kind binding))
                                        (= (:input-dtype binding) (:type port))
@@ -327,16 +338,43 @@
                             ;; reconstruct the whole source-order proof on every cast.
                             (method-entry/assert-frontend-source! frontend source-var)
                             (when witness (validate-contextual-source-witness! witness)))
-           region (if witness
+           region (cond
+                    compound-frame
+                    ((requiring-resolve 'raster.compiler.backend.jvm.bytecode/compile-owned-bytecode-completion-region)
+                     (:emission witness) (:input-body witness) (:expression binding))
+                    witness
                     ((requiring-resolve 'raster.compiler.backend.jvm.bytecode/compile-planned-completion-region)
                      emission (:expression binding) port observed operand-policy owner-check)
+                    :else
                     ((requiring-resolve
                       'raster.compiler.backend.jvm.bytecode/compile-planned-source-floating-completion-region)
                      emission (:expression binding) policy owner-check))
+           input-bindings
+           (if compound-frame
+             (let [operands (into {} (map (juxt :symbol identity)) (:operands step))]
+               (when-not (and (= (count operands) (count (:operands step)))
+                              (= (set (keys operands)) (set (:parameters region)))
+                              (= (:ports compound-frame) (:physical-ports region)))
+                 (fail! :source-completion-step-ports "compound completion changed its exact physical input frame" {}))
+               (mapv (fn [id]
+                       (let [operand (get operands id)
+                             value (get-in plan [:values (:value operand)])]
+                         (when-not (and (= :tensor (:kind value)) (= [] (:shape value)) (= :long (:dtype value)))
+                           (fail! :source-completion-step-ports "compound completion requires a scalar Long representation" {}))
+                         {:symbol id :value (:value operand) :input-kind :scalar :input-dtype :long
+                          :input-class Long :physical-port (get (:physical-ports region) id)})) (:parameters region)))
+             (if literal? []
+               [{:symbol (:operand binding) :value (:operand-id binding) :input-kind (:input-kind binding)
+                 :input-dtype (:input-dtype binding)
+                 :input-class (when (= :scalar (:input-kind binding))
+                                (get types/primitive-info (symbol (name (:type port)))))
+                 :physical-port port}]))
            artifact (cond-> (merge binding {:frontend frontend :source-program source-program
                                            :plan plan :step step :source-policy policy :region region
+                                           :input-bindings input-bindings
                                            :input-class (when (= :scalar (:input-kind binding))
-                                                          (get types/primitive-info (symbol (name (:type port)))))
+                                                          (if compound-frame Long
+                                                            (get types/primitive-info (symbol (name (:type port))))))
                                            :result-class (when (= :scalar (:result-kind binding))
                                                            (get types/primitive-info (symbol (name (:result-dtype binding)))))})
                       witness (assoc :witness witness :input-port port :observed observed))
@@ -1186,9 +1224,12 @@
   [application]
   (validate-owned-import! application :application :helper-application-correspondence))
 
-(defn- construct-helper-application
-  [frontend invocation inputs parameters values body binding-facts return-contracts
-   return-tag expose-spine?]
+(defn- construct-invocation-input-frame
+  "Construct positional completions after their actual caller has been checked.
+   This is shared hygiene/assembly, not a proof of an operand or selected target."
+  ([inputs parameters values body]
+   (construct-invocation-input-frame inputs parameters values body (mapv :operand inputs)))
+  ([inputs parameters values body source-operands]
   (letfn [(symbols [node]
             (cond
               (symbol? node) #{node}
@@ -1196,18 +1237,29 @@
               (map? node) (reduce into #{} (map symbols (mapcat identity node)))
               (coll? node) (reduce into #{} (map symbols node))
               :else #{}))]
-    (let [reserved (into (into (set parameters) (symbols body))
+    (let [reserved (into (into (into (set parameters) (symbols body)) (mapcat symbols source-operands))
                          (mapcat #(concat (symbols (:operand %)) (keys (:ports %))) inputs))]
-      (when-not (and (= (count inputs) (count parameters) (count values) (count (set values)))
+      (when-not (and (= (count inputs) (count source-operands) (count parameters) (count values) (count (set values)))
                      (every? #(and (symbol? %) (nil? (namespace %))
                                    (not (contains? reserved %))) values))
         (fail! :nonfresh-source-import-binder
                "helper input slots must not capture caller operands or imported bindings" {}))))
-  (let [argument-bindings
-        (mapv (fn [value input]
-                [value (vary-meta (completion/complete-value (:contract input) (:operand input))
-                                  assoc :raster.effect/preserve-evaluation true)])
-              values inputs)
+  {:bindings (mapv (fn [value input source-operand]
+                     [value (vary-meta (completion/complete-value (:contract input) source-operand)
+                                       assoc :raster.effect/preserve-evaluation true)])
+                   values inputs source-operands)
+   :slots (mapv (fn [ordinal formal value input source-operand]
+                  {:ordinal ordinal :formal formal :value value
+                   :operand (:operand input) :source-operand source-operand :contract (:contract input)
+                   :input input :completion (:completion input)
+                   :ports (:ports input) :context (:context input)})
+                (range) parameters values inputs source-operands)}))
+
+(defn- construct-helper-application
+  [frontend invocation inputs parameters values body binding-facts return-contracts
+   return-tag expose-spine?]
+  (let [frame (construct-invocation-input-frame inputs parameters values body)
+        argument-bindings (:bindings frame)
         instantiated (util/subst-syms (zipmap parameters values) body)
         returned (reduce (fn [value contract] (completion/complete-value contract value))
                          instantiated return-contracts)
@@ -1217,12 +1269,7 @@
         result (if return-tag (vary-meta result assoc :raster.type/tag return-tag) result)
         application {:caller-occurrence (:expression invocation)
                      :selected-method (:method invocation) :frontend frontend
-                     :input-slots (mapv (fn [ordinal formal value input]
-                                          {:ordinal ordinal :formal formal :value value
-                                           :operand (:operand input) :contract (:contract input)
-                                           :input input :completion (:completion input)
-                                           :ports (:ports input) :context (:context input)})
-                                        (range) parameters values inputs)
+                     :input-slots (:slots frame)
                      :payload-ports values :numerical-projection nil
                      :return-recipe return-contracts
                      :dependencies @method-entry/*emission-inputs*}]
@@ -1722,7 +1769,8 @@
   "A private, non-executable effect projection of actual owned producers.
    Unknown operations stop coverage. No arbitrary AST operation is classified
    by name, and this grants no motion, bounds, totality or concurrent-code claim."
-  [memo]
+  ([memo] (closed-source-effect-projector memo {}))
+  ([memo {:keys [required?]}]
   (let [primitive? #(contains? #{:int :long :float :double :bool} %)
         builtin? #(boolean (some (fn [known] (identical? known (:builtin-class %)))
                                 (vals types/primitive-info)))
@@ -1768,7 +1816,15 @@
                                   (:semantic-op description) (:implementation-op description)
                                   (count results) (:method record)))
                       source (get-in selected [:definition :source-var])
-                      callee (when (= :known (:status selected)) (method-entry/original-source-frontend source))]
+                      callee (when (= :known (:status selected)) (method-entry/original-source-frontend source))
+                      _ (when (and required? source (nil? (:emission callee)))
+                          (when-let [request (method-entry/selected-source-preparation-request
+                                              :physical (:semantic-op description) (:implementation-op description)
+                                              (count results) source)]
+                            ;; Only the explicit construction route requests
+                            ;; work. The existing outer owner discards this
+                            ;; discovery and restarts after independent prepare.
+                            (method-entry/demand-selected-source-preparation! request)))]
                   (when callee
                     (when-let [result (close-owner callee)]
                       (when (and (= (:method record) (:method result))
@@ -1836,6 +1892,9 @@
                                           (= (:stack input) (:operand-before-box-carrier record)))))
                         (merge (when (= :ref (:returned-carrier record))
                                  (merge (select-keys input [:builtin-class])
+                                        (when (and (= :ref raw (:stack input))
+                                                   (contains? #{:identity :checkcast} adaptation))
+                                          (select-keys input [:boxed-primitive-carrier]))
                                         (when (and (:array-origin input)
                                                    (or (and (contains? #{:jvm-object-input :jvm-bytecode-result-context} context)
                                                             (= :ref raw) (= :identity adaptation))
@@ -2023,15 +2082,23 @@
                       {:stack (:result-carrier length) :actual (:expression length)})
 
                     allocation
-                    (when (and (true? (:fresh? allocation)) (= :jvm-zero (:initialization allocation))
-                               (true? (:primitive-count? allocation))
-                               (close-input emission locals values (:count allocation)
-                                            (get-in allocation [:count :input-type])))
-                      (cond-> {:stack :ref :actual (:expression allocation)}
-                        (= :int (get-in allocation [:count :input-type]))
-                        (assoc :array-class (:array-class allocation)
-                               :array-origin {:kind :int-count-allocation :emission emission
-                                              :allocation allocation})))
+                    (let [count-input (:count allocation)
+                          count-result (close-input emission locals values count-input (:input-type count-input))]
+                      (when (and (true? (:fresh? allocation)) (= :jvm-zero (:initialization allocation))
+                                 (= :int (:completed-type count-input))
+                                 (= :raw-jvm-int (:completion count-input))
+                                 count-result
+                                 (or (primitive? (:stack count-result))
+                                     (and (builtin? count-result)
+                                          (identical? (:actual count-result) (:operand count-input)))))
+                        ;; A recursively closed boxed count has no user Number
+                        ;; callback. That is weaker than portable index/capacity
+                        ;; evidence: retain the old Int theorem's original gate.
+                        (cond-> {:stack :ref :actual (:expression allocation)}
+                          (and (true? (:primitive-count? allocation)) (= :int (:input-type count-input)))
+                          (assoc :array-class (:array-class allocation)
+                                 :array-origin {:kind :int-count-allocation :emission emission
+                                                :allocation allocation}))))
 
                     call (close-call emission locals values call)
                     :else (or (close-pmap emission locals values node)
@@ -2062,14 +2129,230 @@
                               (when (or (primitive? (:stack result)) (builtin? result))
                                 (when-let [builtin (get types/primitive-info
                                                        (symbol (.getName ^Class (:payload-carrier bridge))))]
-                                  {:stack :ref :builtin-class builtin}))
+                                  {:stack :ref :builtin-class builtin
+                                   :boxed-primitive-carrier (:payload-carrier bridge)}))
                               nil))
                           result (when result
                                    (assoc result :method (:invocation-method bridge)
                                           :implementation (:implementation emission)))]
                       (.put ^java.util.IdentityHashMap memo emission (or result ::unsupported))
                       result)))))]
-      {:owner close-owner :value close-value})))
+      {:owner close-owner :value close-value}))))
+
+(defn- closed-long-frame-ports
+  "Relate actual scalar ports to value-only Long use, without retyping them.
+   A ref/Object local needs an exact preceding boxed-primitive producer, not a
+   Long hint. Its uses must be direct inputs of actual primitive Long formals."
+  [witness binding facts input]
+  (let [emission (:emission witness)
+        before (:before binding)
+        ports (:ports input)
+        references (into #{} (keep (fn [[id port]] (when (= :ref (:type port)) id))) ports)
+        consumer (when (seq references)
+                   (owned-effect-record emission (:operand input) 'retained-invocation-context))]
+    (when (and (map? ports) (seq ports)
+               (every? (fn [[id port]]
+                         (and (= port (get before id))
+                              (or (= :long (:type port))
+                                  (and (contains? references id)
+                                       (contains? #{Object Long} (:reference-class port))
+                                       (= port (get-in facts [id :local]))
+                                       (identical? Long/TYPE (get-in facts [id :result :boxed-primitive-carrier]))
+                                       (identical? Long (get-in facts [id :result :builtin-class])))))) ports)
+               (or (empty? references)
+                   (and (= :global-typed-indy (:invocation-mode consumer))
+                        ((helper-backend 'completed-invocation-inputs?) consumer)
+                        (every?
+                         (fn [id]
+                           (let [uses (filter (fn [[operand _]] (contains? (:ports operand) id))
+                                              (map vector (:inputs consumer) (:input-completions consumer)))]
+                             (and (seq uses)
+                                  (every? (fn [[operand completed]]
+                                            (and (= id (:operand operand))
+                                                 (= {id (get before id)} (:ports operand))
+                                                 (= :ref (:emitted-type completed))
+                                                 (identical? Long/TYPE (:parameter-carrier completed))
+                                                 (= :coerce (:adaptation completed)))) uses)))) references))))
+      {:ports ports :reference-ports references})))
+
+(defn- current-compound-long-frame!
+  "Rederive the compound step's representation proof from its FINAL witness.
+   Earlier normalization receipts or logical Long tags are not physical facts."
+  [witness position current observed]
+  (let [bindings (second (:scope witness))
+        projector (closed-source-effect-projector (java.util.IdentityHashMap.))
+        emission (:emission witness)]
+    (loop [ordinal 0 facts {}]
+      (let [id (nth bindings (* 2 ordinal))
+            expression (nth bindings (inc (* 2 ordinal)))
+            binding (current-source-binding! witness ordinal id expression
+                                             :source-completion-compound-binding :source-completion-compound-binding)
+            result ((:value projector) emission (:before binding) facts (:initializer binding))]
+        (when-not (and result (= (:stack result) (get-in binding [:after :type]))
+                       (identical? (:actual result) (:initializer binding)))
+          (fail! :source-completion-compound-prefix
+                 "compound completion crosses an unclosed source definition"
+                 {:position ordinal :binding id}))
+        (if (= ordinal position)
+          (let [frame (closed-long-frame-ports witness binding facts (:operand-input observed))]
+            (when-not (and frame (= (:before binding) (:before current) (:locals-before observed))
+                           (identical? (:initializer binding) (:initializer current))
+                           (identical? (:initializer binding) (:expression observed))
+                           (= :long (:stack result) (get-in current [:after :type]))
+                           (= :long (:completion-carrier observed) (:returned-carrier observed))
+                           (false? (:object-parent? observed)))
+              (fail! :source-completion-compound-ports
+                     "compound completion lacks its exact scalar Long physical frame" {:position position}))
+            frame)
+          (recur (inc ordinal) (assoc facts id {:local (:after binding) :result result})))))))
+
+(defn- construct-contextual-input-frame
+  "Name one exact call's completed arguments without importing its body.
+   The prefix and every operand must already close under actual observations.
+   Initial compound support is Long over proved scalar Long values, not buffers
+   or opaque values. Their physical ports may remain Object references."
+  [witness original binding facts projector]
+  (let [{:keys [emission input-body]} witness
+        record ((helper-backend 'retained-input-invocation-context) emission input-body original)
+        arguments (when (and (seq? original) (= '.invk (first original))) (vec (drop 2 original)))
+        inputs (:inputs record)
+        completed (:input-completions record)
+        before (:before binding)
+        results (when (and arguments
+                           (= :global-typed-indy (:invocation-mode record))
+                           ((helper-backend 'completed-invocation-inputs?) record)
+                           (identical? (:initializer binding) (:expression record))
+                           (= (count arguments) (count inputs) (count completed))
+                           (some seq? arguments))
+                  (mapv (fn [input]
+                          (when (and (false? (:unretained-sibling-calls? input))
+                                     (every? (fn [[id port]] (= port (get before id))) (:ports input)))
+                            ((:value projector) emission before facts (:operand input)))) inputs))
+        closed?
+        (and results (every? some? results)
+             (every? true?
+                     (map (fn [argument input completion result]
+                            (let [^Class carrier (:parameter-carrier completion)
+                                  raw (:emitted-type completion)
+                                  compound? (seq? argument)]
+                              (and (= (:stack result) raw)
+                                   (if compound?
+                                     (and (identical? Long/TYPE carrier)
+                                          (contains? #{:long :ref} raw)
+                                          (or (= :long raw) (identical? Long (:builtin-class result)))
+                                          (boolean (closed-long-frame-ports witness binding facts input)))
+                                     (and (symbol? argument)
+                                          (= {argument (get before argument)} (:ports input))
+                                          (if (.isPrimitive carrier)
+                                            (and (= :identity (:adaptation completion))
+                                                 (= raw (:type (get before argument))))
+                                            (let [port (get before argument)
+                                                  source-class (:reference-class port)]
+                                              (and (= :ref raw) (true? (:verified port))
+                                                   (class? source-class)
+                                                   (or (identical? Object carrier)
+                                                       (and (.isArray carrier)
+                                                            (.isPrimitive (.getComponentType carrier))))
+                                                   (.isAssignableFrom carrier ^Class source-class)))))))))
+                          arguments inputs completed results)))
+        typed (when closed? (owned-occurrence-typed-call original record))
+        description (when typed (descriptor/call-description typed))
+        signature (when typed
+                    (call-boundary/selected-typed-signature
+                     (:semantic-op description) (:implementation-op description)
+                     (count arguments) (:method record)))
+        entry (when (= :known (:status signature))
+                (method-entry/selected-source-entry-carriers
+                 (:semantic-op description) (:implementation-op description)
+                 (count arguments) (get-in signature [:definition :source-var])))
+        source-operands
+        (when closed?
+          (let [parent (owned-effect-record emission (:expression record) 'retained-invocation-context)]
+            (mapv (fn [ordinal argument input]
+                    (if (seq? argument)
+                      (let [edge (when parent
+                                   ((helper-backend 'retained-input-source-context)
+                                    emission (:source parent) ordinal))]
+                        (when (and edge (identical? (:operand input) (:operand edge))
+                                   (= (:ports input) (:ports edge)) (= (:context input) (:context edge)))
+                          (:source-original edge)))
+                      argument)) (range) arguments inputs)))
+        parameters (:parameters entry)
+        tags (get-in entry [:definition :tags])]
+    (when (and entry (= (:method record) (:invocation-method entry))
+               (every? some? source-operands)
+               (= (:parameter-classes signature) (:parameter-carriers entry))
+               (= (count arguments) (count parameters) (count tags)))
+      (let [inputs (mapv (fn [input completion]
+                           (assoc input :completion completion
+                                  :contract (completion/planned-bytecode-input-contract
+                                             (:parameter-carrier completion) (:context input)
+                                             (:emitted-type completion)))) inputs completed)
+            values (mapv #(with-meta (gensym "completed_call_input__") {:raster.type/tag %}) tags)
+            frame (construct-invocation-input-frame inputs parameters values (:scope witness) source-operands)
+            call (util/remake-from original (list* '.invk (second original) values))]
+        (retain-owned-artifact!
+         {:frame frame :call call :original original :witness witness :physical-call record}
+         #(do (validate-contextual-source-witness! witness)
+              (method-entry/assert-source-entry-current! (:source-entry entry))
+              (assert-helper-occurrence-current! emission input-body original record)))))))
+
+(defn ^:no-doc project-contextual-invocation-arguments
+  "Normalize callback-free compound Long arguments at their original call site.
+   Reuse the existing ordered input-frame constructor; retain the same global
+   call and return behavior. Unknown prefixes/operands stop coverage. No source
+   execution, numerical equation, allocation or successful-check credit follows."
+  ([witness] (project-contextual-invocation-arguments witness {}))
+  ([witness options]
+  (when method-entry/*emission-inputs*
+    (method-entry/call-with-independent-definition-inputs
+     (fn []
+       (validate-contextual-source-witness! witness)
+       (let [source (:scope witness)
+             bindings (second source)
+             projector (closed-source-effect-projector (java.util.IdentityHashMap.) options)
+             finish (fn [constructed frames]
+                      (when (seq frames)
+                        (retain-owned-artifact!
+                         {:source source :form (util/remake-from source
+                                               (list* 'let* constructed (drop 2 source)))
+                          :frames frames :witness witness}
+                         #(do (validate-contextual-source-witness! witness)
+                              (doseq [frame frames]
+                                (validate-owned-import! frame :frame :source-input-frame-correspondence))))))]
+         (loop [ordinal 0 facts {} constructed [] frames []]
+           (if (= ordinal (quot (count bindings) 2))
+             (finish constructed frames)
+             (let [binder (nth bindings (* 2 ordinal))
+                   original (nth bindings (inc (* 2 ordinal)))
+                   observed (current-source-binding!
+                             witness ordinal binder original :source-input-frame-binding :source-input-frame-observation)
+                   frame (construct-contextual-input-frame witness original observed facts projector)
+                   constructed (cond-> constructed
+                                 ;; The frame keeps original occurrence evidence privately.
+                                 ;; Its NEW source initializers must acquire new occurrences
+                                 ;; from the final witness, not leak the old JVM tokens.
+                                 frame (into (mapcat (fn [[id initializer]]
+                                                       [id ((helper-backend 'detach-emission-occurrences) initializer)])
+                                                     (get-in frame [:frame :bindings]))))
+                   constructed (conj constructed binder (or (:call frame) original))
+                   frames (cond-> frames frame (conj frame))
+                   result ((:value projector) (:emission witness) (:before observed) facts (:initializer observed))]
+               (if (and result (= (:stack result) (get-in observed [:after :type]))
+                        (identical? (:actual result) (:initializer observed)))
+                 (recur (inc ordinal) (assoc facts binder {:local (:after observed) :result result})
+                        constructed frames)
+                 (finish (into constructed (drop (* 2 (inc ordinal)) bindings)) frames)))))))))))
+
+(defn ^:no-doc contextual-invocation-argument-candidate?
+  "Cheap routing only; exact current invocation and callback closure are separate."
+  [source]
+  (boolean
+   (and (seq? source) (= 'let* (first source)) (vector? (second source))
+        (some (fn [[_ expression]]
+                (and (seq? expression) (= '.invk (first expression))
+                     (some seq? (drop 2 expression))))
+              (partition 2 (second source))))))
 
 (defn ^:no-doc project-contextual-reference-helpers
   "Project an exact witnessed flat prefix using owned operation evidence.

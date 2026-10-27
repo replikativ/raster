@@ -1594,28 +1594,36 @@
           (validate! adapter (:semantic compilation) plan step))]
     (assert-current!)
     (let [literal? (= :literal (:input-kind adapter))
-          {:keys [symbol value]} (first (:operands step))
-          operand (get operands symbol)]
-      (when-not (if literal?
-                  (and (empty? (:operands step)) (empty? operands)
-                       (completion/numeric-object-literal-carrier (:expression step)))
-                  (and (= 1 (count (:operands step))) (= 1 (count operands))
-                     (case (:input-kind adapter)
-                       :opaque (materialization/materialized-opaque? operand)
-                       :scalar (and (map? operand) (= (:input-dtype adapter) (:type operand))
-                                    (:input-class adapter)
-                                    (identical? (:input-class adapter) (class (:value operand))))
-                       false)
-                     ;; ValueAlias intentionally retains the original opaque wrapper.
-                     ;; Check the exact current slot, not a newly fabricated alias ID.
-                       (identical? operand
-                                   (get-in source-state [:materialization :values value]))))
+          bindings (:input-bindings adapter)
+          declared (into {} (map (juxt :symbol :value)) (:operands step))]
+      (when-not (and (vector? bindings)
+                     (= (count bindings) (count (:operands step)) (count operands) (count declared))
+                     (= (set (keys operands)) (set (map :symbol bindings)) (set (keys declared)))
+                     (or (not literal?)
+                         (and (empty? bindings)
+                              (completion/numeric-object-literal-carrier (:expression step))))
+                     (every?
+                      (fn [{:keys [symbol value input-kind input-dtype input-class]}]
+                        (let [operand (get operands symbol)]
+                          (and (= value (get declared symbol))
+                               (case input-kind
+                                 :opaque (materialization/materialized-opaque? operand)
+                                 :scalar (and (map? operand) (= input-dtype (:type operand)) input-class
+                                              (identical? input-class (class (:value operand))))
+                                 false)
+                               ;; ValueAlias retains the original wrapper. Match
+                               ;; the actual current slot, not a fabricated ID.
+                               (identical? operand
+                                           (get-in source-state [:materialization :values value]))))) bindings))
         (throw (ex-info "planned source completion requires its exact current physical operand"
                         {:reason :link-ordered-source-completion-input})))
-      (let [result (if literal?
-                     ((get-in adapter [:region :invoke]))
-                     (let [input (case (:input-kind adapter) :opaque (:source operand) :scalar (:value operand))]
-                       ((get-in adapter [:region :invoke]) input)))]
+      (let [inputs (mapv (fn [{:keys [symbol input-kind]}]
+                           (let [operand (get operands symbol)]
+                             (case input-kind :opaque (:source operand) :scalar (:value operand)))) bindings)
+            invoke (get-in adapter [:region :invoke])
+            ;; Pass existing objects in the region's physical parameter order.
+            ;; In particular scalar Long -> Object is not a new conversion/box.
+            result (case (count inputs) 0 (invoke) 1 (invoke (first inputs)) (apply invoke inputs))]
         (assert-current!)
         (case (:result-kind adapter)
           :opaque result

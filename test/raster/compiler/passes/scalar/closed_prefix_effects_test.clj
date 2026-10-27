@@ -2,6 +2,8 @@
   (:require [clojure.test :refer [deftest is]]
             [raster.core :as core :refer [deftm]]
             [raster.par :as par]
+            [raster.arrays :as arrays]
+            [raster.numeric :as n]
             [raster.compiler.backend.jvm.bytecode :as bytecode]
             [raster.compiler.core.method-entry :as entry]
             [raster.compiler.core.value-completion :as completion]
@@ -10,6 +12,7 @@
             [raster.compiler.ir.invocation-plan :as invocation]
             [raster.compiler.ir.invocation-materialization :as materialization]
             [raster.compiler.ir.par]
+            [raster.compiler.ir.semantic-fingerprint :as semantic]
             [raster.compiler.passes.parallel.typed-soac-frontend :as typed-frontend]
             [raster.compiler.passes.scalar.source-import :as source-import]))
 
@@ -21,6 +24,11 @@
 
 (deftm prefix-object-owner [coefficient :- Object values :- (Array double) n :- Long] :- Object
   values)
+
+(deftm prefix-allocation-frame [values :- (Array float) width :- Long] :- (Array float)
+  (let [span (n/* width width)
+        out (arrays/alloc-like values (n/* width span))]
+    out))
 
 (defn- prepared-source [function]
   (let [source (core/resolve-deftm-var function)]
@@ -50,6 +58,63 @@
 (defn- with-witness [request consume]
   (entry/call-with-definition-inputs
    #(consume (source-import/prepare-contextual-source-witness (:source request) (:options request)))))
+
+(deftest compound-long-argument-frame-keeps-call-order-and-original-allocation
+  (let [source (prepared-source #'prefix-allocation-frame)]
+    (entry/call-with-definition-inputs
+     (fn []
+       (let [frontend (entry/original-source-frontend source)
+             body (first (:body frontend))
+             options {:source-var source :source-ns (.ns ^clojure.lang.Var source)
+                      :lexical-inputs (get-in frontend [:emission :params])}
+             witness (source-import/prepare-contextual-source-witness body options)
+             projected (source-import/project-contextual-invocation-arguments witness {:required? true})]
+         (is (= 1 (count (:frames projected))))
+         (when projected
+           (let [frame (first (:frames projected))
+                 before (:original frame)
+                 after (:call frame)
+                 pairs (mapv vec (partition 2 (second (:form projected))))
+                 current (source-import/prepare-contextual-source-witness (:form projected) options)
+                 observe (fn [implementation reference width]
+                           (try
+                             (let [result (implementation reference width)]
+                               {:class (class result) :values (vec result)})
+                             (catch Throwable error
+                               {:error (class (if (instance? java.lang.reflect.InvocationTargetException error)
+                                                (.getCause error) error))})))]
+             (is (= (take 2 before) (take 2 after)) "the original global call/receiver remain")
+             (is (= 2 (count (get-in frame [:frame :bindings]))))
+             (is (every? symbol? (drop 2 after)))
+             (is (every? completion/canonical-form? (map second (get-in frame [:frame :bindings]))))
+             (is (some #(contains? (meta %) :raster.compiler.backend.jvm.bytecode/call-occurrence)
+                       (tree-seq coll? seq (get-in frame [:frame :bindings])))
+                 "private frame operands retain the original invocation occurrence")
+             (is (not-any? #(contains? (meta %) :raster.compiler.backend.jvm.bytecode/call-occurrence)
+                           (tree-seq coll? seq (:form projected)))
+                 "new source does not borrow private occurrences from its evidence")
+             (is (semantic/retained-source-equivalent? (:form projected) (:form projected)))
+             (let [observe bytecode/retained-input-source-context]
+               (with-redefs [bytecode/retained-input-source-context (fn [& _] nil)]
+                 (is (nil? (source-import/project-contextual-invocation-arguments witness))))
+               (with-redefs [bytecode/retained-input-source-context
+                             (fn [& args]
+                               (some-> (apply observe args)
+                                       (update :operand #(with-meta (apply list %) (meta %)))))]
+                 (is (nil? (source-import/project-contextual-invocation-arguments witness)))
+                 "a structurally equal copied operand cannot establish the source/physical edge"))
+             (is (= 1 (count (filter #(= 'span (first %)) pairs)))
+                 "normalization does not re-evaluate the earlier boxed Long producer")
+             (doseq [[reference width] [[(float-array 0) 0] [(float-array 0) 2]
+                                      [nil 2] [(float-array 0) -1]
+                                      [(float-array 0) Long/MAX_VALUE]
+                                      [(float-array 0) 65536]]]
+               ;; 65536^3 narrows to zero at JVM newarray: no huge allocation.
+               ;; This is source equivalence, not a claim of GPU wrap support.
+               (is (= (observe (:implementation witness) reference width)
+                      (observe (:implementation current) reference width))))
+             (is (nil? (source-import/project-contextual-invocation-arguments current))
+                 "completed leaf arguments make this normalization idempotent"))))))))
 
 (deftest actual-builtin-box-prefix-can-import-a-reference-call-without-erasing-checks
   (let [request (prefix-request #'prefix-owner false)]

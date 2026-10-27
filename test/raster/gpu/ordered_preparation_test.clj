@@ -18,6 +18,7 @@
             [raster.compiler.fixtures.mixed-storage :as mixed]
             [raster.core :refer [deftm]]
             [raster.par :as par]
+            [raster.numeric :as n]
             [raster.compiler.passes.scalar.effects :as effects]
             [raster.compiler.passes.scalar.source-import :as source-import]
             [raster.compiler.passes.parallel.structured-control-route :as structured]
@@ -295,6 +296,40 @@
     (do (check-owned-completion-runtime! :ze:0)
         (check-completion-source-order-and-replay! :ze:0))
     (ze-probe/gpu-skip! "owned planned source completion")))
+
+(deftm compound-frame-map [out :- (Array float) width :- Long height :- Long] :- (Array float)
+  (let [count (n/* width (n/- height width))]
+    (par/map! out i count float (n/+ (float i) (float width)))))
+
+(defn- check-compound-input-frame! [target]
+  (let [compilation (equation-first/compile #'compound-frame-map {:target target :dtype :float})]
+    (is (= 1 (count (:kernels compilation))))
+    (is (some #(> (count (:input-bindings %)) 1)
+              (vals (:source-completion-adapters compilation))))
+    ;; Reuse the same compiled adapters with different scalar bindings.
+    (doseq [[width height] [[2 6] [1 9]]]
+      (let [x (float-array 8)
+            live (link/instantiate-ordered-invocation! compilation [x width height] {})]
+        (try
+          (doseq [scale [1.0 -0.5]]
+            (dotimes [i 8] (aset x i (float (* scale (inc i) 0.1))))
+            (let [expected (compound-frame-map (aclone x) width height)]
+              (link/run! live)
+              (let [actual (link/download live (first (keys (link/outputs live))))]
+                (is (= (class expected) (class actual)))
+                (is (= 8 (alength ^floats actual)))
+                (doseq [i (range 8)]
+                  (is (< (Math/abs (- (double (aget ^floats expected i))
+                                      (double (aget ^floats actual i)))) 2.0e-5))))))
+          (finally (link/close! live)))))))
+
+(deftest compound-input-frame-replays-on-local-backends
+  (if @ocl-probe/opencl-available?
+    (check-compound-input-frame! :ocl:0)
+    (ocl-probe/opencl-skip! "compound input frame"))
+  (if @ze-probe/gpu-available?
+    (check-compound-input-frame! :ze:0)
+    (ze-probe/gpu-skip! "compound input frame")))
 
 (deftm completed-float-terminal [completed :- Float] :- Float
   (let [out (float-array 1)]

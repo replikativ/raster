@@ -977,6 +977,10 @@
         (when (source-import/contextual-reference-helper-candidate? source)
           (source-import/project-contextual-reference-helpers (owner! source)))
 
+        (= kind :ordered-invocation-arguments)
+        (when (source-import/contextual-invocation-argument-candidate? source)
+          (source-import/project-contextual-invocation-arguments (owner! source) {:required? true}))
+
         (= kind :checked-array-length-source)
         (when (source-import/contextual-array-length-candidate? source)
           (source-import/project-contextual-array-lengths (owner! source)))
@@ -1089,6 +1093,8 @@
     (let [construct (contextual-reduction-constructor opts)
           references (construct {:kind :closed-prefix-reference-helpers :source source})
           source (if references (inline/flatten-nested-lets (:form references)) source)
+          frames (construct {:kind :ordered-invocation-arguments :source source})
+          source (if frames (inline/flatten-nested-lets (:form frames)) source)
           projection (construct {:kind :direct-double-map-payloads :source source})
           source (or (:form projection) source)
           lengths (construct {:kind :checked-array-length-source :source source})
@@ -1097,6 +1103,7 @@
        construct
        #(cond-> (semantic-program-attempt* source opts abstract-machine)
           references (assoc-in [:stats :owned-reference-helpers] (count (:applications references)))
+          frames (assoc-in [:stats :owned-input-frames] (count (:frames frames)))
           lengths (assoc-in [:stats :owned-array-lengths] (count (:rewrites lengths)))
           projection (assoc-in [:stats :owned-map-payloads] (count (:applications projection))))))
     (semantic-program-attempt* source opts abstract-machine))))

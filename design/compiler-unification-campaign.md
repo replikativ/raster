@@ -4,6 +4,44 @@
 
 ### Current boundary ledger
 
+Latest completed exact-head CI is `430545f99`: all sixteen unit shards
+(35322) finish with 7,762 tests / 95,322 pass / 46 failures / 115 errors across
+133 failing Vars. Both JVM regression repairs recover. A new cold diagnostic
+entry fails with `:missing-source-prerequisite-owner`; the repair routes
+`show-pipeline` through the same selected-source service as production compilation,
+without relaxing prerequisite ownership. All 7,760 prior outcome Vars remain;
+shared assertions fall 95,464→95,457 because the diagnostic exits early, not a
+waived loss. CPU-OpenCL 35326 completes all four shards: 679 tests / 7,505 pass /
+12 failures / 73 errors across 75 failing Vars. The scratch-alias regression
+recovers, with no newly failing Vars and no removed outcomes. Shared assertions
+rise 7,547→7,576; one new Var adds 14. Emission35323 still fails; downstream
+vendor checks remain unqualified. **Draft, not merge-ready; no release.**
+
+The next generic source-input-frame slice has independent design review and
+local gates: 4 bytecode tests / 71 assertions, 16 closed-prefix tests / 148
+assertions, and 2 actual ordered-runtime tests / 43 assertions. These cover
+preserved physical Object ports, overflow, argument order, changed inputs,
+repeated operands, copied adapters/wrappers, wrong numeric Classes and stale
+invocation ownership. The generated-map end-to-end gate passes 84 assertions
+across OpenCL and Level Zero, reusing one compilation per backend with different
+scalar bindings and repeated device executions. This does not qualify the full
+group-norm runtime. A source-comparison refusal was an old private call-occurrence token
+leaking into new source. The existing detachment operation now applies only to
+new completion initializers; original source/physical edges remain in the private
+frame. The original source child is obtained through the existing authenticated
+positional-edge query, never guessed from desugared JVM dot syntax. Group-norm
+now compiles to four kernels. Its runtime still refuses the independent compound
+counts of direct `double-array` temporaries (`means` first); this requires a
+checked array-count input projection, not weaker allocation or preflight rules.
+An isolated zero-allocation fixture additionally exposes causal initialization
+extent availability across ordered source actions. The reviewed next step is a
+true component boundary at intervening source actions, with exact preceding
+completion outputs as incoming values; no blanket host-extent admission.
+Existing unary/literal/opaque completion regressions pass 17 tests / 337
+assertions, with the existing two-backend completion replay passing 54 assertions.
+The cold diagnostic-entry fix is separately committed/pushed as `470b77b0f`;
+its two focused tests pass 21 assertions. Exact-head CI is running.
+
 Latest completed exact-head CI is `b9178db99`: all sixteen unit shards
 (35319) finish with 7,759 tests / 95,289 pass / 47 failures / 115 errors across
 134 failing Vars. Three prior Vars recover; two new failures require correction.

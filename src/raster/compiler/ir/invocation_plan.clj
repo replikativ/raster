@@ -337,6 +337,7 @@
 
       (source-completion? step)
       (let [{:keys [contract operand]} (completion/canonical-parts (:expression step))
+            compound (completion/planned-compound-long-input-parts (:expression step))
             result (completion/invocation-result-description contract)
             expected (some-> (:tag result) dtype/dtype-for-scalar-tag)
             symbols (set (keys operands))]
@@ -346,6 +347,9 @@
                          :scalar (and (scalar-value? value) expected
                                       (= expected (dtype/canon (:dtype value)))))
                        (or (completion/source-cast-result-tag contract) (symbol? operand)
+                           (and compound (seq operand-values)
+                                (every? #(let [input (get values %)]
+                                           (and (scalar-value? input) (= :long (:dtype input)))) operand-values))
                            (and (empty? operand-values)
                                 (completion/numeric-object-literal-carrier (:expression step))))
                        (every? (fn [id]

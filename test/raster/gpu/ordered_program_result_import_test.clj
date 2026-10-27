@@ -12,6 +12,7 @@
             [raster.compiler.ir.semantic-fingerprint :as fingerprint]
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.ir.invocation-plan :as invocation]
+            [raster.compiler.ir.parallel-program :as program]
             [raster.compiler.ir.invocation-materialization :as materialization]
             [raster.compiler.ir.invocation-link :as invocation-link]
             [raster.compiler.ir.link-plan :as link-plan]
@@ -21,6 +22,7 @@
             [raster.compiler.passes.parallel.typed-soac-route :as typed-route]
             [raster.compiler.passes.parallel.terminal-reduction-import-test :as completion-fixture]
             [raster.compiler.pipeline :as pipeline]
+            [raster.core :as core]
             [raster.gpu.core :as gpu]
             [raster.gpu.device-probe :as ocl-probe]
             [raster.gpu.resource-cleanup :as cleanup]
@@ -30,6 +32,67 @@
 
 (defn- reason [f]
   (try (f) nil (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+
+(core/deftm compound-frame-owner [left :- Long right :- Long] :- Long left)
+
+(defn- compound-completion-request [operand]
+  (let [original (#'completion-fixture/selected-frontend #'compound-frame-owner)
+        expression (completion/complete-value
+                    (completion/planned-bytecode-input-contract
+                     Long/TYPE (completion/bytecode-operand-context
+                                {:preserve-source-call-results? true}) :long) operand)
+        binder (symbol "completed")
+        source (list 'let* [binder expression] binder)
+        scalar (av/tensor {:dtype :long :shape []})
+        plan (invocation/from-prefix
+              {:id :compound-input-frame :parameters '[left right]
+               :parameter-values {'left scalar 'right scalar}
+               :bindings [[binder expression]] :binding-values {binder scalar}
+               :program-values {} :program-inputs [] :program-outputs []})
+        semantic (program/make {:dialect :typed-soac :source source
+                                :attributes {:invocation-plan plan}})
+        witness (entry/call-with-definition-inputs
+                 #(source-import/prepare-contextual-source-witness
+                   source {:source-var (get-in original [:source-entry :source-var])
+                           :source-ns (get-in original [:source-entry :source-ns])
+                           :lexical-inputs '[left right]}))]
+    {:frontend original :source-program semantic :plan plan :step (first (:steps plan))
+     :witness witness}))
+
+(deftest compound-completion-executes-exact-current-ports-in-region-order
+  (doseq [[operand cases] [['(clojure.core/- left right) [[11 3 8] [4 19 -15]]]
+                         ['(clojure.core/- left left) [[11 3 0] [4 19 0]]]]]
+    (let [{:keys [source-program plan step] :as request} (compound-completion-request operand)
+          adapter (#'completion-fixture/completion-adapter request)
+          state (atom {:value-epoch 0})
+          owner (cleanup/owner [])
+          executable (assoc (link/map->LinkedExecutable {:closed? (atom false) :execution-state state})
+                            ::cleanup/owner owner)]
+      (try
+        (is (#'invocation-link/ordered-source-completion? step))
+        (doseq [[left right expected] cases]
+          (let [source-state {:materialization (materialization/begin-materialization plan [(long left) (long right)])}
+                values (get-in source-state [:materialization :values])
+                operands (into {} (map (fn [{:keys [symbol value]}] [symbol (get values value)])) (:operands step))
+                invoke #(#'link/execute-ordered-source-completion executable source-state step %)]
+            (swap! state assoc :ordered {:current source-state :compilation
+                                         {:semantic source-program :source-completion-adapters {(:id step) adapter}}})
+            (is (= {:type :long :value (long expected)} (invoke operands)))
+            (is (zero? (get-in source-state [:materialization :next-step])))
+            (is (= :link-ordered-source-completion-input
+                   (reason #(invoke (update-vals operands (fn [v] (with-meta v {:copied true})))))))
+            (is (= :link-ordered-source-completion-input
+                   (reason #(invoke (update-vals operands (fn [v] (assoc v :value (int (:value v)))))))))
+            (when (= 2 (count operands))
+              (is (= :link-ordered-source-completion-input
+                     (reason #(invoke {'left (operands 'right) 'right (operands 'left)})))))
+            (let [copied (update adapter :input-bindings #(with-meta % {:copied true}))]
+              (swap! state assoc-in [:ordered :compilation :source-completion-adapters (:id step)] copied)
+              (is (= :source-completion-step-correspondence (reason #(invoke operands)))))
+            (swap! state assoc-in [:ordered :compilation :source-completion-adapters (:id step)] adapter)
+            (swap! state assoc-in [:ordered :current] (with-meta source-state {:copied true}))
+            (is (= :link-ordered-source-completion-epoch (reason #(invoke operands))))))
+        (finally (cleanup/release! owner))))))
 
 (deftest prepared-fragments-recheck-actual-readiness-and-always-release
   ;; Dispatch/lifecycle only: stand-in bindings grant no program validation or
