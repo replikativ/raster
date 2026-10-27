@@ -7338,6 +7338,25 @@
               id)
             (check-ports! [ports env]
               (when-not (every? (fn [[id facts]] (= facts (get-in env [id :facts]))) ports) (fail!)))
+            (direct-array-input [input completion carrier env]
+              (let [operand (:operand input)
+                    ports (:ports input)
+                    facts (when (symbol? operand) (get ports operand))
+                    source (when facts (get env operand))
+                    reference-class (:reference-class facts)]
+                (when (and (class? carrier) (.isArray ^Class carrier)
+                           (.isPrimitive (.getComponentType ^Class carrier))
+                           (symbol? operand) (= #{operand} (set (keys ports)))
+                           (false? (:unretained-sibling-calls? input))
+                           source (= facts (:facts source)) (symbol? (:value source))
+                           (= :ref (:type facts)) (true? (:verified facts))
+                           (class? reference-class)
+                           (.isAssignableFrom ^Class carrier ^Class reference-class)
+                           (identical? operand (:operand completion))
+                           (= :ref (:emitted-type completion))
+                           (identical? carrier (:parameter-carrier completion))
+                           (= :checkcast (:adaptation completion)))
+                  (:value source))))
             (lower-owned-input [region env prefix]
               (let [^java.lang.reflect.Method method (:method region)
                     carrier (when (instance? java.lang.reflect.Method method)
@@ -7387,12 +7406,15 @@
                       callee-params (get-in selected [:emission :params])
                       used-callee-params (util/free-syms
                                           (list* 'do (get-in selected [:emission :body])))
-                      _ (when-not (= (count carriers) (count (:inputs context)) (count callee-params))
+                      completions (:input-completions context)
+                      _ (when-not (= (count carriers) (count (:inputs context))
+                                     (count completions) (count callee-params))
                           (unowned!))
                       inputs
                       (mapv (fn [index input]
                               (check-ports! (:ports input) env)
                               (let [carrier (nth carriers index)
+                                    completion (nth completions index)
                                     input-active? (boolean
                                                    (some (fn [id]
                                                            (get-in @state [:activity (get-in env [id :value])]))
@@ -7400,8 +7422,11 @@
                                     array-tag (some (fn [[tag array-class]]
                                                       (when (identical? carrier array-class) tag))
                                                     types/primitive-array-info)
+                                    direct-array (when array-tag
+                                                   (direct-array-input input completion carrier env))
                                     projection (into {} (map (fn [[id port]] [id (:value port)])) env)]
-                                (if (contains? #{Float/TYPE Double/TYPE} carrier)
+                                (cond
+                                  (contains? #{Float/TYPE Double/TYPE} carrier)
                                   (let [ordered
                                         (ordered-bytecode-input-program
                                          emission {:physical-ports (:ports input)} expression index
@@ -7422,6 +7447,10 @@
                                     (swap! state update :helpers into (:helpers ordered))
                                     (doseq [[id init] (partition 2 (:bindings ordered))] (append! id init))
                                     (:result ordered))
+
+                                  direct-array direct-array
+
+                                  :else
                                   (do
                                     ;; Discrete/reference arguments stay wholly
                                     ;; primal. Their exact original conversion is

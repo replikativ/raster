@@ -1,5 +1,5 @@
 (ns raster.ad.owned-inactive-input-test
-  "Owned bytecode AD retains inactive input completion and source evaluation order."
+  "Owned bytecode AD retains input completion, direct array identity and source order."
   (:require [clojure.test :refer [deftest is]]
             [raster.core :as core :refer [deftm]]
             [raster.compiler.core.method-entry :as entry]
@@ -28,6 +28,8 @@
   (clojure.core/+ (clojure.core/aget data 0) (clojure.core/* x x)))
 (deftm application-used-array-caller [data :- (Array double) x :- Double] :- Double
   (application-used-array data x))
+(deftm application-compound-used-array-caller [data :- (Array double) x :- Double] :- Double
+  (application-used-array (do (clojure.core/aget data 0) data) x))
 
 (defmacro define-object-array-ad-caller []
   (let [operation (symbol (str (ns-name *ns*)) "application-inactive-array-square")
@@ -43,6 +45,21 @@
 
 (declare application-object-array-caller)
 (define-object-array-ad-caller)
+
+(defmacro define-object-used-array-ad-caller []
+  (let [operation (symbol (str (ns-name *ns*)) "application-used-array")
+        implementation (symbol (str (ns-name *ns*)) "application-used-array_m_doubles_double-impl")
+        selected (entry/selected-definition operation implementation 2)
+        receiver (with-meta implementation
+                   {:raster.type/tag (get-in selected [:entry :typed-iface])
+                    :raster.type/ret-tag 'double})]
+    (list 'raster.core/deftm 'application-object-used-array-caller
+          '[data :- Object x :- Double] ':- 'Double
+          (with-meta (list '.invk receiver 'data 'x)
+            {:raster.op/original operation}))))
+
+(declare application-object-used-array-caller)
+(define-object-used-array-ad-caller)
 
 (defn- compiled-owned [source wrt]
   (#'reverse/compile-prepared-value+grad
@@ -81,9 +98,21 @@
         (is (= (first expected) (application-inactive-int-caller selector 3.0)))
         (is (= expected (gradient selector 3.0)))))))
 
-(deftest unsupported-active-discrete-and-used-array-regions-still-refuse
+(deftest exact-local-array-keeps-its-existing-memory-and-tangent-identity
+  (let [all (compiled-owned #'application-used-array-caller [0 1])
+        scalar-only (compiled-owned #'application-used-array-caller [1])
+        data (double-array [2.0])
+        [value gradient derivative] (all data 3.0)]
+    (is (= 11.0 value))
+    (is (= [1.0] (vec gradient)))
+    (is (= 6.0 derivative))
+    (is (= [11.0 nil 6.0] (scalar-only data 3.0)))
+    (is (= [2.0] (vec data)))))
+
+(deftest unsupported-active-discrete-and-unverified-array-regions-still-refuse
   (doseq [[source wrt] [[#'application-active-discrete-caller [0 1]]
-                        [#'application-used-array-caller [1]]]]
+                        [#'application-object-used-array-caller [1]]
+                        [#'application-compound-used-array-caller [0 1]]]]
     (is (= :ad-unowned-derived-pullback
            (try (reverse/prepare-owned-bytecode-value+grad source wrt) nil
                 (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))))
