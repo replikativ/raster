@@ -83,6 +83,21 @@ The same wrapped warm microcase now checks the plan150times versus178, with
 source-history checks unchanged212. This is count evidence, not a benchmark
 speedup claim. Multi-second compilation and remaining validation still need work.
 
+The next AD prerequisite records actual JVM field reads through the existing
+occurrence/physical-emission catalog. Dot and direct keyword GETFIELD share one
+instruction producer; observations retain the actual Field, symbolic owner and
+declaring Class, receiver CHECKCAST/identity choice and raw result carrier. Only
+primitive Float/Double field results have closed identity completion. Object
+field registry postprocessing grants no completion proof. This adds no AD rule
+or record tangent space and does not yet recover the inactive-record AD case.
+Independent review passes; generic field gates4/89 and neighboring arithmetic,
+input-completion and allocation gates36/758 pass. A bounded fresh process passes
+field, array-only and source-preparation gates23/279. Next, owned scalar AD must
+consume those reads in forward order and capture scalar residuals rather than
+reread mutable objects during a delayed pullback; null/cast/effect/loader controls
+must accompany that admission. Active compound array helper ownership is a
+separate remaining boundary, not permission to broaden arbitrary Object inputs.
+
 Coverage reconciliation: the seven-assertion
 `generated-storage-actions-do-not-partition-fusible-maps` test was replaced by
 `generated-storage-actions-partition-causal-components-without-host-boundaries`.

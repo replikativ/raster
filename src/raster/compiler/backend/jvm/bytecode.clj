@@ -1605,6 +1605,21 @@
     (when-let [observed (retained-invocation-context emission owned)]
       (assoc observed :source-input original))))
 
+(defn ^:no-doc retained-field-read
+  "Actual original GETFIELD selection and receiver adaptation. A reference
+   result does not carry a closed post-read completion, even when subsequent
+   emission consults a logical field registry. No AD or replay permission follows."
+  [emission original]
+  (retained-call-observation emission original :field-read-contexts))
+
+(defn ^:no-doc retained-input-field-read
+  "Follow the actual input-origin edge to its original field-read observation.
+   Equal or copied source forms cannot acquire this occurrence's selection."
+  [emission input-body original]
+  (when-let [owned (input-origin emission input-body original :invocation)]
+    (when-let [observed (retained-field-read emission owned)]
+      (assoc observed :source-input original))))
+
 (defn ^:no-doc retained-input-call-context
   "Follow an actual emitted input edge to its nested invocation context.
    Expanded operands are not the source catalog's original objects. Their
@@ -5405,6 +5420,38 @@
             (throw (ex-info (str "Cannot resolve IFn__ interface: " tag) {:obj obj :tag tag})))
           (resolved-typed-invocation-plan obj arity locals ctx cls))))))
 
+(defn- emit-selected-field-read
+  "Emit and observe the same selected raw GETFIELD for dot and keyword paths.
+   The receiver has already been evaluated. Post-read registry adaptations stay
+   with their original caller and are deliberately not certified here."
+  [code receiver receiver-type checkcast? ^Class owner field-name
+   ^java.lang.reflect.Field field locals ctx]
+  (let [^Class carrier (.getType field)
+        descriptor (class-desc-of carrier)
+        result-type (class-type->stack carrier)
+        closed? (contains? #{Float/TYPE Double/TYPE} carrier)]
+    (when checkcast?
+      (.checkcast code (class-desc-of owner)))
+    (.getfield code (class-desc-of owner) field-name descriptor)
+    (when (and me/*emission-inputs* (::call-occurrence ctx))
+      (retain-call-observation!
+       ctx :field-read-contexts
+       (cond-> {:status :known :field field :declaring-class (.getDeclaringClass field)
+                :owner-class owner :field-name field-name :field-descriptor descriptor
+                :receiver-input (physical-operand-input receiver locals ctx)
+                :receiver-type receiver-type
+                :receiver-adaptation (if checkcast? :checkcast :identity)
+                :receiver-checkcast-class (when checkcast? owner)
+                ;; A skipped check is an observed instruction choice, not proof
+                ;; that a hint establishes runtime Class or non-null presence.
+                :receiver-local (get locals receiver)
+                :raw-result-carrier carrier :raw-result-type result-type
+                :closed-result? closed?}
+         closed? (assoc :final-completion {:kind :identity :result-carrier carrier
+                                           :result-type result-type}))
+       :repeated-emitted-field-read))
+    result-type))
+
 (defn- emit-dot-handler
   "Emit bytecode for (. obj method args...) — instance method or field access.
   Handles two paths:
@@ -5738,9 +5785,9 @@
                   (throw (ex-info (str "Cannot resolve method or field: " meth-str " on " (.getName cls))
                                   {:class (.getName cls) :member meth-str :field-name field-name
                                    :available-fields (mapv #(.getName %) (.getFields cls))})))
-                (when (and (= obj-type :ref) (not type-verified?))
-                  (.checkcast code cls-cd))
-                (.getfield code cls-cd field-name (class-desc-of ft))
+                (emit-selected-field-read code obj obj-type
+                                          (and (= obj-type :ref) (not type-verified?))
+                                          cls field-name field locals ctx)
               ;; When field is Object but the field-type-registry knows a
               ;; more specific type (from defvalue annotations), add CHECKCAST.
               ;; This is zero-cost in C2 and enables correct downstream dispatch.
@@ -5859,13 +5906,10 @@
         field (when field-cls
                 (try (.getField ^Class field-cls jvm-field-name) (catch Exception _ nil)))]
     (if field
-      (let [obj-type (emit-form code obj-form locals ctx)
-            _ (when (and (= obj-type :ref) (not (:verified (get locals obj-form))))
-                (.checkcast code (class-desc-of field-cls)))
-            ^Class ftype (.getType ^java.lang.reflect.Field field)
-            fcd (class-desc-of ftype)]
-        (.getfield code (class-desc-of field-cls) jvm-field-name fcd)
-        (class-type->stack ftype))
+      (let [obj-type (emit-form code obj-form locals ctx)]
+        (emit-selected-field-read code obj-form obj-type
+                                  (and (= obj-type :ref) (not (:verified (get locals obj-form))))
+                                  field-cls jvm-field-name field locals ctx))
       (let [kw-cd (ClassDesc/of "clojure.lang" "Keyword")
             kw-intern-mt (MethodTypeDesc/of kw-cd (into-array ClassDesc [(ClassDesc/ofDescriptor "Ljava/lang/String;") (ClassDesc/ofDescriptor "Ljava/lang/String;")]))]
         (if (namespace head)
