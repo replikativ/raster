@@ -3001,6 +3001,33 @@
   [emission original]
   (retained-call-observation emission original :array-read-contexts))
 
+(defn ^:no-doc retained-input-invocation-operands
+  "Follow exact positional input-origin edges, never equality of rewritten ASTs.
+   Compound operands require their own original-to-owned relation plus the actual
+   parent's immediate input edge. Unchanged numeric leaves require object identity
+   at all three positions. This grants correspondence only, not numerical meaning."
+  [emission input-body original]
+  (let [owned (input-origin emission input-body original :invocation)
+        record (when owned (retained-invocation-context emission owned))
+        source-arguments (vec (util/call-args original))
+        owned-arguments (vec (util/call-args owned))
+        inputs (:inputs record)]
+    (when (and owned record (= (count source-arguments) (count owned-arguments) (count inputs)))
+      (let [edges
+            (mapv
+             (fn [ordinal source owned-argument input]
+               (let [compound? (some #(identical? owned-argument
+                                                   (input-origin emission input-body source %))
+                                     [:invocation :binding :completion :reduction])
+                     edge (when compound? (retained-input-source-context emission owned ordinal))
+                     leaf? (and (number? source) (identical? source owned-argument)
+                                (identical? source (:operand input)))]
+                 (when (or leaf? (and edge (identical? owned-argument (:source-original edge))))
+                   {:ordinal ordinal :source source :owned owned-argument :input input
+                    :array-read (when compound? (retained-array-read emission owned-argument))})))
+             (range) source-arguments owned-arguments inputs)]
+        (when (every? some? edges) edges)))))
+
 (defn- retain-zero-array-allocation! [ctx array-class count-source count-type locals proof]
   (when me/*emission-inputs*
     (retain-call-observation!

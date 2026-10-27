@@ -1,7 +1,8 @@
 (ns raster.compiler.scalar-intrinsic-identity-test
   "Public compiler controls: a user function name is not a primitive semantic identity."
   (:require [clojure.test :refer [deftest is]]
-            [raster.core :refer [deftm]]
+            [raster.core :as core :refer [deftm]]
+            [raster.compiler.passes.scalar.inline :as inline]
             [raster.par :as par]
             [raster.compiler.backend.intrinsics :as intrinsic]
             [raster.compiler.backend.gpu.c-emit :as c]
@@ -10,6 +11,7 @@
             [raster.compiler.core.dispatch :as dispatch]
             [raster.compiler.core.method-entry :as method-entry]
             [raster.compiler.pipeline :as pipeline]
+            [raster.compiler.passes.scalar.source-import :as source-import]
             [raster.gpu.core :as gpu]))
 
 (deftm sin [x :- Double] :- Double (clojure.core/+ x 100.0))
@@ -23,6 +25,13 @@
 (deftm control-map!
   [a :- (Array double) out :- (Array double) n :- Long] :- (Array double)
   (par/map! out i n double (custom-sine (clojure.core/aget a i))))
+
+(deftm two-direct-helper-maps!
+  [a :- (Array double) b :- (Array double) first-out :- (Array double)
+   second-out :- (Array double) n :- Long] :- (Array double)
+  (par/map! first-out i n double (sin (clojure.core/aget a i)))
+  (par/map! second-out j n double (custom-sine (clojure.core/aget b j)))
+  second-out)
 
 (defn- compiled-source [operation]
   (let [session (atom {:device-id :ocl:0 :closed? false :kernels {}
@@ -96,6 +105,42 @@
       (is (re-find #"\+ 100\.0" source) "the user helper's actual arithmetic reaches emission")
       (is (not (re-find #"\bsin\(" source))
           "a qualified user function must not be reinterpreted as mathematical sine"))))
+
+(deftest two-direct-map-payloads-share-one-witness-for-the-same-current-candidate
+  (let [prepare source-import/prepare-contextual-source-witness
+        project source-import/project-direct-double-map-results
+        ordinary-inline @#'inline/try-resolve-deftm
+        retained (set (mapcat (fn [generic]
+                                (let [source (core/resolve-deftm-var generic)
+                                      qualified (symbol (str (.ns ^clojure.lang.Var source))
+                                                        (str (:name (meta source))))]
+                                  [(symbol (str (.ns ^clojure.lang.Var generic))
+                                           (str (:name (meta generic))))
+                                   qualified (symbol (namespace qualified) (str (name qualified) "-impl"))]))
+                              [#'sin #'custom-sine]))
+        emitted (java.util.IdentityHashMap.)
+        projected (atom [])
+        ;; Deny ordinary inlining only: every source/Method/operand proof stays
+        ;; real. This tests the numerical projection even with the old inliner.
+        source (with-redefs-fn
+                 {#'inline/try-resolve-deftm
+                  (fn [callee & arguments]
+                    (when-not (contains? retained callee) (apply ordinary-inline callee arguments)))
+                  #'source-import/prepare-contextual-source-witness
+                  (fn [candidate options]
+                    (.put emitted candidate (inc (or (.get emitted candidate) 0)))
+                    (prepare candidate options))
+                  #'source-import/project-direct-double-map-results
+                  (fn [witness]
+                    (let [result (project witness)]
+                      (when result (swap! projected conj (count (:applications result))))
+                      result))}
+                 #(compiled-source #'two-direct-helper-maps!))]
+    (is (= [2] @projected) "both maps are projected together, not by per-call source emission")
+    (is (pos? (.size emitted)))
+    (is (every? #(= 1 %) (.values emitted)) "each exact candidate is emitted at most once in the attempt")
+    (is (not (re-find #"\bsin\(" source)))
+    (is (re-find #"\+ 100\.0" source))))
 
 (deftest qualified-identity-is-not-a-basename-contract
   (doseq [identity '[user.helpers/sin user.helpers/sin_m_double-impl

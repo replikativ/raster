@@ -904,7 +904,8 @@
         (binding-completion/capture-resolution-context policy)))))
 
 (defn- contextual-reduction-constructor
-  "One request-local witness per exact current source candidate, not per binding."
+  "One attempt-local owner service shared by map projection and reductions.
+   Each exact current source candidate has at most one witness, not one per call."
   [opts]
   (let [owners (java.util.IdentityHashMap.)
         original (volatile! nil)
@@ -930,7 +931,17 @@
                        (.put owners source created)
                        created)))]
     (fn [{:keys [kind source ordinal binder expression accept?]}]
-      (if (= kind :terminal-float-publication)
+      (cond
+        (= kind :direct-double-map-payloads)
+        (when (and (source-import/direct-double-map-helper-candidate? source)
+                   (dtype/known? (:dtype opts)) (= :double (dtype/canon (:dtype opts))))
+          (let [owner (try (owner! source)
+                           (catch clojure.lang.ExceptionInfo error
+                             (if (= :contextual-source-witness-entry (:reason (ex-data error)))
+                               nil (throw error))))]
+            (when owner (source-import/project-direct-double-map-results owner))))
+
+        (= kind :terminal-float-publication)
         (when (source-import/terminal-float-publication-candidate? source)
           (me/call-with-optional-definition-inputs
            (fn []
@@ -946,6 +957,8 @@
                                             nil (throw error))))]
                    (when publication
                      (source-import/construct-terminal-float-publication publication))))))))
+
+        :else
         (let [owner (owner! source)]
         (if (= kind :reference-provenance)
           (source-import/observe-reference-provenance! owner ordinal binder expression accept?)
@@ -958,13 +971,7 @@
    coverage decline preserves the original source and remains visible beside any later TypedSOAC
    decline; certified contradictions are never converted into fallback."
   [source opts abstract-machine]
-  (let [;; Late buffer/representation rewrites can introduce whole sequential
-        ;; wrappers after expansion. Normalize those once at shared semantic
-        ;; admission, without moving work out of calls or vector operands.
-        source (if (device/gpu-target? (:target-device opts))
-                 (inline/flatten-nested-lets source)
-                 source)
-        binding-context (source-binding-resolution-context source)
+  (let [binding-context (source-binding-resolution-context source)
         ;; A public array's backing capacity is independent of each traversal.
         ;; Semantic owners must prove their logical access footprint separately.
         values (merge (when (device/gpu-target? (:target-device opts))
@@ -1024,11 +1031,19 @@
 
 (defn- semantic-program-attempt
   [source opts abstract-machine]
-  (if (and (device/gpu-target? (:target-device opts)) (var? (:source-var opts)))
-    (typed-soac-frontend/call-with-contextual-reduction-constructor
-     (contextual-reduction-constructor opts)
-     #(semantic-program-attempt* source opts abstract-machine))
-    (semantic-program-attempt* source opts abstract-machine)))
+  ;; Normalize exactly once BEFORE either owner sees the candidate. Rebuilding
+  ;; again inside admission would defeat the shared identity-keyed witness.
+  (let [source (if (device/gpu-target? (:target-device opts))
+                 (inline/flatten-nested-lets source) source)]
+   (if (and (device/gpu-target? (:target-device opts)) (var? (:source-var opts)))
+    (let [construct (contextual-reduction-constructor opts)
+          projection (construct {:kind :direct-double-map-payloads :source source})
+          source (or (:form projection) source)]
+      (typed-soac-frontend/call-with-contextual-reduction-constructor
+       construct
+       #(cond-> (semantic-program-attempt* source opts abstract-machine)
+          projection (assoc-in [:stats :owned-map-payloads] (count (:applications projection))))))
+    (semantic-program-attempt* source opts abstract-machine))))
 
 (defn- unfused-compatibility
   "Keep unsupported source byte-for-byte while exposing why no certified fusion ran."

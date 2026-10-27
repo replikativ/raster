@@ -6,6 +6,8 @@
             [raster.compiler.core.types :as types]
             [raster.compiler.core.method-entry :as entry]
             [raster.compiler.core.op-descriptor :as descriptor]
+            [raster.compiler.ir.semantic-fingerprint :as semantic]
+            [raster.compiler.pipeline :as pipeline]
             [raster.compiler.backend.jvm.bytecode :as bytecode]
             [raster.compiler.passes.parallel.scalar-expression-body :as scalar]
             [raster.compiler.passes.scalar.source-import :as source-import]))
@@ -48,6 +50,98 @@
 
 (defn- domain-recipe [call]
   (entry/call-with-definition-inputs #(scalar/checked-selected-fp-domain-recipe call)))
+
+(deftest unsupported-map-owners-do-not-request-a-current-source-witness
+  (let [call (with-meta '(.invk example/helper_m_double-impl (clojure.core/aget input i))
+               {:raster.op/original 'example/helper})
+        map-form (list 'raster.par/map! 'output 'i 'n 'double call)
+        wrap #(list 'let* ['result %] 'result)
+        attempts (atom 0)
+        construct (#'pipeline/contextual-reduction-constructor
+                   {:dtype :double :source-var #'n/+})]
+    (is (source-import/direct-double-map-helper-candidate? (wrap map-form)))
+    (with-redefs [source-import/prepare-contextual-source-witness
+                  (fn [& _] (swap! attempts inc) (throw (AssertionError. "unsupported owner emitted source")))
+                  core/prepare-owned-source-frontend!
+                  (fn [& _] (throw (AssertionError. "unsupported owner prepared an entry")))]
+      (doseq [source [(wrap (list 'quote map-form))
+                      (wrap (list 'fn* [] map-form))
+                      (wrap (list 'loop* ['iteration 0] map-form))
+                      (wrap (list 'if true map-form nil))
+                      (wrap (list 'raster.par/map! 'output 'j 'n 'float map-form))
+                      (wrap (list 'raster.par/map! 'output 'i 'n 'float call))]]
+        (is (nil? (construct {:kind :direct-double-map-payloads :source source}))))
+      (is (zero? @attempts)))))
+
+(defn- contextual-map-fixture! [body]
+  (let [{:keys [scope receiver] :as fixture}
+        (fixture! "raster.direct-map-payload." body 'Double 'sin)]
+    (binding [*ns* scope]
+      (eval '(raster.core/deftm mapped-sin
+               [input :- (Array double) unused :- (Array double)
+                output :- (Array double) n :- Long] :- (Array double)
+               (raster.par/map! output i n double
+                 (sin (clojure.core/aget input i) (clojure.core/aget unused i))))))
+    (core/ensure-current-owned-bytecode! receiver)
+    (let [source (core/resolve-deftm-var (ns-resolve scope 'mapped-sin))]
+      (entry/call-with-definition-inputs #(core/prepare-owned-source-frontend! source))
+      (assoc fixture :caller source))))
+
+(defn- invoke-contextual-source [witness arguments]
+  (try
+    (.invoke ^java.lang.reflect.Method (:method witness) nil (object-array arguments))
+    (catch java.lang.reflect.InvocationTargetException failure (throw (.getCause failure)))))
+
+(deftest direct-map-payload-source-keeps-unused-input-and-duplicate-formal-uses
+  (let [{:keys [scope caller]} (contextual-map-fixture! '(clojure.core/+ x x))]
+    (try
+      (entry/call-with-definition-inputs
+       (fn []
+         (let [frontend (entry/original-source-frontend caller)
+               source (list 'let* ['mapped (first (:body frontend))] 'mapped)
+               parameters (:raster.core/deftm-params (meta caller))
+               options {:source-var caller :source-ns scope
+                        :lexical-inputs parameters :public-parameters parameters}
+               original (source-import/prepare-contextual-source-witness source options)
+               projection (source-import/project-direct-double-map-results original)
+               rewritten (:form projection)
+               map-form (second (second rewritten))
+               lambda (nth map-form 5 nil)]
+           (is (= 1 (count (:applications projection))))
+           (is (= 'let* (first lambda)))
+           (is (= 4 (count (second lambda))) "both actual arguments receive an ordered slot")
+           (is (string? (semantic/fingerprint rewritten))
+               "portable source contains no borrowed JVM occurrence tokens or receipts")
+           (is (= 2 (count (descriptor/aget-reads lambda)))
+               "duplicate formal uses do not duplicate a read; unused arguments keep their read")
+           (let [compiled (source-import/prepare-contextual-source-witness rewritten options)]
+             (doseq [witness [original compiled]]
+               (let [output (double-array 1)]
+                 (invoke-contextual-source witness [(double-array [3.0]) (double-array [7.0]) output 1])
+                 (is (= [6.0] (vec output))))
+               (is (thrown? NullPointerException
+                            (invoke-contextual-source witness [(double-array [3.0]) nil (double-array 1) 1]))
+                   "an unused second argument is still evaluated")
+               (let [output (double-array [11.0])]
+                 (invoke-contextual-source witness [nil nil output 0])
+                 (is (= [11.0] (vec output)) "operand evaluation stays inside the map loop")))))))
+      (finally (remove-ns (ns-name scope))))))
+
+(deftest lexical-helper-payload-is-not-silently-stripped-of-owned-binding-context
+  (let [{:keys [scope caller]}
+        (contextual-map-fixture! '(let* [copied (clojure.core/double x)] (clojure.core/+ copied 100.0)))]
+    (try
+      (entry/call-with-definition-inputs
+       (fn []
+         (let [frontend (entry/original-source-frontend caller)
+               source (list 'let* ['mapped (first (:body frontend))] 'mapped)
+               parameters (:raster.core/deftm-params (meta caller))
+               witness (source-import/prepare-contextual-source-witness
+                        source {:source-var caller :source-ns scope :lexical-inputs parameters
+                                :public-parameters parameters})]
+           (is (nil? (source-import/project-direct-double-map-results witness))
+               "let/completion payloads remain unsupported rather than losing their context"))))
+      (finally (remove-ns (ns-name scope))))))
 
 (deftest helper-input-slots-cannot-capture-caller-or-callee-identifiers
   ;; This private AST utility issues no receipt. Force collisions directly so

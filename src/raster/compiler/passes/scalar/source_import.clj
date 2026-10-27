@@ -3,6 +3,8 @@
    Receipts, original JVM return recipes and unresolved source completions stay
    outside the portable numerical frontend and its TypedSOAC programs."
   (:require [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.backend.intrinsics :as intrinsics]
+            [raster.compiler.core.intrinsic-source :as intrinsic-source]
             [raster.compiler.core.inference :as inference]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.inline-call-plan :as call-plan]
@@ -1140,7 +1142,7 @@
                      :dependencies @method-entry/*emission-inputs*}]
     {:expression (list 'let* (into (vec (mapcat identity argument-bindings)) body-bindings) result)
      :binding-facts binding-facts :argument-bindings argument-bindings
-     :result-form result :application application}))
+     :result-form result :payload-expression instantiated :application application}))
 
 (defn- construct-emitted-helper
   [expression locals context capture! consume-terminal-reduction terminal-only?]
@@ -1341,21 +1343,23 @@
      #(construct-static-helper candidate occurrence source-options))))
 
 (defn- assert-helper-occurrence-current!
-  [frontend emission input-body original record]
-  (method-entry/assert-frontend-source! frontend (get-in frontend [:source-entry :source-var]))
+  ([emission input-body original record]
   ;; This is the module authenticated BEFORE receipt issuance. Its original
   ;; history/physical-selection guards are already retained; never reenter a
   ;; collecting frontend query from the enclosing receipt's reuse guard.
   (method-entry/assert-emission-inputs-current! emission)
   (let [current ((helper-backend 'retained-input-invocation-context)
                  emission input-body original)]
-    (when-not (and (identical? emission (:emission frontend))
-                   (identical? input-body (:body frontend))
-                   (identical? original (:source-input current))
+    (when-not (and (identical? original (:source-input current))
                    (every? #(identical? (get record %) (get current %))
                            [:expression :method :receiver :inputs :input-completions]))
       (fail! :helper-application-occurrence
              "helper application lost its exact original emitted occurrence" {}))))
+  ([frontend emission input-body original record]
+   (method-entry/assert-frontend-source! frontend (get-in frontend [:source-entry :source-var]))
+   (when-not (and (identical? emission (:emission frontend)) (identical? input-body (:body frontend)))
+     (fail! :helper-application-occurrence "helper application lost its original caller" {}))
+   (assert-helper-occurrence-current! emission input-body original record)))
 
 (defn- owned-occurrence-typed-call [original record]
   ;; The emitter may desugar the actual expression to (. receiver invk ...).
@@ -1373,9 +1377,10 @@
       (with-meta (list* '.invk receiver (mapv :operand inputs))
         {:raster.op/original semantic-op}))))
 
-(defn- construct-owned-helper-occurrence [caller input-body original]
-  (let [caller-emission (method-entry/observed-frontend-emission caller)]
-    (when (and caller-emission (identical? input-body (:body caller)))
+(defn- construct-helper-occurrence
+  [caller-emission input-body original source-ns policy owner-fields owner-guard]
+  (owner-guard)
+  (when caller-emission
       (when-let [record ((helper-backend 'retained-input-invocation-context)
                         caller-emission input-body original)]
         (when (and (= :known (:status record))
@@ -1401,10 +1406,10 @@
             (when (and frontend emission (identical? emission (:emission frontend))
                        (= method (:invocation-method bridge)) saved
                        (not (:unretained-sibling-calls? saved))
-                       (= (get-in caller [:source-entry :source-policy])
+                       (= policy
                           (get-in frontend [:source-entry :source-policy])))
               (let [{:keys [body binding-facts]}
-                    (qualified-helper-body emission (get-in caller [:source-entry :source-ns]))
+                    (qualified-helper-body emission source-ns)
                     body (if (= 1 (count body)) (first body) (list* 'do body))
                     inputs (mapv (fn [input completed carrier]
                                    (assoc input :completion completed
@@ -1424,14 +1429,26 @@
                     ;; erasure remain separate obligations of a future consumer.
                     projection (assoc recipe :arguments values
                                       :formal-input-values (zipmap (:parameters recipe) values))
-                    artifact (update artifact :application assoc
-                                     :numerical-projection projection :caller-frontend caller
+                    artifact (update artifact :application merge
+                                     owner-fields {:numerical-projection projection
                                      :caller-input-body input-body :original-call original
                                      :physical-call record :derived-call typed-call
-                                     :input-ports (mapv :ports (:inputs record)))]
+                                     :input-ports (mapv :ports (:inputs record))})]
                 (retain-owned-import!
                  artifact frontend
-                 #(assert-helper-occurrence-current! caller caller-emission input-body original record))))))))))
+                 #(do (owner-guard)
+                      (assert-helper-occurrence-current! caller-emission input-body original record))))))))))
+
+(defn- construct-owned-helper-occurrence [caller input-body original]
+  (when-let [emission (method-entry/observed-frontend-emission caller)]
+    (when (identical? input-body (:body caller))
+      (construct-helper-occurrence
+       emission input-body original (get-in caller [:source-entry :source-ns])
+       (get-in caller [:source-entry :source-policy]) {:caller-frontend caller}
+       #(do (method-entry/assert-frontend-source! caller (get-in caller [:source-entry :source-var]))
+            (method-entry/assert-emission-inputs-current! emission))))))
+
+
 
 (defn ^:no-doc instantiate-owned-helper-occurrence
   "Construct an emitted fragment from one exact original caller occurrence.
@@ -1442,3 +1459,154 @@
   (when method-entry/*emission-inputs*
     (method-entry/call-with-independent-definition-inputs
      #(construct-owned-helper-occurrence caller-frontend exact-input-body original-call))))
+
+(defn ^:no-doc instantiate-contextual-helper-occurrence
+  "Derive one current-source application from its existing explicit emission owner.
+   This query validates that owner; it never creates a witness or prepares code."
+  [witness original-call]
+  (when method-entry/*emission-inputs*
+    (method-entry/call-with-independent-definition-inputs
+     #(do (validate-contextual-source-witness! witness)
+          (construct-helper-occurrence
+           (:emission witness) (:input-body witness) original-call
+           (:source-ns witness) (:source-policy witness) {:caller-witness witness}
+           (fn [] (validate-contextual-source-witness! witness)))))))
+
+(defn- direct-double-map-helper? [node]
+  (when (and (par/par-map-form? node) (= 6 (count node)))
+    (let [{:keys [cast body]} (par/extract-par-map-info node)
+          {:keys [dispatch? semantic-op lexical-callee]} (descriptor/call-description body)]
+      (and (contains? '#{double clojure.core/double} cast)
+           dispatch? (not lexical-callee)
+           (not (some-> semantic-op intrinsics/canonical intrinsics/descriptor))))))
+
+(defn ^:no-doc direct-double-map-helper-candidate?
+  "Cheap syntax-only routing. No source query, emission, or admission is done."
+  [source]
+  (letfn [(candidate? [node]
+            (cond
+              (and (seq? node) (contains? '#{quote clojure.core/quote} (first node))) false
+              (direct-double-map-helper? node) true
+              (par/par-map-form? node) false
+              (and (seq? node) (= 'let* (first node)) (vector? (second node)))
+              (boolean (or (some #(candidate? (second %)) (partition 2 (second node)))
+                           (some candidate? (nnext node))))
+              (and (seq? node) (= 'do (first node))) (boolean (some candidate? (rest node)))
+              :else false))]
+    (and (seq? source) (= 'let* (first source)) (vector? (second source)) (candidate? source))))
+
+(defn- double-array-carrier? [carrier]
+  (and (class? carrier) (.isArray ^Class carrier)
+       (identical? Double/TYPE (.getComponentType ^Class carrier))))
+
+(defn- unanchored-numerical-payload? [expression slots]
+  ;; Imported lexical context/completion anchors are not a numerical-source
+  ;; projection. Leave let/control/Java and unknown grammar to a later owner.
+  (cond
+    (symbol? expression) (contains? slots expression)
+    (number? expression) true
+    (seq? expression)
+    (let [operation (first expression)]
+      (and (symbol? operation) (= "clojure.core" (namespace operation))
+           (not (completion/canonical-form? expression))
+           (or (descriptor/cast-op? operation) (descriptor/scalar-op? operation))
+           (every? #(unanchored-numerical-payload? % slots) (rest expression))))
+    :else false))
+
+(defn- direct-map-source-argument?
+  [edge index available-parameters]
+  (let [{:keys [source input array-read]} edge
+        arguments (when (descriptor/aget-call? source) (descriptor/call-args source))
+        [sym idx] arguments]
+    (or (and (number? source) (identical? source (:operand input))
+             (= :double (types/numeric-literal-carrier source)))
+        (and (= 2 (count arguments)) (symbol? sym) (= idx index)
+             (double-array-carrier? (get available-parameters sym))
+             array-read (= :double (:result-type array-read))
+             (= sym (:array array-read))
+             (= index (get-in array-read [:input :operand]))
+             (contains? #{:int :long} (get-in array-read [:input :type]))))))
+
+(defn- project-direct-double-map-result
+  [witness node available-parameters lexical]
+  (when (direct-double-map-helper? node)
+    (let [{:keys [out idx cast body]} (par/extract-par-map-info node)
+          source-ns (:source-ns witness)
+          context {:source-ns source-ns :pending-source? false
+                   :dependency-snapshots (get-in witness [:emission :dependency-snapshots])}]
+      (when (and (symbol? idx) (not (contains? available-parameters idx))
+                 (double-array-carrier? (get available-parameters out))
+                 (= 'clojure.core/double (method-entry/observed-body-operation context cast (conj lexical idx)))
+                 (intrinsic-source/observe-original! source-ns 'clojure.core/double))
+        (when-let [application (instantiate-contextual-helper-occurrence witness body)]
+          (validate-helper-application! application)
+          (let [projection (:application application)
+                record (:physical-call projection)
+                numerical (:numerical-projection projection)
+                slots (:input-slots projection)
+                values (mapv :value slots)
+                edges ((helper-backend 'retained-input-invocation-operands)
+                       (:emission witness) (:input-body witness) body)
+                expression (:payload-expression application)]
+            (when (and (identical? Double/TYPE (:payload-carrier numerical))
+                       (= :double (get-in numerical [:bridge :body-context :emitted-result-type]))
+                       (= (count edges) (count slots)) (every? some? edges)
+                       (every? #(and (identical? Double/TYPE (:parameter-carrier %))
+                                     (= :double (:emitted-type %)) (= :identity (:adaptation %)))
+                               (:input-completions record))
+                       (every? #(direct-map-source-argument? % idx (dissoc available-parameters idx)) edges)
+                       (unanchored-numerical-payload? expression (set values)))
+              (let [bindings (vec (mapcat (fn [value edge]
+                                           [(vary-meta value assoc :raster.type/tag 'double
+                                                       :raster.effect/effectful true)
+                                            (if (instance? clojure.lang.IObj (:source edge))
+                                              (vary-meta (:source edge) assoc :raster.effect/preserve-evaluation true)
+                                              (:source edge))]) values edges))
+                    result (list 'let* bindings expression)
+                    ;; The original payload stays owned by its receipt. Only
+                    ;; this newly proved numerical source loses the emitter's
+                    ;; private occurrence tokens before portable admission.
+                    mapped ((helper-backend 'detach-emission-occurrences)
+                            (util/remake-from node (concat (take 5 node) [result])))]
+                {:form mapped :application application}))))))))
+
+(defn ^:no-doc project-direct-double-map-results
+  "Construct ordinary numerical source only for direct, use-closed Double map sinks.
+   Uses an existing exact-candidate emission owner; all argument-origin and
+   identity conversions remain checked. Receipts never enter the portable IR."
+  [witness]
+  (method-entry/call-with-independent-definition-inputs
+   (fn []
+     (validate-contextual-source-witness! witness)
+     (let [applications (volatile! [])
+           parameters (zipmap (:parameters witness) (:parameter-carriers witness))]
+       (letfn [(walk [node available lexical]
+                 (cond
+                   (and (seq? node) (contains? '#{quote clojure.core/quote} (first node))) node
+                   (and (seq? node) (= 'let* (first node)) (vector? (second node)))
+                   (let [[pairs available lexical]
+                         (reduce (fn [[pairs available lexical] [id initializer]]
+                                   [(conj pairs [id (walk initializer available lexical)])
+                                    (dissoc available id) (conj lexical id)])
+                                 [[] available lexical] (partition 2 (second node)))]
+                     (util/remake-from node (list* (first node) (vec (mapcat identity pairs))
+                                                  (mapv #(walk % available lexical) (nnext node)))))
+                   (par/par-map-form? node)
+                   (if-let [projected (try (project-direct-double-map-result witness node available lexical)
+                                          (catch clojure.lang.ExceptionInfo error
+                                            (if (= :generated-body-unsupported (:reason (ex-data error)))
+                                              nil (throw error))))]
+                     (do (vswap! applications conj (:application projected)) (:form projected))
+                     node)
+                   ;; Unknown lexical/control owners are not traversed: a
+                   ;; surrounding branch/fn/loop must supply its own contract.
+                   (and (seq? node) (= 'do (first node)))
+                   (util/remake-if-changed node (into [(first node)] (map #(walk % available lexical) (rest node))))
+                   :else node))]
+         (let [source (:scope witness)
+               result (walk source parameters (set (keys parameters)))]
+           (when (seq @applications)
+             (retain-owned-artifact!
+              {:scope source :form result :applications @applications}
+              #(do (validate-contextual-source-witness! witness)
+                   (doseq [application @applications] (validate-helper-application! application)))))))))))

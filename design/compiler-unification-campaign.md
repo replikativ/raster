@@ -7452,6 +7452,32 @@ inliner. This qualifies the producer and its refusal controls only. Transport
 through source construction and the primitive map-result consumer are the next
 required steps; no general box erasure or GPU execution is granted by this receipt.
 
+A bounded consumer now constructs ordinary numerical source before TypedSOAC
+for a helper used as the whole result of a standard Double map. It authenticates
+the current candidate through the existing contextual witness and joins each
+source argument to its actual positional input by InputOrigins. Only identity
+Double completions and the actual Double body/return bridge are admitted;
+declared dtypes alone do not prove this. All arguments, including unused ones,
+stay inside the map and evaluate once in order. Only the newly proved numerical
+source is detached from private JVM occurrence tokens; the original owned
+application remains intact and portable fingerprint validation is unchanged.
+
+The witness service is shared with contextual reductions and emits once per
+exact candidate **within one semantic-admission attempt**. It is not yet a
+whole-compilation or persistent analysis cache. Unsupported lexical owners do
+not request a witness. Float/narrowing, arbitrary Object uses, and helper bodies
+whose binding contexts cannot be projected remain explicit limitations.
+
+The committed-inliner consumer gate passes 36 tests / 483 assertions. Its real
+OpenCL and Level Zero regression includes precision-sensitive Double values,
+changed-input replay, host immutability, no acquisition during lowering and
+wrapper invalidation. The test denies optional ordinary helper inlining and
+asserts that real owned projection occurred, so an inliner-only path cannot
+silently satisfy it; no positive source/Method/operand fact is mocked. The
+separate cold-helper device gate passes 20 assertions without explicit helper
+warmup. These scoped results do not qualify the unfinished global inliner
+migration, all distributed consumers, or performance competitiveness.
+
 ### Compilation-latency follow-up: closed analysis results, not wider memoization
 
 The local JAX/MLIR review reinforces the existing ownership boundary. JAX's

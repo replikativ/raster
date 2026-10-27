@@ -4,7 +4,9 @@
             [raster.arrays :as arrays]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.soac-dialect :as dialect]
-            [raster.core :refer [deftm]]
+            [raster.core :as core :refer [deftm]]
+            [raster.compiler.passes.scalar.inline :as inline]
+            [raster.compiler.passes.scalar.source-import :as source-import]
             [raster.dl.gpu-grad-parity :as ze]
             [raster.gpu.compiled :as compiled]
             [raster.gpu.core :as gpu]
@@ -27,6 +29,13 @@
   (let [out (float-array 1)]
     (par/map-void! i 1 (arrays/aset out i completed))
     (arrays/aget out 0)))
+
+(deftm direct-map-helper-shift [input :- Double] :- Double
+  (clojure.core/+ input 100.0))
+
+(deftm direct-map-helper-result!
+  [input :- (Array double) output :- (Array double) cnt :- Long] :- (Array double)
+  (par/map! output i cnt double (direct-map-helper-shift (aget input i))))
 
 (def ^:private samples
   [(float-array [1.2345679])
@@ -147,6 +156,65 @@
   (if @ze/gpu-available?
     (check-device! :ze:0)
     (ze/gpu-skip! "direct Double scalar result")))
+
+(defn- check-direct-map-helper-body! [target projected]
+  (let [initial (double-array [0.5 -1.0 0.0 2.0])
+        changed (double-array [16777217.0 1.0e-12 -100.00000000001 Math/PI])
+        output (double-array 4)
+        ;; No explicit helper warmup: ordinary owning orchestration must close
+        ;; the original source before creating the current-candidate witness.
+        prepared (with-redefs [gpu/make-session (fn [& _] (throw (AssertionError. "lower opened a session")))
+                               gpu/alloc! (fn [& _] (throw (AssertionError. "lower allocated")))
+                               link/instantiate! (fn [& _] (throw (AssertionError. "lower instantiated")))]
+                   (compiled/lower #'direct-map-helper-result! [initial output (long 4)]
+                                   {:compiler :equation-first :target target :dtype :double}))
+        artifact (compiled/instantiate! prepared)
+        previous (atom nil)]
+    (try
+      (is (= :none (get-in prepared [:schedule :stats :fallback])))
+      (is (pos? @projected) "this exercises owned numerical projection, not ordinary helper inlining")
+      (doseq [[input overrides] [[initial {}] [changed {:input changed}]]]
+        (let [result (:result (artifact overrides))]
+          (is (= (mapv #(+ 100.0 %) input) (vec (value/->host result))))
+          (is (value/live? result))
+          (when @previous (is (not (value/live? @previous))))
+          (reset! previous result)))
+      (is (= [0.5 -1.0 0.0 2.0] (vec initial)))
+      (is (= [16777217.0 1.0e-12 -100.00000000001 Math/PI] (vec changed)))
+      (is (= [0.0 0.0 0.0 0.0] (vec output)))
+      (compiled/close! artifact)
+      (is (not (value/live? @previous)))
+      (finally (compiled/close! artifact)))))
+
+(defn- check-direct-map-helper! [target]
+  (let [helper (core/resolve-deftm-var #'direct-map-helper-shift)
+        qualified (symbol (str (.ns ^clojure.lang.Var helper)) (str (:name (meta helper))))
+        retained #{'raster.gpu.public-device-scalar-result-test/direct-map-helper-shift
+                   qualified (symbol (namespace qualified) (str (name qualified) "-impl"))}
+        ordinary-inline @#'inline/try-resolve-deftm
+        project source-import/project-direct-double-map-results
+        projected (atom 0)]
+    ;; Deny only an optional optimization. All selected source, Method, argument
+    ;; and module evidence stays real; no positive compiler fact is fabricated.
+    ;; Keep the policy installed through execution so retained guards stay valid.
+    (with-redefs-fn
+      {#'inline/try-resolve-deftm
+       (fn [callee & arguments]
+         (when-not (contains? retained callee) (apply ordinary-inline callee arguments)))
+       #'source-import/project-direct-double-map-results
+       (fn [witness]
+         (let [result (project witness)]
+           (when result (swap! projected + (count (:applications result))))
+           result))}
+      #(check-direct-map-helper-body! target projected))))
+
+(deftest direct-map-helper-replays-on-both-local-backends
+  (if @opencl/opencl-fp64-available?
+    (check-direct-map-helper! :ocl:0)
+    (opencl/opencl-skip! "direct Double helper map" :fp64))
+  (if @ze/gpu-available?
+    (check-direct-map-helper! :ze:0)
+    (ze/gpu-skip! "direct Double helper map")))
 
 (defn- check-completed-float! [target]
   ;; This is an already completed source scalar. It does not claim to qualify
