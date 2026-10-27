@@ -200,12 +200,14 @@
          (is (string? (compiled-source #'sin-map!)))
          (is (ifn? (pipeline/compile-aot #'sin-map! :dtype :double)))
          (is (map? (pipeline/compile-gpu-program
-                    #'sin-map! :ocl:0 :dtype :double :on-non-resident :throw)))))
+                    #'sin-map! :ocl:0 :dtype :double :on-non-resident :throw)))
+         (is (map? (pipeline/show-pipeline #'sin-map! :dtype :double :simd? false)))))
     (is (= [[#'sin-map! :double nil]
+            [#'sin-map! :double nil]
             [#'sin-map! :double nil]
             [#'sin-map! :double nil]]
            @calls)
-        "session, AOT, and resident construction all prepare before their outer owner")))
+        "session, AOT, resident, and diagnostic roots all prepare before their outer owner")))
 
 (deftest own-namespaced-helper-does-not-acquire-sine-semantics
   (doseq [operation [#'sin-map! #'control-map!]]

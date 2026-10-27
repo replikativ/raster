@@ -2946,44 +2946,36 @@
                    simd? target-device dtype preserve-declared-array-storage? values]
             :or {mode :forward
                  simd? true}}]
-  (let [inline? (if (nil? inline?) true inline?)
-        params (get-params f-var dtype)
-        active-params (clean-params params)
-        walked-body (get-walked-body f-var dtype)
-        raw-form (if (= 1 (count walked-body))
-                   (first walked-body)
-                   (list* 'do walked-body))
-        passes forward-passes
-        resolved-var (or (resolve-deftm-var f-var dtype) f-var)
-        effective-dtype (or dtype (infer-dtype resolved-var)
-                            ;; Scalar-only functions default to double precision
-                            :double)
-        source-ns (let [m (meta resolved-var)]
-                    (or (when-let [s (:raster.core/deftm-source-ns m)]
-                          (try (the-ns s) (catch Exception _ nil)))
-                        (when (var? resolved-var) (.ns ^clojure.lang.Var resolved-var))))
-        param-env (build-param-env f-var dtype)
-        ;; Declared parameter types are middle-end facts, not GPU-emitter hints.  Production
-        ;; compilation supplies them for every backend; diagnostics must do the same or a
-        ;; target-free `show-pipeline` can misclassify proven identity casts as throwing.
-        parameter-types (opencl-pass/derive-param-types
-                         (:raster.core/deftm-params (meta resolved-var))
-                         (:raster.core/deftm-tags (meta resolved-var))
-                         effective-dtype
-                         {:preserve-declared-array-storage? preserve-declared-array-storage?})
-        opts (cond-> {:inline? inline?
-                      :diagnostic? true
-                      :values values
-                      :active-params active-params
-                      :simd? simd? :target-device target-device
-                      :dtype effective-dtype
-                      :preserve-declared-array-storage? preserve-declared-array-storage?}
-               param-env (assoc :param-env param-env)
-               source-ns (assoc :source-ns source-ns)
-               parameter-types (assoc :scalar-types (:scalar-types parameter-types)
-                                      :array-types (:array-types parameter-types)))
-        diagnostic (run-passes-diagnostic raw-form passes opts)]
-    (diagnostic->pipeline-map raw-form (if simd? :simd :scalar) diagnostic)))
+  (call-with-deftm-source-inputs
+   f-var dtype
+   (fn [{:keys [resolved-var parameters param-env effective-dtype source-ns]}]
+     (let [inline? (if (nil? inline?) true inline?)
+           walked-body (get-walked-body resolved-var dtype)
+           raw-form (if (= 1 (count walked-body))
+                      (first walked-body)
+                      (list* 'do walked-body))
+           passes forward-passes
+           ;; Declared parameter types are middle-end facts, not GPU-emitter hints.  Production
+           ;; compilation supplies them for every backend; diagnostics must do the same or a
+           ;; target-free `show-pipeline` can misclassify proven identity casts as throwing.
+           parameter-types (opencl-pass/derive-param-types
+                            (:raster.core/deftm-params (meta resolved-var))
+                            (:raster.core/deftm-tags (meta resolved-var))
+                            effective-dtype
+                            {:preserve-declared-array-storage? preserve-declared-array-storage?})
+           opts (cond-> {:inline? inline?
+                         :diagnostic? true
+                         :values values
+                         :active-params parameters
+                         :simd? simd? :target-device target-device
+                         :dtype effective-dtype
+                         :preserve-declared-array-storage? preserve-declared-array-storage?}
+                  param-env (assoc :param-env param-env)
+                  source-ns (assoc :source-ns source-ns)
+                  parameter-types (assoc :scalar-types (:scalar-types parameter-types)
+                                         :array-types (:array-types parameter-types)))
+           diagnostic (run-passes-diagnostic raw-form passes opts)]
+       (diagnostic->pipeline-map raw-form (if simd? :simd :scalar) diagnostic)))))
 
 (defn compile-report
   "Compile once through the diagnostic pipeline and return its normalized compatibility report.
