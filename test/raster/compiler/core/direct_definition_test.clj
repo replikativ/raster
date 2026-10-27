@@ -11,11 +11,15 @@
     (try
       (binding [*ns* scope]
         (refer 'clojure.core)
-        (eval '(raster.core/deftm fresh [input :- (Array float)] :- (Array float)
-                 (clojure.core/float-array (clojure.core/alength input))))
+        ;; Array-only declarations now deliberately select the typed producer.
+        ;; This namespace exercises the distinct real plain-entry contract, so
+        ;; keep its declaration Object-only while retaining the actual array
+        ;; constructor whose normal-return fact is checked below.
+        (eval '(raster.core/deftm fresh [input :- Object] :- Object
+                 (clojure.core/float-array (clojure.core/alength ^floats input))))
         (let [operation (symbol (str (ns-name scope)) "fresh")
               generic (ns-resolve scope 'fresh)
-              signature (inference/registered-call-signature operation '[floats])
+              signature (inference/registered-call-signature operation '[Object])
               implementation (:mangled-sym signature)
               query #(entry/direct-selected-definition operation implementation 1)]
           (check {:scope scope :operation operation :generic generic
@@ -28,7 +32,7 @@
       (let [definition (query)]
         (is (map? definition))
         (is (nil? (get-in definition [:entry :typed-impl])))
-        (is (= '[floats] (:tags definition)))
+        (is (= '[Object] (:tags definition)))
         (is (= {:presence :present :array-tag 'floats}
                (binding [entry/*emission-inputs* (atom {:static [] :values []})]
                  (normal/result-fact (list implementation 'input)))))))))
@@ -57,9 +61,9 @@
         (dispatch/set-reducible! generic)
         (is (not (identical? original @generic)))
         (is (map? (query))))
-      (core/prefer-method! generic '[floats] '[Object])
+      (core/prefer-method! generic '[Object] '[floats])
       (is (map? (query)))
-      (core/remove-method! generic '[floats])
+      (core/remove-method! generic '[Object])
       (is (nil? (query))))))
 
 (deftest copied-namespace-metadata-cannot-publish-a-new-var

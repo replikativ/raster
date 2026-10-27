@@ -1527,6 +1527,17 @@
                            :source source :mode mode})))
         (throw failure)))))
 
+(defn ^:no-doc demand-selected-source-preparation-if-owned!
+  "Optional semantic analysis may request work only from an actual outer
+   prerequisite owner. An isolated collector is not permission to prepare code;
+   absent that scope, leave the optional fact unavailable."
+  [mode operation implementation-op argument-count source-var]
+  (when (and *emission-inputs*
+             (instance? clojure.lang.IAtom *source-prerequisite-scope*))
+    (when-let [request (selected-source-preparation-request
+                       mode operation implementation-op argument-count source-var)]
+      (demand-selected-source-preparation! request))))
+
 (defn- fulfill-source-prerequisite! [scope failure]
   (when-not (pending-source-prerequisite? scope failure)
     (throw failure))
@@ -1599,6 +1610,35 @@
   (when-let [{:keys [operation implementation-op arity]}
              (source-var-selection-request source-var)]
     (selected-source-entry-carriers operation implementation-op arity source-var)))
+
+(defn observed-generic-source-definition
+  "Join a generic dispatch's actual source callable to its registered typed
+   entry, if any. The direct query first owns dispatcher/root/table and requires
+   target-fn and typed-target-fn to be the SAME callable. Only then may the
+   live selected-entry query identifies its receiver; names discover work,
+   never establish this routing relation. Consumers must still authenticate the
+   original semantic frontend. No physical carrier, overload or argument facts
+   follow, and this semantic query must not pin a replaceable JIT receiver."
+  [operation source-var argument-count]
+  (when (and *emission-inputs* (var? source-var))
+    (let [source-op (symbol (str (ns-name (.ns ^clojure.lang.Var source-var)))
+                            (str (.sym ^clojure.lang.Var source-var)))]
+      (when-let [direct (observed-selected-definition :direct operation source-op argument-count)]
+        (when (identical? source-var (:source-var direct))
+          (if (some? (get-in direct [:entry :typed-impl]))
+            (when-let [request (source-var-selection-request source-var)]
+              (let [typed (selected-definition (:operation request) (:implementation-op request)
+                                               argument-count)
+                    current (observed-selected-definition :direct operation source-op argument-count)]
+                (when (and current typed
+                           (= operation (:operation typed))
+                           (= argument-count (count (:parameters typed)))
+                           (= (:tags direct) (:tags typed))
+                           (every? #(and (identical? (get direct %) (get typed %))
+                                         (identical? (get direct %) (get current %)))
+                                   [:entry :source-var :generic-var]))
+                  typed)))
+            direct))))))
 
 (defn- retained-body-context!
   [{:keys [source-var source-body]} lineage body context]

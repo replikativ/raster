@@ -4,6 +4,30 @@
 
 ### Current boundary ledger
 
+Latest completed checkpoint `4b6e7660a` is **draft, not merge-ready**.
+Unit35409 completes all16:7,797 tests /95,935 pass /69 fail /117 errors across
+144 failing Vars. CPU35410 completes all4:684 /7,738 pass /16 fail /75 errors
+across79 Vars. The array-entry migration exposed13 newly failing unit Vars and
+two CPU regressions versus3f; the former cold-source CPU case recovers. These
+regressions are not waived. Emission now reaches the complete fixture inventory,
+but16 CUDA/HIP cases across8 functions still fail. No merge or release.
+
+The reviewed follow-up unifies ordinary and parametric dispatch registration on
+their already-published source delegate, eliminating a second opaque wrapper.
+Semantic return facts authenticate that exact dispatch route and original
+frontend, rather than pinning a replaceable physical receiver. Present exact
+arrays can select an overload; nullable tags cannot. A cold semantic prerequisite
+uses the existing real outer request owner; isolated collectors abstain. No
+receiver metadata is restamped, no Class/nonnull premise comes from annotations,
+and result-context wrappers remain authoritative for capacity projection.
+The new first-JIT lifecycle, wrapper-substitution, nullable and cold-source gate
+passes4/32. A frozen fresh process passes37 tests /368 assertions, including the
+complete existing return-proof namespace19/117, its numerical rounding and
+empty-array→nil oracle, plain-entry ownership4/15, array-entry6/115 and actual
+field-observation4/89. This establishes targeted recovery, not full CI closure.
+Remaining capacity/scan/source-declaration and diagnostic-path regressions still
+need qualification; AD member consumption is subsequent work.
+
 October 27 resumed checkpoint: pushed `3f173a424` remains **draft, not
 merge-ready**. Unit35385 completes all16 shards:7,785 tests /95,767 pass /
 52 failures /111 errors across131 failing Vars. CPU35386 completes all4:

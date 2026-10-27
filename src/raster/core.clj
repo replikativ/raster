@@ -1319,20 +1319,13 @@
                                                 :walked-body (or (:walked-body-typed reg#) (:walked-body reg#))
                                                 :source-ns-name '~(ns-name *ns*)
                                                 :typed-iface-name '~typed-iface-name})))]))
-       ;; Register: typed-target-fn triggers lazy JIT on first call,
-       ;; then routes through the -impl (which after JIT implements IFn).
-       ;; Julia model: first dispatch call triggers compilation.
+       ;; The public source function already owns lazy JIT and delegation to
+       ;; -impl. Use that SAME callable for generic dispatch, rather than a
+       ;; second equivalent closure whose routing has no source correspondence.
            (dispatch/register-method! ~mangled '~fn-name '~tags *ns*
                                       ~(if generate-typed? mangled-impl-var nil)
                                       ~(if generate-typed? `'~typed-iface-name nil)
-                                      ~(if generate-typed?
-                                         `(fn [~'& ~'args]
-                                        ;; Trigger lazy JIT if not yet compiled
-                                            (let [iv# (var ~mangled-impl-var)]
-                                              (ensure-bytecode-implementation! iv#))
-                                        ;; Route through -impl (after JIT: compiled class with IFn)
-                                            (apply (deref (var ~mangled-impl-var)) ~'args))
-                                         nil)
+                                      ~(if generate-typed? mangled nil)
                                       ~(meta fn-name)))))))
 
 ;; ================================================================
@@ -2245,9 +2238,9 @@
                 ;; mutable Var. JIT upgrades already refresh those objects.
                 (dispatch/register-method! @mangled-var fn-name tags source-ns
                                            @impl-var typed-iface-name
-                                           ;; typed-target-fn: routes through -impl
-                                           (fn [& call-args]
-                                             (apply @impl-var call-args))
+                                           ;; The actual published source owns
+                                           ;; this same delegation to -impl.
+                                           source-function
                                            (assoc (meta (ns-resolve source-ns (symbol (name fn-name))))
                                                   ::dispatch/parametric-annotations annotations
                                                   ::dispatch/parametric-bindings bindings))

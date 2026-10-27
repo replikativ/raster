@@ -25,3 +25,11 @@ Existing plain frontends and emitted artifacts are not upgraded or restamped.
 Their original source/producer identity guards remain authoritative. Driver-free
 OpenCL/CUDA/HIP source qualification does not establish device execution; the
 global routing change additionally requires fresh-process compiler and CI gates.
+
+Ordinary and parametric dispatch now reuse the published source delegate rather
+than a second equivalent wrapper. Return analyses must authenticate this routing
+and the original semantic frontend; they cannot infer an arbitrary wrapper's
+result from the separately registered typed implementation. Semantic-only facts
+survive the same source's first physical JIT promotion, while substituted source
+or receiver implementations remain guarded. This does not make nullable array
+arguments sufficient to select a generic overload.

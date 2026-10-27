@@ -43,9 +43,14 @@
   [{:keys [source-var receiver-var operation implementation-op parameters tags]
     :as definition}]
   (if receiver-var
-    (when-let [frontend (method-entry/selected-frontend-source
-                        operation implementation-op (count parameters) source-var
-                        (dtype/infer-dtype-from-tags tags))]
+    (when-let [frontend (or (method-entry/selected-frontend-source
+                            operation implementation-op (count parameters) source-var
+                            (dtype/infer-dtype-from-tags tags))
+                           ;; A genuine outer owner may independently prepare
+                           ;; this selected source and restart the whole query.
+                           ;; A bare optional collector must simply abstain.
+                           (method-entry/demand-selected-source-preparation-if-owned!
+                            :semantic operation implementation-op (count parameters) source-var))]
       (let [lineage (:source-entry frontend)
             return-tag (:return-tag lineage)]
         (when (and (identical? (:source-body definition) (:source-body lineage))
@@ -88,19 +93,31 @@
                        (method-entry/selected-definition semantic-op implementation-op (count arguments))
                        (or
                         (when-let [operation (mangled/impl->op implementation-op)]
-                          (method-entry/observed-selected-definition :direct operation implementation-op
-                                                                    (count arguments)))
+                          (when-let [source-var (find-var implementation-op)]
+                            (method-entry/observed-generic-source-definition
+                             operation source-var (count arguments))))
                         ;; Generic array selection uses actual producer carriers,
                         ;; never desired result/formal annotations or fake values.
                         (when (and (qualified-symbol? implementation-op)
                                    (find-ns (symbol (namespace implementation-op))))
-                          (let [tags (mapv #(:array-tag (summary % env visited body-context)) arguments)
-                                signature (when (and (seq tags) (every? some? tags))
-                                            (inference/registered-call-signature implementation-op tags))]
+                          (let [facts (mapv #(summary % env visited body-context) arguments)
+                                tags (mapv :array-tag facts)
+                                ;; nil matches reference dispatch alternatives;
+                                ;; a nullable array tag cannot choose this entry.
+                                signature (when (and (seq tags) (every? some? tags)
+                                                     (every? #(= :present (:presence %)) facts))
+                                            (when-let [generic (find-var implementation-op)]
+                                              ;; Selection itself must belong to
+                                              ;; the same history as the later
+                                              ;; exact source/receiver join.
+                                              (method-entry/observe-definition-input!
+                                               generic (.ns ^clojure.lang.Var generic) implementation-op)
+                                              (inference/registered-call-signature implementation-op tags)))]
                             (when (and signature (= tags (:tags signature))
                                        (not (seq (:promotion-casts signature))))
-                              (method-entry/observed-selected-definition
-                               :direct implementation-op (:mangled-sym signature) (count arguments))))))))]
+                              (when-let [source-var (find-var (:mangled-sym signature))]
+                                (method-entry/observed-generic-source-definition
+                                 implementation-op source-var (count arguments)))))))))]
     (if definition
       (if-let [{:keys [source-var parameters body tags] :as selected-body}
                (summary-source definition)]
