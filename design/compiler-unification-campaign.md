@@ -4,11 +4,11 @@
 
 ### Current boundary ledger
 
-Latest completed unit/CPU accounting, `48767306b` (October 27): unit job 35193
-and CPU-OpenCL job 35192 fail; this branch is not merge-ready. Later checkpoints
+Latest completed unit/CPU accounting, `588320453` (October 27): unit job 35206
+and CPU-OpenCL job 35207 fail; this branch is not merge-ready. Later checkpoints
 require their own exact-head qualification.
-All sixteen unit shards complete: 7,668 tests, 95,302 passing assertions, 22 failures and 28
-errors across 39 failing Vars. CPU-OpenCL has all four completed shards: 677
+All sixteen unit shards complete: 7,675 tests, 95,317 passing assertions, 22 failures and 29
+errors across 40 failing Vars. CPU-OpenCL has all four completed shards: 677
 tests, 8,629 passing assertions, 6 failures and 27 errors across 31 failing Vars.
 Setup, build, emitted-source, CUDA and HIP compiler checks pass at this checkpoint. Compiler-only
 vendor checks do not establish native execution or waive the failed unit/device
@@ -25,8 +25,15 @@ the older nested-MMM test expecting the now-owned helper cases to refuse. Those
 including default/selected gradients, empty reductions and unchanged inputs.
 The five affected AD namespaces pass 43 tests / 718 assertions with the
 committed inliner. Unknown Object/compound-array and active-discrete refusals
-remain independently tested. The other 39 unit and 31 CPU failing Vars are
+remain independently tested. The other 40 unit and 31 CPU failing Vars are
 still unqualified; this test migration does not waive them.
+
+The latest unit checkpoint adds a maxpool-gradient ClassCastException (`long[]`
+to `int[]` inside an extracted helper). Its isolated committed-source replay
+passes one test / four assertions, which does not clear the CI failure. The
+existing helper diagnostics are printed on that test's unchanged failure path
+to distinguish cold specialization, stored versus use-site tags, and liveness
+exposing malformed code. No retry or fallback replaces the failing execution.
 
 The uncommitted whole-call inliner migration has a consolidated real-owner
 source/arity/history gate passing 34 tests / 300 assertions. Five fabricated
@@ -56,6 +63,29 @@ The new identity/null/conversion/failure test passes 1 test / 8 assertions;
 the existing boxed-entry and input-completion namespaces pass 21 / 537. This
 does not yet wire native entry adaptation or authorize pointer/allocation
 projection, and grants no presence or ownership facts.
+
+Dead-code elimination now closes identity-alias liveness and directed
+projection ancestry. It retains mutations through caller aliases and live
+returned containers, including shadowed outer inputs, without treating a
+projection as array identity. Mutation effects are queried after descriptor
+initialization rather than cached in an early inventory. The focused namespace
+passes 24 tests / 81 assertions; independent review found no blocker. Directly
+live targets take the fast path; repeated ancestry queries can still have
+nonlinear cost in large distinct projection components. This repair is
+independently committed as `588320453`.
+
+The native reference-helper runtime integration remains **uncommitted and
+unsafe to qualify as complete**. Its ordinary changed-input fixture passes
+only after fixing both DCE and native pointer-copyback write-root agreement.
+That narrow result does not discharge checked Long overflow or source array
+bounds: raw C `inc` and dereferences currently lack those source obligations.
+Do not execute an undersized native-pointer probe. The next native prerequisite
+must use shared checked arithmetic/access evidence and either prove the
+operation safe or preserve its failure and effect order. Further open domains
+include cold plain-IFn call provenance, nullable native inputs and fresh zeroed
+allocation under buffer reuse; no Class/presence fact waives them. The new
+bounded adapter explicitly refuses unsupported null/reuse cases before native
+allocation, rather than silently inventing nonnull/fresh storage.
 
 The shared hardware-free output fixture now constructs a valid effect-checked
 plan, exact buffer/view geometry, and an initially uncompleted owner. Storage and
