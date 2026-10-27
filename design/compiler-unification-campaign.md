@@ -4,10 +4,10 @@
 
 ### Current boundary ledger
 
-Latest exact-head accounting, `55a741781` (October 26): unit job 35123 and
-CPU-OpenCL job 35119 fail; this branch is not merge-ready. All sixteen unit
-shards now complete: 7,636 tests, 94,821 passing assertions, 26 failures and 42
-errors across 53 failing Vars. CPU-OpenCL has all four completed shards: 676
+Latest exact-head accounting, `c86461642` (October 26): unit job 35129 and
+CPU-OpenCL job 35126 fail; this branch is not merge-ready. All sixteen unit
+shards complete: 7,636 tests, 94,966 passing assertions, 36 failures and 28
+errors across 45 failing Vars. CPU-OpenCL has all four completed shards: 676
 tests, 8,617 passing assertions, 6 failures and 27 errors across 31 failing Vars.
 Setup, build, emitted-source, CUDA and HIP compiler checks pass. Compiler-only
 vendor checks do not establish native execution or waive the failed unit/device
@@ -199,6 +199,22 @@ justify removing freshness fences. A small existing optimizer-precision test
 reproduces the same capacity-refusal family and captures an actual typed
 container-array field read without repeating GSDM. Its causal capacity must be
 proved; consumer annotations must not supply the missing evidence.
+
+The next bounded correction owns one unpublished fixpoint analysis session and
+isolates only eager normal-return queries. Each query validates its complete
+semantic dependency footprint; the enclosing independent scope still validates
+all original parent/local history before publication. Original snapshots and
+lookup edges are consulted at observation/import, including a declined nested
+optional query. Ordinary optional children carry observation history only, not
+fast-query authority; unregistered independent/preparation children retain their
+old behavior. Exact semantic guards are canonicalized only after fresh query
+validation, preventing duplicate guard growth without caching freshness. Public
+full assertions/adoption, standalone required/optional semantics, owner CAS and
+authentic prerequisite propagation remain intact. No analysis result is memoized
+in this slice. Independent review found no remaining blocker; the combined
+source, AD-lifetime, inlining, normal-return, pipeline and fingerprint gate passes
+206 tests / 1,639 assertions. Remaining structural union and lexical-environment
+construction costs must be measured rather than described as constant time.
 
 One independent convergence-domain defect is corrected: compiler fixpoints now
 use pair-local retained-source equality, allowing exact immutable Class identity,

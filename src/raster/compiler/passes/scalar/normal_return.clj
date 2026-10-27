@@ -146,7 +146,7 @@
       unknown)))
 
 (defn- selected-result [expression env visited body-context]
-  (or (method-entry/call-with-optional-definition-inputs
+  (or (method-entry/call-with-isolated-definition-query
        #(let [result (selected-result* expression env visited body-context)]
           (when (or (not= :unknown (:presence result)) (:array-tag result)) result)))
       unknown))
@@ -264,7 +264,9 @@
    definition-dependent facts are unknown rather than silently losing provenance."
   ([expression] (result-fact expression {}))
   ([expression lexical-facts]
-   (select-keys (summary expression lexical-facts #{}) [:presence :array-tag :scalar-type])))
+   (method-entry/call-with-isolated-definition-query
+    #(select-keys (summary expression lexical-facts #{}) [:presence :array-tag :scalar-type])
+    false)))
 
 (defn presence
   "Return :present, :absent, :unknown, or :no-return for a closed source region.

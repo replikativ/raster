@@ -54,6 +54,25 @@
    for dynamic execution). This is neither a registry nor a cache."
   nil)
 
+(def ^:dynamic ^:private *definition-analysis-session* nil)
+(def ^:dynamic ^:private *definition-query-frame* nil)
+(def ^:dynamic ^:private *definition-observation-baselines* nil)
+(def ^:dynamic ^:private *definition-observation-owner* nil)
+
+(defn- active-definition-query-owner? []
+  (let [session *definition-analysis-session* frame *definition-query-frame*]
+    (and session @(:active? session) frame @(:active? frame)
+         (identical? (:session-token frame) (:token session))
+         (identical? (:owner frame) *emission-inputs*))))
+
+(defn- active-definition-observation-owner? []
+  (or (active-definition-query-owner?)
+      (let [session *definition-analysis-session* frame *definition-query-frame*]
+        (and session @(:active? session) frame @(:active? frame)
+             (identical? (:session-token frame) (:token session))
+             *definition-observation-owner*
+             (identical? *definition-observation-owner* *emission-inputs*)))))
+
 (defprotocol RetainedProducerInput
   "Process-local compiler dependency, separate from portable IR and Var snapshots.
    Validate this immutable producer's own freshness. Transitive dependencies are
@@ -119,7 +138,33 @@
   (and (var-reference-current? snapshot)
        (var-value-current? snapshot)))
 
-(defn- retain-definition-observation [inputs v snapshot]
+(defn- analysis-definition-observation
+  "A pure query may isolate work, never refresh a touched historical definition or lookup."
+  [inputs v snapshot]
+  (if-not (and *definition-observation-baselines* (active-definition-observation-owner?))
+    snapshot
+    (let [historical (into [] (keep #(get-in % [:definition-proofs v]))
+                           *definition-observation-baselines*)
+          historical (cond-> historical (get-in inputs [:definition-proofs v])
+                       (conj (get-in inputs [:definition-proofs v])))
+          first-observation (or (first historical) snapshot)]
+      (doseq [prior historical]
+        (when-not (same-var-snapshot? prior snapshot)
+          (throw (ex-info "definition changed inside an isolated semantic query"
+                          {:reason :unstable-definition-proof-input :source v})))
+        ;; Check old aliases even when this query uses a new, still-valid lookup
+        ;; and eventually declines. Only this touched Var's edges are inspected.
+        (when-not (var-snapshot-current? prior)
+          (throw (ex-info "historical semantic-query lookup is no longer current"
+                          {:reason :stale-definition-proof-input :source v}))))
+      (let [lookups (reduce #(into %1 (:lookups %2))
+                            (or (:lookups first-observation) #{})
+                            (conj historical snapshot))]
+        (if (= lookups (:lookups first-observation)) first-observation
+            (assoc first-observation :lookups lookups))))))
+
+(defn- retain-definition-observation [inputs v observed]
+  (let [snapshot (analysis-definition-observation inputs v observed)]
   (if-let [prior (get-in inputs [:definition-proofs v])]
     (do
       (when-not (same-var-snapshot? prior snapshot)
@@ -137,7 +182,7 @@
                         (mapv #(if (identical? prior %) updated %) values)))))))
     (-> inputs
         (assoc-in [:definition-proofs v] snapshot)
-        (update :values (fnil conj []) snapshot))))
+        (update :values (fnil conj []) snapshot)))))
 
 (defn observe-definition-input!
   "Retain a definition actually consulted by a normalization proof.
@@ -173,6 +218,13 @@
                       {:reason :stale-source-resolution :kind kind :symbol lookup-symbol})))
     true))
 
+(defn- same-source-resolution-input? [left right]
+  (and (instance? SourceResolutionInput left) (instance? SourceResolutionInput right)
+       (= (.-kind ^SourceResolutionInput left) (.-kind ^SourceResolutionInput right))
+       (identical? (.-source-ns ^SourceResolutionInput left) (.-source-ns ^SourceResolutionInput right))
+       (= (.-lookup-symbol ^SourceResolutionInput left) (.-lookup-symbol ^SourceResolutionInput right))
+       (identical? (.-result ^SourceResolutionInput left) (.-result ^SourceResolutionInput right))))
+
 (defn- validate-source-resolution!
   [{:keys [kind source-ns symbol result]}]
   (when-not (and (instance? clojure.lang.Namespace source-ns) (symbol? symbol)
@@ -197,11 +249,7 @@
       (assert-producer-current! input)
       (swap! *emission-inputs*
              (fn [inputs]
-               (if (some #(and (instance? SourceResolutionInput %)
-                               (= kind (.-kind ^SourceResolutionInput %))
-                               (identical? source-ns (.-source-ns ^SourceResolutionInput %))
-                               (= symbol (.-lookup-symbol ^SourceResolutionInput %))
-                               (identical? result (.-result ^SourceResolutionInput %)))
+               (if (some #(same-source-resolution-input? input %)
                          (:producer-inputs inputs))
                  inputs
                  (retain-producer-inputs inputs [input]))))))
@@ -242,7 +290,10 @@
     (let [owner *emission-inputs*
           historical @owner
           child (atom historical)
-          result (binding [*emission-inputs* child] (prove!))]
+          result (binding [*definition-observation-owner*
+                           (when (active-definition-observation-owner?) child)
+                           *emission-inputs* child]
+                   (prove!))]
       (when result
         (assert-definition-inputs-current! @child)
         (when-not (compare-and-set! owner historical @child)
@@ -416,6 +467,106 @@
 
               :else (throw failure))
             (:result outcome))))))))))
+
+(defn ^:no-doc call-with-definition-analysis
+  "Own one unpublished source-normalization analysis under the existing complete fences.
+   Only explicit semantic queries on this exact collector (or active query children) isolate
+   their work. General independent/optional/preparation children retain ordinary full behavior."
+  [construct]
+  (if-not *emission-inputs*
+    (construct)
+    (let [historical @*emission-inputs*
+          enclosing *definition-analysis-session*
+          admitted? (and enclosing @(:active? enclosing)
+                         (or (identical? (:owner enclosing) *emission-inputs*)
+                             (active-definition-query-owner?)))
+          inherited (if admitted?
+                      (or *definition-observation-baselines* (:baselines enclosing) [])
+                      [])
+          baselines (cond-> (vec inherited)
+                      admitted? (conj @(:owner enclosing)))
+          baselines (conj baselines historical)]
+      (call-with-independent-definition-inputs
+       (fn []
+         (let [session {:owner *emission-inputs* :token (Object.)
+                        :active? (volatile! true) :baselines baselines}]
+           (try
+             (binding [*definition-analysis-session* session
+                       *definition-query-frame* nil
+                       *definition-observation-owner* nil
+                       *definition-observation-baselines* nil]
+               (construct))
+             (finally (vreset! (:active? session) false)))))))))
+
+(defn- isolated-definition-query-owner?
+  []
+  (let [session *definition-analysis-session*]
+    (and session @(:active? session) *emission-inputs*
+         (or (identical? (:owner session) *emission-inputs*)
+             (active-definition-query-owner?)))))
+
+(declare semantic-query-producer? canonical-analysis-producers)
+
+(defn- assert-definition-query-state! [inputs]
+  (let [proofs (or (:definition-proofs inputs) {}) values (:values inputs)]
+    (when-not (and (every? #{:static :values :definition-proofs :producer-inputs} (keys inputs))
+                   (empty? (:static inputs)) (map? proofs) (vector? values)
+                   (= (count proofs) (count values))
+                   (every? semantic-query-producer? (:producer-inputs inputs))
+                   (every? (fn [[v snapshot]] (and (var? v) (identical? v (:var snapshot)))) proofs)
+                   (every? #(identical? % (get proofs (:var %))) values))
+      (throw (ex-info "isolated semantic analysis produced non-query compiler state"
+                      {:reason :invalid-definition-query-state}))))
+  true)
+
+(defn- assert-no-analysis-prerequisite! []
+  (when (instance? clojure.lang.IAtom *source-prerequisite-scope*)
+    (when-let [pending (:pending @*source-prerequisite-scope*)]
+      ;; The enclosing owner authenticates this EXACT Throwable. Never replace
+      ;; a genuine demand with a generic stale/unstable exception.
+      (throw (:failure pending)))))
+
+(defn ^:no-doc call-with-isolated-definition-query
+  "Conditional adoption for eager normal-return lattice analysis, not an executable proof.
+   Outside an admitted analysis owner, optional queries keep the original optional behavior;
+   required queries call directly, preserving result-fact's standalone fence semantics.
+   No results are cached. A positive query validates its entire footprint, then merges original
+   snapshots/lookup edges with an exact-owner CAS; the enclosing source scope fences all history."
+  ([prove!] (call-with-isolated-definition-query prove! true))
+  ([prove! optional?]
+   (if-not (isolated-definition-query-owner?)
+     (if optional? (call-with-optional-definition-inputs prove!) (prove!))
+     (let [parent *emission-inputs* historical @parent
+           session *definition-analysis-session*
+           baselines (into (conj (vec (:baselines session)) @(:owner session))
+                           (concat *definition-observation-baselines* [historical]))
+           local (atom {:static [] :values []})
+           frame {:owner local :session-token (:token session) :active? (volatile! true)}]
+       (assert-no-analysis-prerequisite!)
+       (try
+         (let [result (binding [*emission-inputs* local *definition-query-frame* frame
+                                *definition-observation-baselines* baselines]
+                        (prove!))]
+           (assert-no-analysis-prerequisite!)
+           (when-not (identical? historical @parent)
+             (throw (ex-info "semantic-query owner changed during construction"
+                             {:reason :unstable-definition-proof-input})))
+           (assert-definition-query-state! @local)
+           (when (or result (not optional?))
+             (assert-definition-inputs-current! @local)
+             (let [merged (reduce-kv retain-definition-observation historical
+                                     (or (:definition-proofs @local) {}))
+                   merged (retain-producer-inputs
+                           merged (canonical-analysis-producers (:producer-inputs @local)
+                                                                (conj baselines historical)))]
+               (when-not (compare-and-set! parent historical merged)
+                 (throw (ex-info "semantic-query owner changed before adoption"
+                                 {:reason :unstable-definition-proof-input})))))
+           result)
+         (catch Throwable failure
+           (assert-no-analysis-prerequisite!)
+           (throw failure))
+         (finally (vreset! (:active? frame) false)))))))
 
 (declare validate-static-emission!)
 
@@ -916,6 +1067,25 @@
     (when selection (assert-semantic-frontend-selection! lineage selection))
     true))
 
+(defn- same-frontend-source-input? [left right]
+  (and (instance? FrontendSourceIdentityInput left) (instance? FrontendSourceIdentityInput right)
+       (identical? (.-lineage ^FrontendSourceIdentityInput left) (.-lineage ^FrontendSourceIdentityInput right))
+       (= (.-selection ^FrontendSourceIdentityInput left) (.-selection ^FrontendSourceIdentityInput right))))
+
+(defn- semantic-query-producer? [producer]
+  (or (instance? SourceResolutionInput producer) (instance? FrontendSourceIdentityInput producer)))
+
+(defn- canonical-analysis-producers
+  "Reuse original semantic guards only AFTER validating the query's actual guard observations.
+   These are the observers' exact equivalences, not cached freshness or general producer equality."
+  [producers baselines]
+  (let [historical (mapcat :producer-inputs baselines)]
+    (mapv (fn [producer]
+            (or (some #(when (or (same-source-resolution-input? producer %)
+                                 (same-frontend-source-input? producer %)) %)
+                      historical)
+                producer)) producers)))
+
 (defn observe-frontend-source-identity!
   "Retain exact source-entry identity after authenticating its opaque frontend.
    This lightweight guard also catches equal-but-copied raw source metadata.
@@ -923,15 +1093,14 @@
   [frontend]
   (when *emission-inputs*
     (assert-frontend-source! frontend (get-in frontend [:source-entry :source-var]))
-    (let [lineage (:source-entry frontend)]
+    (let [lineage (:source-entry frontend)
+          input (FrontendSourceIdentityInput. lineage nil)]
       (swap! *emission-inputs*
              (fn [inputs]
-               (if (some #(and (instance? FrontendSourceIdentityInput %)
-                               (identical? lineage (.-lineage ^FrontendSourceIdentityInput %))
-                               (nil? (.-selection ^FrontendSourceIdentityInput %)))
+               (if (some #(same-frontend-source-input? input %)
                          (:producer-inputs inputs))
                  inputs
-                 (retain-producer-inputs inputs [(FrontendSourceIdentityInput. lineage nil)])))))
+                 (retain-producer-inputs inputs [input])))))
     true))
 
 (defn- retain-semantic-frontend-selection!
@@ -949,9 +1118,7 @@
                                                  [:no-inline :raster.compiler/host-only])}
         input (FrontendSourceIdentityInput. lineage selection)]
     (assert-producer-current! input)
-    (when-not (some #(and (instance? FrontendSourceIdentityInput %)
-                         (identical? lineage (.-lineage ^FrontendSourceIdentityInput %))
-                         (= selection (.-selection ^FrontendSourceIdentityInput %)))
+    (when-not (some #(same-frontend-source-input? input %)
                    (:producer-inputs @*emission-inputs*))
       (adopt-definition-inputs! {:producer-inputs [input]}))))
 

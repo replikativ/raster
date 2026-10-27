@@ -461,6 +461,68 @@
         (when (instance? java.lang.AutoCloseable compiled)
           (.close ^java.lang.AutoCloseable compiled))))))
 
+(deftest normalization-analysis-isolates-repeated-semantic-footprints-without-caching-facts
+  (let [source (core/resolve-deftm-var #'allocated)
+        call (selected-call #'allocated '[n])
+        selected! @#'normal/selected-result*
+        measurements
+        (mapv (fn [n]
+                (let [visits (atom 0) queries (atom 0)
+                      unrelated (reify method-entry/RetainedProducerInput
+                                  (assert-producer-current! [this] (swap! visits inc) this))
+                      parent (atom {:static [] :values [] :producer-inputs [unrelated]})]
+                  (binding [method-entry/*emission-inputs* parent]
+                    (with-redefs-fn
+                      {#'normal/selected-result* (fn [& arguments]
+                                                  (swap! queries inc) (apply selected! arguments))}
+                      #(method-entry/call-with-definition-analysis
+                        (fn []
+                          (dotimes [_ n]
+                            (is (= {:presence :present :array-tag 'doubles}
+                                   (normal/result-fact call))))))))
+                  (is (>= @queries n) "every query still performs actual analysis, not a fact-cache hit")
+                  (is (contains? (:definition-proofs @parent) source))
+                  {:visits @visits :producers (count (:producer-inputs @parent))})) [2 16])]
+    (is (= (first measurements) (second measurements))
+        "neither unrelated validation nor producer history grows with repeated use of the same dependencies")
+    (is (<= 1 (:visits (first measurements)) 6))))
+
+(deftest standalone-result-fact-does-not-add-a-new-unrelated-parent-fence
+  (let [visits (atom 0)
+        unrelated (reify method-entry/RetainedProducerInput
+                    (assert-producer-current! [_]
+                      (swap! visits inc)
+                      (throw (ex-info "stale unrelated parent" {:reason ::stale-parent}))))
+        parent (atom {:static [] :values [] :producer-inputs [unrelated]})]
+    (binding [method-entry/*emission-inputs* parent]
+      (is (= {:presence :present} (normal/result-fact 1.0)))
+      (is (zero? @visits))
+      (is (= ::stale-parent
+             (try (method-entry/call-with-definition-analysis #(normal/result-fact 1.0)) nil
+                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))
+      (is (= 1 @visits)))))
+
+(deftest normalization-analysis-does-not-leak-proof-work-or-realize-quoted-data
+  (let [forced (atom 0)
+        payload (lazy-seq (swap! forced inc) (list 'opaque-data))
+        quoted (list 'quote payload)
+        owner (atom {:static [] :values []})
+        [output quoted-output]
+        (binding [method-entry/*emission-inputs* owner]
+          (method-entry/call-with-definition-analysis
+           (fn []
+             [(products/lower-local-products
+               '(let* [out (clojure.core/double-array 3)] (if (clojure.core/nil? out) 1 2)))
+              (products/lower-local-products quoted)])))]
+    (with-redefs [method-entry/observe-definition-input!
+                  (fn [& _] (throw (Exception. "definition observation escaped its analysis owner")))
+                  method-entry/observe-source-reference!
+                  (fn [& _] (throw (Exception. "qualification escaped its analysis owner")))]
+      (is (seq (pr-str output)))
+      (is (seq (doall (tree-seq coll? seq output)))))
+    (is (identical? quoted quoted-output))
+    (is (zero? @forced))))
+
 (deftest folding-presence-must-preserve-failing-allocation
   (let [source '(let* [out (clojure.core/double-array -1)]
                  (if (clojure.core/nil? out) 1 2))

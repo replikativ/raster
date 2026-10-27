@@ -521,7 +521,9 @@
   ;; arg tags nil so try-parametric-specialize! could not fire. Re-expanding here
   ;; would never have fixed that; declaring the template's float signature up
   ;; front does (dispatch/parametric-tc-sigs). The census is the messenger.
-  (let [max-iters 5
+  (me/call-with-definition-analysis
+   (fn []
+    (let [max-iters 5
         ;; Force simplify mode for the fixpoint — we always want normalize+rewalk
         opts (assoc opts :simplify? true)]
     (reset! fixpoint-census [])
@@ -574,7 +576,7 @@
             (do
               (record-fixpoint-census! iter rewalked opts)
               (recur rewalked (inc iter)
-                     (assoc total-stats :fixpoint-iterations (inc iter))))))))))
+                     (assoc total-stats :fixpoint-iterations (inc iter))))))))))))
 
 (defn- pass-mode-select
   "Analyze Jacobian structure and annotate form with recommended AD mode.
