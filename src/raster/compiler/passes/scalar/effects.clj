@@ -259,6 +259,17 @@
 
 (def ^:private descriptor-cache-capacity 65536)
 
+(defn ^:no-doc source-obligation-flags
+  "Read only retained source-evaluation obligations, not effects or totality.
+   A consumer must independently close the expression grammar before using
+   this instead of the full descriptor. In particular, an empty result says
+   nothing about callbacks, exceptions or randomness in an arbitrary call."
+  [expression]
+  (try
+    (source-evaluation-flags expression)
+    (catch Exception _ #{:unclosed-source-obligations})
+    (catch StackOverflowError _ #{:unclosed-source-obligations})))
+
 (def ^:private descriptor-cache
   "Descriptors by expression key, least recently used evicted first. Scalar
    passes ask about the same expressions many times per fixpoint, and each

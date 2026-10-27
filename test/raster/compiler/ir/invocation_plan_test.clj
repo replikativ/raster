@@ -8,6 +8,7 @@
             [raster.compiler.ir.invocation-source :as invocation-source]
             [raster.compiler.ir.parallel-program :as program]
             [raster.compiler.ir.semantic-fingerprint :as semantic]
+            [raster.compiler.passes.scalar.effects :as effects]
             [raster.compiler.passes.parallel.resident-program-projection :as resident-projection]))
 
 (defn- scalar [dtype]
@@ -19,6 +20,41 @@
 
 (defn- array-value [dtype extent]
   (av/tensor {:dtype dtype :shape [extent] :representation {:kind :plain}}))
+
+(deftest canonical-reference-identities-read-obligations-without-effect-inference
+  (let [binder (with-meta 'alias {:tag 'java.lang.Object :raster.type/tag 'doubles})
+        expression (completion/complete-value completion/object-input-contract 'x)
+        query #(invocation-source/reference-identity-source binder %)
+        flag #(vary-meta % assoc :raster.effect/source-reference-cast true)
+        rebuild (fn [head contract operand]
+                  (with-meta (list head contract operand) (meta expression)))]
+    (with-redefs [effects/descriptor (fn [& _] (throw (AssertionError. "unexpected effect inference")))]
+      (is (= 'x (query expression)))
+      (is (= 'x (query (vary-meta expression assoc :raster.effect/preserve-evaluation true))))
+      (doseq [operand ['(callback) '(do x) '(long x)
+                       (completion/complete-value completion/object-input-contract 'x)]]
+        (is (nil? (query (completion/complete-value completion/object-input-contract operand)))
+            "the grammar, not an empty obligation set, excludes executable operands"))
+      (doseq [changed [(rebuild (flag completion/completion-symbol) completion/object-input-contract 'x)
+                       (rebuild completion/completion-symbol (flag completion/object-input-contract) 'x)
+                       (rebuild completion/completion-symbol completion/object-input-contract (flag 'x))
+                       (flag expression)]]
+        (is (nil? (query changed)) "all existing recursive source obligations remain visible"))
+      (is (nil? (invocation-source/reference-identity-source (flag binder) expression)))
+      (doseq [changed [(vary-meta expression assoc :raster.effect/unknown true)
+                       (rebuild completion/completion-symbol completion/object-input-contract
+                                (vary-meta 'x assoc :raster.effect/unknown true))]]
+        (is (nil? (query changed))))
+      (doseq [contract [(assoc completion/object-input-contract :extra true)
+                        (dissoc completion/object-input-contract :policy)
+                        (assoc completion/object-input-contract :policy :different)]]
+        (is (nil? (query (rebuild completion/completion-symbol contract 'x))))))
+    (doseq [failure [(IllegalStateException. "obligation traversal failed")
+                     (StackOverflowError. "obligation traversal overflow")]]
+      (with-redefs-fn {(ns-resolve 'raster.compiler.passes.scalar.effects 'source-evaluation-flags)
+                      (fn [& _] (throw failure))}
+        #(do (is (= #{:unclosed-source-obligations} (effects/source-obligation-flags expression)))
+             (is (nil? (query expression))))))))
 
 (deftest source-boxing-keeps-invocation-representation-separate-from-numerical-facts
   (let [logical (scalar :float)

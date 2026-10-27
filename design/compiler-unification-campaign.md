@@ -28,6 +28,19 @@ parity and source-only tail-alias qualification are not established here.
 Static lint reports zero errors. Exact-head CI remains required. The disabled
 native-reference prototype is excluded from this batch.
 
+The next compile-latency change is deliberately narrower than validation-cache
+work: exact canonical Object identities over bare symbols now read the existing
+recursive source-obligation flags without invoking general effect inference.
+This is not a purity/totality proof or a descriptor replacement for arbitrary
+calls. Independent review and all four affected plan/materialization/source-order/
+effect namespaces pass (60 tests / 578 assertions); changed-input gradient device
+replay still passes 24 assertions on both local backends. The complete device
+gate takes 42.9 seconds in the warm shared REPL, not a controlled comparative
+compile benchmark. A paired warmed identity-query microbenchmark (100 calls,
+five trials) is 159–181 ms committed versus 1.15–1.23 ms with the bounded reader;
+no end-to-end model-compilation speedup is claimed. Remaining whole-plan replay
+and emission-history DAG duplication need separate measured work.
+
 Previous completed exact-head CI is `87aea1e78`: all sixteen unit shards
 (35302) finish with 7,740 tests / 95,060 pass / 48 failures / 118 errors across
 137 failing Vars. The three prior cold-root Vars recover, but two allocation

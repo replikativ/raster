@@ -58,7 +58,12 @@
                                          (or (not= key :raster.effect/preserve-evaluation)
                                              (not (true? value)))))
                                   (meta node))
-                        (every? #{:preserve-source-evaluation} (:flags (effects/descriptor node)))))]
+                        ;; Below, the grammar is the reserved canonical Object
+                        ;; completion over one bare symbol, not an arbitrary
+                        ;; function call. Only source obligations remain to read;
+                        ;; do not re-run general effect inference on its marker.
+                        (every? #{:preserve-source-evaluation}
+                                (effects/source-obligation-flags node))))]
     (when (and (symbol? binder) (= 'java.lang.Object (:tag (meta binder)))
                (some? (dtype/dtype-for-array-tag (:raster.type/tag (meta binder))))
                (symbol? operand) (every? allowed? [binder expression operand]))
