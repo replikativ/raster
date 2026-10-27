@@ -859,6 +859,11 @@
 
 (def ^:private local-fact-keys [:type :hint :verified :reference-class])
 
+(defn- helper-source-nodes [source]
+  (tree-seq #(and (coll? %)
+                  (not (and (seq? %) (contains? '#{quote clojure.core/quote} (first %)))))
+            seq source))
+
 (defn- checked-helper-body
   "Materialize actual lexical reference checks before hygiene or simplification."
   [emission receivers binding-contexts]
@@ -960,13 +965,15 @@
               :else node))]
     (mapv walk (:body emission))))
 
-(defn- qualified-helper-body [emission outer-ns]
+(defn- qualified-helper-body
+  ([emission outer-ns] (qualified-helper-body emission outer-ns checked-helper-body))
+  ([emission outer-ns construct-body]
   (let [receivers (volatile! {})
         binding-contexts (java.util.IdentityHashMap.)
         binding-facts (volatile! {})
-        body (checked-helper-body emission receivers binding-contexts)
+        body (construct-body emission receivers binding-contexts)
         parameters (into (set (:params emission)) (keys @receivers))
-        used (volatile! (into parameters (filter symbol?) (tree-seq coll? seq body)))
+        used (volatile! (into parameters (filter symbol?) (helper-source-nodes body)))
         allocated (volatile! #{}) allocator util/*fresh-binder*
         hygienic (binding [util/*fresh-binder*
                            (fn [original]
@@ -1032,7 +1039,7 @@
                 (vector? node) (util/remake-if-changed node (mapv walk node))
                 :else node))]
       {:body (mapv #(util/subst-syms @receivers (walk %)) qualified)
-       :binding-facts @binding-facts})))
+       :binding-facts @binding-facts}))))
 
 (defn- expose-anchored-result-spine
   "Distribute result completions through a complete owned sequential binding
@@ -1341,6 +1348,54 @@
   (when method-entry/*emission-inputs*
     (method-entry/call-with-independent-definition-inputs
      #(construct-static-helper candidate occurrence source-options))))
+
+(defn ^:no-doc instantiate-ready-reference-helper
+  "Construct an ordinary application using an ALREADY owned reference-return
+   emission. This is the emitted alternative to the cold scalar body planner,
+   not a request to prepare a helper. Caller inputs are rederived from the exact
+   candidate; the complete callee body, lexical checks and return CHECKCAST come
+   from its original module. No native representation permission follows."
+  [candidate occurrence source-options]
+  (when method-entry/*emission-inputs*
+    (method-entry/call-with-independent-definition-inputs
+     (fn []
+       (when-let [scope (call-plan/source-context source-options)]
+         (when-let [planned (.get ^java.util.IdentityHashMap
+                                 (call-plan/call-plans scope candidate) occurrence)]
+           (let [physical (:physical planned)
+                 source (get-in physical [:definition :source-var])
+                 frontend (when source (method-entry/original-source-frontend source))]
+             (when frontend
+               (method-entry/assert-frontend-selection! frontend source)
+               (when-let [emission (method-entry/observed-frontend-emission frontend)]
+                 (when-let [bridge (method-entry/frontend-reference-return-bridge frontend)]
+                   (let [method (get-in planned [:plan :method])
+                         saved (:body-context bridge)]
+                     (when (and (= method (:invocation-method bridge))
+                                (identical? (:implementation emission)
+                                            (get-in physical [:definition :entry :typed-impl]))
+                                (= (:policy scope) (get-in frontend [:source-entry :source-policy]))
+                                (= (:parameter-carriers physical) (:parameter-carriers bridge))
+                                (not (:unretained-sibling-calls? saved)))
+                       (let [{:keys [body binding-facts]}
+                             (qualified-helper-body emission (get-in scope [:context :source-ns]))
+                             body (if (= 1 (count body)) (first body) (list* 'do body))
+                             values (mapv (fn [tag]
+                                            (with-meta (gensym "reference_input__")
+                                              {:raster.type/tag tag :raster.effect/effectful true}))
+                                          (:tags emission))
+                             contracts (cond-> [(completion/bytecode-result-context-contract
+                                                 (:result-context saved) (:emitted-result-type saved))]
+                                         (not= Object (:body-return-carrier bridge))
+                                         (conj (completion/reference-check-contract
+                                                (:body-return-carrier bridge))))
+                             artifact (construct-helper-application
+                                       frontend (assoc (:plan planned) :expression occurrence)
+                                       (:inputs planned) (:params emission) values body binding-facts
+                                       contracts (:return-tag emission) true)]
+                         (retain-owned-import!
+                          (assoc artifact :reference-return bridge)
+                          frontend))))))))))))))
 
 (defn- assert-helper-occurrence-current!
   ([emission input-body original record]

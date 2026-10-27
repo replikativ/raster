@@ -4,10 +4,10 @@
 
 ### Current boundary ledger
 
-Latest completed unit/CPU accounting, `32ff5587a` (October 27): unit job 35221
-and CPU-OpenCL job 35220 fail; this branch is not merge-ready. Later checkpoints
+Latest completed unit/CPU accounting, `280a9a3a7` (October 27): unit job 35231
+and CPU-OpenCL job 35235 fail; this branch is not merge-ready. Later checkpoints
 require their own exact-head qualification.
-All sixteen unit shards complete: 7,678 tests, 95,354 passing assertions, 22 failures and 28
+All sixteen unit shards complete: 7,689 tests, 95,717 passing assertions, 22 failures and 28
 errors across 39 failing Vars. CPU-OpenCL has all four completed shards: 677
 tests, 8,629 passing assertions, 6 failures and 27 errors across 31 failing Vars.
 Setup, build, emitted-source, CUDA and HIP compiler checks pass at this checkpoint. Compiler-only
@@ -27,6 +27,10 @@ The five affected AD namespaces pass 43 tests / 718 assertions with the
 committed inliner. Unknown Object/compound-array and active-discrete refusals
 remain independently tested. The other 39 unit and 31 CPU failing Vars are
 still unqualified; this test migration does not waive them.
+Between the last two complete reports, all 7,679 shared unit outcome Vars and
+95,417 shared assertions are retained; eleven new Vars add 363 assertions. CPU
+coverage is unchanged. Neither a removed test nor an incomplete shard explains
+the remaining failures.
 
 The earlier unit checkpoint exposed a maxpool-gradient ClassCastException (`long[]`
 to `int[]` inside an extracted helper). It is absent from the latest completed
@@ -66,6 +70,16 @@ boundaries. It deliberately retains unplanned calls: multi-call heat composition
 still lacks a complete sequential site plan. GSDM training gets past the earlier
 host-alias refusal but then correctly refuses an unexpanded array-return helper;
 neither workload is qualified by these narrow passing gates.
+
+A separate ordinary-source fallback can consume an already authenticated
+reference-return JVM module when static body/exit planning abstains. It reuses
+the existing helper-application constructor and saved input/body/return recipes;
+it never forces JIT preparation, grants native placement or expands the scalar
+AD companion's return domain. Nullable identity, wrong returned Class, quoted
+data opacity, exact ordered input slots, cold abstention and stale/replaced
+modules pass 4 tests / 25 assertions. The combined inliner/input/reference gate
+passes 51 / 404. Non-leaf effectful arguments still abstain; input-slot assertions
+are not a claim that those wider calls are supported.
 
 The shared AD prerequisite now closes the previously failing helper/allocation
 boundary. It isolates AD from an enclosing pipeline's source-call context and

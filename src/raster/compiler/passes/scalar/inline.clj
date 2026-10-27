@@ -464,8 +464,14 @@
     (let [planned (when *source-call-plans* (.get ^java.util.IdentityHashMap *source-call-plans* caller))]
       (when (and planned (= (count args) (count (:inputs planned)))
                  (every? true? (map identical? args (map :operand (:inputs planned)))))
-        (when-let [application (source-import/instantiate-static-helper
-                               (:candidate planned) caller (:source-options planned))]
+        (when-let [application (or (source-import/instantiate-static-helper
+                                    (:candidate planned) caller (:source-options planned))
+                                   ;; A cold source body is the preferred proof.  An already
+                                   ;; owned reference-return module is a strictly narrower
+                                   ;; fallback: it replays the same argument recipes and its
+                                   ;; actual return CHECKCAST, but grants no native capability.
+                                   (source-import/instantiate-ready-reference-helper
+                                    (:candidate planned) caller (:source-options planned)))]
           (source-import/validate-helper-application! application)
           (let [arguments (:argument-bindings application)
                 returned (:result-form application)]
