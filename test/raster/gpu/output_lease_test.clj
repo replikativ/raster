@@ -1,33 +1,20 @@
 (ns raster.gpu.output-lease-test
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.ir.link-plan :as plan]
-            [raster.compiler.ir.link-plan-test :as plan-fixture]
             [raster.gpu.compiled :as compiled]
             [raster.gpu.core :as gpu]
-            [raster.gpu.test-lifecycle]
+            [raster.gpu.test-lifecycle :as lifecycle]
             [raster.gpu.link :as link]
             [raster.gpu.value :as value]))
 
 (defn- executable
   ([] (executable :owned true))
   ([ownership owns-session?]
-   ;; Pure canonical geometry/effect proof, with replay/release/output projection
-   ;; mocked by the lifecycle tests below. This is not a native execution fixture.
-   (let [original (#'plan-fixture/valid-plan)
-         nodes (assoc-in (:nodes original) [:out :view :allocation :ownership] ownership)
-         {:keys [plan effect-evidence]}
-         (plan/make-with-effect-evidence {:id :resident-result :target (:target original)
-                                          :nodes nodes :instances (:instances original) :outputs [:out]})
-         descriptor (get-in nodes [:out :view])
-         buffer {:dtype :float :n-elements 16 :byte-size 64}
-         session (atom {:session-id :lease-fixture :closed? false
-                        :buffers {:out buffer} :allocations {:out (:allocation descriptor)}})]
-   (raster.gpu.test-lifecycle/linked-executable
-    {:plan plan :node-views {:out (gpu/->ResidentBufferView :lease-fixture :out descriptor)}
-     :session session :owns-session? owns-session? :graph-key :graph
-     :pending-inputs (atom #{}) :tainted-inputs (atom #{}) :closed? (atom false)
-     :lifetime-lock (Object.) :execution-state (atom {:value-epoch 0 :effect-evidence effect-evidence})
-     :completed-replays (atom 0) :output-leases (atom 0) :output-ready? (atom false)}))))
+   (lifecycle/linked-output-executable
+    {:id :resident-result :target :ze:0 :session-id :lease-fixture
+     :owns-session? owns-session?
+     :outputs [{:id :out :shape [16] :ownership ownership
+                :source (when (= :owned ownership) (float-array 16))}]})))
 
 (defn- reason [f]
   (try (f) nil (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
@@ -163,8 +150,6 @@
       (doseq [executable [(executable :borrowed true)
                           (executable :external true)
                           (executable :owned false)]]
-        (reset! (:completed-replays executable) 1)
-        (reset! (:output-ready? executable) true)
         (is (= :link-output-lease-ownership
                (reason #(link/output-lease! executable))))
         (is (= :link-output-lease-ownership

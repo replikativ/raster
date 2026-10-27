@@ -22,11 +22,10 @@
             [raster.compiler.pipeline :as pl]
             [raster.dl.nn :as nn]
             [raster.gpu.core :as gpu]
-            [raster.gpu.test-lifecycle]
+            [raster.gpu.test-lifecycle :as lifecycle]
             [raster.gpu.link :as gpu-link]
             [raster.gpu.resident-value :as resident-value]
-            [raster.gpu.value :as value])
-  (:import [java.util.concurrent.atomic AtomicBoolean]))
+            [raster.gpu.value :as value]))
 
 ;; A minimal elementwise forward: y = (x + w) * x. Typed placement and horizontal fusion lower the
 ;; residual-add/hadamard source to one tuple-free elementwise step. Composing it twice with weights
@@ -226,8 +225,15 @@
       (is (= [:graph :phase-1 :phase-0] @calls)))))
 
 (deftest linked-device-input-is-zero-copy-or-device-to-device
-  (let [destination-buffer (Object.)
-        source-buffer (Object.)
+  (let [released (atom [])
+        destination-buffer
+        (lifecycle/native-buffer
+         (constantly {:id :destination :dtype :float :n-elements 5 :byte-size 20})
+         #(swap! released conj (:id %)) {})
+        source-buffer
+        (lifecycle/native-buffer
+         (constantly {:id :source :dtype :float :n-elements 4 :byte-size 16})
+         #(swap! released conj (:id %)) {})
         destination-allocation
         (bview/allocation {:id :destination :byte-size 20 :memory-space :device
                            :device :ze:0 :ownership :owned})
@@ -237,7 +243,7 @@
         destination-view (bview/view destination-allocation {:dtype :float :shape [4]})
         source-view (bview/view source-allocation {:dtype :float :shape [4]})
         resident (gpu/->ResidentBufferView :session :destination-key destination-view)
-        executable (raster.gpu.test-lifecycle/linked-executable
+        executable (lifecycle/linked-executable
                     {:plan {:target :ze:0
                             :nodes {:destination {:id :destination :role :input
                                                   :view destination-view}}}
@@ -249,90 +255,93 @@
                      :lifetime-lock (Object.) :output-leases (atom 0)
                      :output-ready? (atom false) :execution-state (atom {:value-epoch 0})})
         device-array (fn [buffer view]
-                       (value/map->DeviceArray
-                        {:buffer buffer :device :ze:0 :dtype :float :shape [4] :view view
-                         :owner ::value/external :freed (AtomicBoolean. false)}))]
-    (testing "the exact destination view is a zero-copy readiness transition"
-      (with-redefs [gpu/buffer (fn [_ _] destination-buffer)
-                    gpu/copy-range! (fn [& _] (throw (AssertionError. "unexpected copy")))
-                    gpu/register-buffer! (fn [& _] (throw (AssertionError. "unexpected import")))]
-        (is (identical? executable
-                        (gpu-link/write! executable :destination
-                                         (device-array destination-buffer destination-view))))
-        (is (empty? @(:pending-inputs executable)))))
-    (testing "device preflight checks compatibility without imports or readiness mutation"
-      (reset! (:output-ready? executable) true)
-      (reset! (:pending-inputs executable) #{:destination})
-      (with-redefs [gpu/buffer (fn [_ _] destination-buffer)
-                    gpu/register-buffer! (fn [& _] (throw (ex-info "preflight imported storage" {})))
-                    gpu/copy-range! (fn [& _] (throw (ex-info "preflight copied storage" {})))]
-        (is (identical? executable
-                        (gpu-link/validate-write! executable :destination
-                                                  (device-array source-buffer source-view))))
-        (is (true? @(:output-ready? executable)))
-        (is (= #{:destination} @(:pending-inputs executable)))
-        (let [overlap (bview/view destination-allocation
-                                  {:dtype :float :shape [4] :byte-offset 4})]
-          (is (thrown-with-msg? clojure.lang.ExceptionInfo #"partially overlapping"
-                                (gpu-link/write! executable :destination
-                                                 (device-array destination-buffer overlap)))))
-        (is (true? @(:output-ready? executable)))
-        (is (= #{:destination} @(:pending-inputs executable)))))
-    (testing "a foreign compatible DeviceArray is copied resident-to-resident and detached"
-      (reset! (:pending-inputs executable) #{:destination})
-      (let [calls (atom [])
-            imported (gpu/->ResidentBufferView :session :temporary-key source-view)]
+                       (value/wrap-external-view buffer :ze:0 view))]
+    (try
+      (testing "the exact destination view is a zero-copy readiness transition"
         (with-redefs [gpu/buffer (fn [_ _] destination-buffer)
-                      gpu/register-buffer! (fn [_ key buffer opts]
-                                             (swap! calls conj [:register key buffer opts]))
-                      gpu/buffer-view (fn [_ key _]
-                                        (is (some? key))
-                                        imported)
-                      gpu/copy-range! (fn [_ src dst spec]
-                                        (swap! calls conj [:copy src dst spec]))
-                      gpu/free-buffer! (fn [_ key] (swap! calls conj [:detach key]))]
-          (gpu-link/write! executable :destination (device-array source-buffer source-view)))
-        (is (= [:register :copy :detach] (mapv first @calls)))
-        (is (= {:elements 4} (-> @calls second last)))
-        (is (empty? @(:pending-inputs executable)))))
-    (testing "a failed device copy does not preserve old initialized readiness"
-      (reset! (:pending-inputs executable) #{})
-      (let [failure (ex-info "simulated partially completed device copy" {})
-            detached (atom false)]
+                      gpu/copy-range! (fn [& _] (throw (AssertionError. "unexpected copy")))
+                      gpu/register-buffer! (fn [& _] (throw (AssertionError. "unexpected import")))]
+          (is (identical? executable
+                          (gpu-link/write! executable :destination
+                                           (device-array destination-buffer destination-view))))
+          (is (empty? @(:pending-inputs executable)))))
+      (testing "device preflight checks compatibility without imports or readiness mutation"
+        (reset! (:output-ready? executable) true)
+        (reset! (:pending-inputs executable) #{:destination})
         (with-redefs [gpu/buffer (fn [_ _] destination-buffer)
-                      gpu/register-buffer! (fn [& _] nil)
-                      gpu/buffer-view (fn [& _] (gpu/->ResidentBufferView ::session :import source-view))
-                      gpu/copy-range! (fn [& _] (throw failure))
-                      gpu/free-buffer! (fn [& _] (reset! detached true))]
-          (is (identical? failure
-                          (try (gpu-link/write! executable :destination
-                                                (device-array source-buffer source-view))
-                               (catch Throwable error error)))))
-        (is (true? @detached))
-        (is (= #{:destination} @(:pending-inputs executable)))
-        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"not been initialized"
-                              (gpu-link/run! executable)))))
-    (testing "a no-copy self-write cannot revive a failed destination"
-      (with-redefs [gpu/buffer (fn [& _] destination-buffer)]
-        (doseq [write [gpu-link/validate-write! gpu-link/write!]]
-          (is (= :link-device-input-tainted
-                 (try (write executable :destination
-                             (device-array destination-buffer destination-view))
-                      (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))))
-      (is (= #{:destination} @(:pending-inputs executable))))
-    (testing "copy failure stays primary when detaching the borrowed buffer also fails"
-      (let [failure (ex-info "copy failed" {})
-            cleanup (ex-info "detach failed" {})]
-        (with-redefs [gpu/buffer (fn [& _] destination-buffer)
-                      gpu/register-buffer! (fn [& _] nil)
-                      gpu/buffer-view (fn [& _] (gpu/->ResidentBufferView ::session :import source-view))
-                      gpu/copy-range! (fn [& _] (throw failure))
-                      gpu/free-buffer! (fn [& _] (throw cleanup))]
-          (is (identical? failure
-                          (try (gpu-link/write! executable :destination
-                                                (device-array source-buffer source-view))
-                               (catch Throwable error error))))
-          (is (= [cleanup] (vec (.getSuppressed failure)))))))))
+                      gpu/register-buffer! (fn [& _] (throw (ex-info "preflight imported storage" {})))
+                      gpu/copy-range! (fn [& _] (throw (ex-info "preflight copied storage" {})))]
+          (is (identical? executable
+                          (gpu-link/validate-write! executable :destination
+                                                    (device-array source-buffer source-view))))
+          (is (true? @(:output-ready? executable)))
+          (is (= #{:destination} @(:pending-inputs executable)))
+          (let [overlap (bview/view destination-allocation
+                                    {:dtype :float :shape [4] :byte-offset 4})]
+            (is (thrown-with-msg? clojure.lang.ExceptionInfo #"partially overlapping"
+                                  (gpu-link/write! executable :destination
+                                                   (device-array destination-buffer overlap)))))
+          (is (true? @(:output-ready? executable)))
+          (is (= #{:destination} @(:pending-inputs executable)))))
+      (testing "a foreign compatible DeviceArray is copied resident-to-resident and detached"
+        (reset! (:pending-inputs executable) #{:destination})
+        (let [calls (atom [])
+              imported (gpu/->ResidentBufferView :session :temporary-key source-view)]
+          (with-redefs [gpu/buffer (fn [_ _] destination-buffer)
+                        gpu/register-buffer! (fn [_ key buffer opts]
+                                               (swap! calls conj [:register key buffer opts]))
+                        gpu/buffer-view (fn [_ key _]
+                                          (is (some? key))
+                                          imported)
+                        gpu/copy-range! (fn [_ src dst spec]
+                                          (swap! calls conj [:copy src dst spec]))
+                        gpu/free-buffer! (fn [_ key] (swap! calls conj [:detach key]))]
+            (gpu-link/write! executable :destination (device-array source-buffer source-view)))
+          (is (= [:register :copy :detach] (mapv first @calls)))
+          (is (= {:elements 4} (-> @calls second last)))
+          (is (empty? @(:pending-inputs executable)))))
+      (testing "a failed device copy does not preserve old initialized readiness"
+        (reset! (:pending-inputs executable) #{})
+        (let [failure (ex-info "simulated partially completed device copy" {})
+              detached (atom false)]
+          (with-redefs [gpu/buffer (fn [_ _] destination-buffer)
+                        gpu/register-buffer! (fn [& _] nil)
+                        gpu/buffer-view (fn [& _] (gpu/->ResidentBufferView ::session :import source-view))
+                        gpu/copy-range! (fn [& _] (throw failure))
+                        gpu/free-buffer! (fn [& _] (reset! detached true))]
+            (is (identical? failure
+                            (try (gpu-link/write! executable :destination
+                                                  (device-array source-buffer source-view))
+                                 (catch Throwable error error)))))
+          (is (true? @detached))
+          (is (= #{:destination} @(:pending-inputs executable)))
+          (is (thrown-with-msg? clojure.lang.ExceptionInfo #"not been initialized"
+                                (gpu-link/run! executable)))))
+      (testing "a no-copy self-write cannot revive a failed destination"
+        (with-redefs [gpu/buffer (fn [& _] destination-buffer)]
+          (doseq [write [gpu-link/validate-write! gpu-link/write!]]
+            (is (= :link-device-input-tainted
+                   (try (write executable :destination
+                               (device-array destination-buffer destination-view))
+                        (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))))
+        (is (= #{:destination} @(:pending-inputs executable))))
+      (testing "copy failure stays primary when detaching the borrowed buffer also fails"
+        (let [failure (ex-info "copy failed" {})
+              cleanup (ex-info "detach failed" {})]
+          (with-redefs [gpu/buffer (fn [& _] destination-buffer)
+                        gpu/register-buffer! (fn [& _] nil)
+                        gpu/buffer-view (fn [& _] (gpu/->ResidentBufferView ::session :import source-view))
+                        gpu/copy-range! (fn [& _] (throw failure))
+                        gpu/free-buffer! (fn [& _] (throw cleanup))]
+            (is (identical? failure
+                            (try (gpu-link/write! executable :destination
+                                                  (device-array source-buffer source-view))
+                                 (catch Throwable error error))))
+            (is (= [cleanup] (vec (.getSuppressed failure)))))))
+      (finally
+        (cleanup/release! (cleanup/lifetime-owner source-buffer))
+        (cleanup/release! (cleanup/lifetime-owner destination-buffer))))
+    (is (= [:source :destination] @released))))
 
 (deftest failed-host-replacement-requires-overlapping-views-to-be-reinitialized
   (let [allocation (bview/allocation {:id :failed-transfer :byte-size 32 :memory-space :device
@@ -374,7 +383,10 @@
       (doseq [id [:alias :partial]] (gpu-link/upload! executable id (float-array 4)))
       (is (empty? @(:pending-inputs executable)))
       (gpu-link/run! executable)
-      (is (= {:value-epoch 5} @(:execution-state executable)))
+      (is (= {:value-epoch 5 :completed-epoch 5 :completed-replay 1}
+             @(:execution-state executable)))
+      (is (= 1 @(:completed-replays executable)))
+      (is (true? @(:output-ready? executable)))
       (is (true? @replayed)))))
 
 (deftest linked-owned-allocation-roots-are-execution-qualified

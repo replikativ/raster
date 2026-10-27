@@ -4,18 +4,28 @@
 
 ### Current boundary ledger
 
-Latest completed-job accounting, `f302c69c8` (October 26): unit job 35077 and
-CPU-OpenCL job 35078 fail; this branch is not merge-ready. The newer
-`ee4564262` checks remain in progress. Unit has 15 completed shards: 7,057
-tests, 89,508 passing assertions, 19 failures and 27 errors across 36 failing
-Vars. Shard 3 remains incomplete with 431 observed Vars, so these are not
-full-suite totals. CPU-OpenCL has all four completed shards: 674 tests,
-8,528 passing assertions, 6 failures and 27 errors across 31 failing Vars.
-The invocation/source-region/source-prefix failures from the preceding guard
-bundle no longer occur; AMR instead reaches the resident-input boundary below.
-The current artifacts supersede the older checkpoint counts
-below without waiving any remaining failure. Coverage counts vary with shard
-completion and are not evidence that tests were removed.
+Latest exact-head accounting, `55a741781` (October 26): unit job 35123 and
+CPU-OpenCL job 35119 fail; this branch is not merge-ready. All sixteen unit
+shards now complete: 7,636 tests, 94,821 passing assertions, 26 failures and 42
+errors across 53 failing Vars. CPU-OpenCL has all four completed shards: 676
+tests, 8,617 passing assertions, 6 failures and 27 errors across 31 failing Vars.
+Setup, build, emitted-source, CUDA and HIP compiler checks pass. Compiler-only
+vendor checks do not establish native execution or waive the failed unit/device
+gates. These complete reports supersede the older incomplete checkpoint counts
+below; failure-count changes against incomplete shards are not regression or
+test-removal measurements. The source-capacity alias refusals remain under
+investigation; completed-boundary fixture repairs are locally qualified below.
+
+The shared hardware-free output fixture now constructs a valid effect-checked
+plan, exact buffer/view geometry, and an initially uncompleted owner. Storage and
+resident-state tests acquire receipts only after public `link/run!`; no replay
+or readiness atoms are stamped to fabricate completion. Device-input transfer
+tests use typed lifetime-owned buffers and the public external-view constructor.
+The four affected namespaces pass 48 tests / 559 assertions, including real
+two-instance device output checks and the existing forged/stale/taint/cleanup
+negatives. Independent review found no remaining blocker. This is scoped
+qualification of the 11 completion-fixture errors and dtype fixture correction,
+not a claim that the full unit or CPU-OpenCL gates are green.
 
 The in-progress correction distinguishes an attached InvocationPlan from actual
 scalar-proof demand: strict source correspondence is necessary when a leaf uses
@@ -176,7 +186,19 @@ retained helper/lookup dependencies, late mutation and exception refusal, and
 completed proof traversal without touching quoted lazy data. Independent
 exact-diff review found no blocker. The combined affected source, emission,
 normalized AD lifetime and inlining gate passes 134 tests / 1,138 assertions in
-the reusable REPL. Actual GSDM completion and performance remain unqualified.
+the reusable REPL. The actual warmed GSDM probe now completes fixpoint
+construction in 178.3 seconds, then refuses source-capacity alias analysis after
+272.7 seconds of fused compilation. The two test Vars finish with one passing
+assertion and one error, not a successful training result. Instrumentation counts
+145,672 freshness checks (124.5 seconds inclusive), 15,645 original-frontend
+queries (16.4 seconds inclusive), and two AD preparations (1.2 seconds inclusive).
+Those times overlap and are not additive. Sampling points especially to
+normal-return summaries through local-product analysis. This supports scoped
+analysis/dependency reuse as the next compile-cost design problem; it does not
+justify removing freshness fences. A small existing optimizer-precision test
+reproduces the same capacity-refusal family and captures an actual typed
+container-array field read without repeating GSDM. Its causal capacity must be
+proved; consumer annotations must not supply the missing evidence.
 
 One independent convergence-domain defect is corrected: compiler fixpoints now
 use pair-local retained-source equality, allowing exact immutable Class identity,
