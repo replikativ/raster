@@ -1702,13 +1702,14 @@
                   (assoc-in [:attributes :allocations] allocations))]
     (dialect/make facts equations chunk-outputs)))
 
-(defn ^:no-doc realize-typed-component
-  "Shared post-fusion component pipeline, including structured-control continuations.
-   An internal public-output demand must come from a checked whole-source return projection,
-   never from a component's conservative live-outs or caller-supplied representation hints."
-  ([typed-input options] (realize-typed-component typed-input options []))
-  ([typed-input {:keys [resident-reductions? resident-initialization?
-                       resident-uniform-input-loads?]} public-outputs]
+(defn- merge-component-stats
+  [& reports]
+  (apply merge-with (fn [left right]
+                      (if (and (number? left) (number? right)) (+ left right) right))
+         reports))
+
+(defn- prepare-typed-component
+  [typed-input {:keys [resident-reductions? resident-uniform-input-loads?]} public-outputs]
   (when (and (seq public-outputs) (not resident-reductions?))
     (throw (ex-info "explicit public-output representation requires resident realization"
                     {:reason :typed-soac-resident-output-policy :requested public-outputs})))
@@ -1719,18 +1720,30 @@
         [typed-result resident-stats]
         (if resident-reductions?
           (resident/realize typed-result public-outputs)
-          [typed-result {:resident-reductions 0 :inlined-scalars 0}])
-        [typed-result initialization-stats]
+          [typed-result {:resident-reductions 0 :inlined-scalars 0}])]
+    {:program typed-result
+     :stats (merge-component-stats uniform-stats resident-stats)}))
+
+(defn- finish-typed-component
+  [{:keys [program stats]} {:keys [resident-initialization?]} component-context]
+  (let [[typed-result initialization-stats]
         (if resident-initialization?
-          (initialization/materialize typed-result)
-          [typed-result {}])
+          (initialization/materialize program component-context)
+          [program {}])
         [typed-result ownership-stats] (ownership/prove typed-result)]
     {:program typed-result
      :declined (sequential-continuation-decline typed-result)
-     :stats (merge-with (fn [left right]
-                          (if (and (number? left) (number? right)) (+ left right) right))
-                        uniform-stats resident-stats initialization-stats
-                        ownership-stats)})))
+     :stats (merge-component-stats stats initialization-stats ownership-stats)}))
+
+(defn ^:no-doc realize-typed-component
+  "Shared post-fusion component pipeline, including structured-control continuations.
+   An internal public-output demand must come from a checked whole-source return projection,
+   never from a component's conservative live-outs or caller-supplied representation hints."
+  ([typed-input options] (realize-typed-component typed-input options []))
+  ([typed-input options public-outputs]
+   (finish-typed-component
+    (prepare-typed-component typed-input options public-outputs)
+    options nil)))
 
 (defn- fuse-typed-component
   [typed-input {:keys [abstract-machine]}]
@@ -1740,9 +1753,12 @@
 (defn- realize-fused-component
   [{:keys [program stats]} options public-outputs]
   (update (realize-typed-component program options public-outputs) :stats
-            #(merge-with (fn [left right]
-                           (if (and (number? left) (number? right)) (+ left right) right))
-                         stats %)))
+          #(merge-component-stats stats %)))
+
+(defn- prepare-fused-component
+  [{:keys [program stats]} options public-outputs]
+  (update (prepare-typed-component program options public-outputs) :stats
+          #(merge-component-stats stats %)))
 
 (defn- public-source-return?
   [options]
@@ -1920,17 +1936,29 @@
                     (map #(fuse-typed-component
                            (typed-component-program projection %) options)))
               components)
-        provisional (when (public-source-return? options)
-                      (:program (assemble-component-envelope
-                                 form projection components fused-components)))
+        return-provisional (when (public-source-return? options)
+                             (:program (assemble-component-envelope
+                                        form projection components fused-components)))
         demand (set (source-return-demand
-                     (when provisional (realization-program projection fused-components))
-                     provisional options))
-        typed-components
+                     (when return-provisional
+                       (realization-program projection fused-components))
+                     return-provisional options))
+        prepared-components
         (mapv (fn [{:keys [program] :as fused}]
-                (realize-fused-component fused options
-                                         (filterv demand (dialect/outputs program))))
-              fused-components)]
+                (prepare-fused-component
+                 fused options (filterv demand (dialect/outputs program))))
+              fused-components)
+        initialization-provisional
+        (when (:resident-initialization? options)
+          (:program (assemble-component-envelope
+                     form projection components prepared-components)))
+        typed-components
+        (mapv (fn [{:keys [program] :as prepared}]
+                (finish-typed-component
+                 prepared options
+                 (when initialization-provisional
+                   {:parallel-program initialization-provisional :component program})))
+              prepared-components)]
     (assemble-component-envelope form projection components typed-components)))
 
 (defn program-envelope

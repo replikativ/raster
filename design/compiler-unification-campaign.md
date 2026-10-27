@@ -13,6 +13,18 @@ repairs, not accepted performance regressions or waived tests. CPU35357 complete
 all4 shards:682 tests /7,635 pass /20 failures /73 errors across79 failing Vars.
 Emission remains red; missing vendor checks are not passes. No merge/release.
 
+The predecessor bridge now runs uniform/resident realization before assembling
+the initialization context. Initialization consumes only its identical current
+component; complete ordered subprogram correspondence ties it to the enclosing
+program, and only already-available predecessor scalar proofs enter. No source
+actions move and no executable equations or ABI ports are added. Independent
+review plus extent6/48, actual production-boundary1/9 and causal device2/232
+pass. Six of seven reported routing regressions recover under unchanged tests;
+dynamic GEMM still exposes the separate optional Int-count selection problem.
+The wider initialization gate also retains an ordered-preparation error; it is
+not a full-suite pass. Required Int-count/Long-product and foreign-algorithm
+negative controls remain intact.
+
 Protected numerical source is not JVM-executable source evidence. Optional input
 frame projection now abstains before physical preparation when an executable
 protected operation is present (quoted data stays inert). It leaves the source
@@ -31,6 +43,11 @@ changed inputs on both OpenCL and Level Zero against the JVM (eight comparisons,
 zero maximum error on these inputs). It emits eight kernels including four
 conservative zero fills. Eliminating those fills requires a real extent/storage
 proof; Int-narrowed counts must not simply be equated to Long products.
+
+### Historical qualification notes
+
+The checkpoints below retain their original measurements. Their status and
+"next" statements are superseded by the current boundary ledger above.
 
 Latest completed unit CI is `061bf13ef` (35338, all16): 7,769 tests /
 95,508 pass / 53 failures / 112 errors across132 failing Vars. Three prior Vars

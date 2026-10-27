@@ -181,11 +181,30 @@
                {:allocation allocation :value value})))
     allocations))
 
+(defn- initial-extent-environment
+  [program component-context]
+  (let [initial (extent-proof/initial-environment program)
+        current-values (:values (dialect/facts program))
+        component-values (some-> component-context :component dialect/facts :values)
+        predecessors (when (and component-context
+                                (identical? program (:component component-context)))
+                       (extent-proof/component-environment-before component-context))]
+    (into initial
+          (keep (fn [[id proof]]
+                  (let [current (get initial id)
+                        facets [:kind :dtype :shape :representation :logical-layout]]
+                    (when (and current (= (:dtype current) (:dtype proof))
+                               (= (select-keys (get current-values id) facets)
+                                  (select-keys (get component-values id) facets)))
+                      [id proof]))))
+          predecessors)))
+
 (defn materialize
   "Return [program stats], inserting zero maps before the first physical use of fresh storage.
    Unspecified/copy allocations retain their own contracts. Elision needs exact dense coverage,
    never merely an ABI :write permission. Run after fusion and before ownership certification."
-  [program]
+  ([program] (materialize program nil))
+  ([program component-context]
   (dialect/validate! program)
   (let [original-facts (dialect/facts program)
         allocations (filter #(and (= :zero (:initialization %))
@@ -221,7 +240,7 @@
                  (assoc :available-extents (extent-proof/advance available-extents facts equation))
                  (update :equations conj equation))))
          {:facts original-facts :equations [] :pending (vec allocations) :fills 0 :elided 0 :native 0
-          :available-extents (extent-proof/initial-environment program)}
+          :available-extents (initial-extent-environment program component-context)}
          (dialect/equations program))
         native-only (filterv #(host-only-native-provider? facts %) pending)
         pending (remove (set native-only) pending)
@@ -240,4 +259,4 @@
         facts (assoc facts :inputs (vec (sort-by pr-str (set/difference references definitions))))]
     [(dialect/make facts equations (dialect/outputs program))
      {:initialization-fills fills :initialization-full-overwrites elided
-      :initialization-native-providers native}]))
+      :initialization-native-providers native}])))
