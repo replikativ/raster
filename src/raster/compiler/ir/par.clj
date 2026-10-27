@@ -10,6 +10,7 @@
   - Expanders: expand-par-map!, expand-par-reduce, etc.
   - Info extractors: extract-par-map-info, extract-par-reduce-info, etc."
   (:require [clojure.set :as set]
+            [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.op-descriptor :as descriptor]))
 
 ;; splitmix64 mixing constants — written via parseUnsignedLong because
@@ -21,6 +22,64 @@
 ;; ================================================================
 ;; Expansion functions (par forms → sequential loop S-expressions)
 ;; ================================================================
+
+(defn pure-map-expansion
+  "The source pmap allocation/count recipe, shared by its macro and materializer.
+   Complete the count to Int exactly once BEFORE allocation. Storage follows
+   the explicit cast (nil means Double), never conflicting logical metadata.
+   Canonical qualified/unqualified casts share the historical four storage
+   families; other casts retain the source macro's Double-storage fallback.
+   A private map counter does not change the source's observable Long ordinal.
+   The returned source is construction data, not an emission/ownership proof."
+  [result [_ index bound cast body :as source]]
+  (when-not (and (= 5 (count source)) (symbol? result) (symbol? index))
+    (throw (ex-info "pure map requires one lexical index, bound, cast and body"
+                    {:reason :unsupported-pure-map-materialization})))
+  (let [cast-tag (descriptor/cast-result-tag cast)
+        element (if (contains? '#{float double long int} cast-tag)
+                  (dtype/dtype-for-scalar-tag cast-tag) :double)
+        facets (get dtype/dtype-info element)
+        occupied (atom #{result})
+        _ (letfn [(visit [node]
+                    (cond
+                      (symbol? node) (swap! occupied conj node)
+                      (and (seq? node) (contains? '#{quote clojure.core/quote} (first node))) nil
+                      (coll? node) (doseq [child node] (visit child))))]
+            (visit source))
+        fresh (fn [prefix]
+                (loop [id (gensym prefix)]
+                  (if (contains? @occupied id) (recur (gensym prefix))
+                      (do (swap! occupied conj id) id))))
+        count-id (fresh "pmap_count__")
+        private-index (fresh "pmap_index__")
+        ;; A let initializer may read the same-spelled OUTER value. Do not
+        ;; introduce its result buffer into the source body's lexical scope.
+        aliases-outer? (letfn [(mentions? [node]
+                                (cond
+                                  (symbol? node) (= result node)
+                                  (and (seq? node) (contains? '#{quote clojure.core/quote} (first node))) false
+                                  (coll? node) (boolean (some mentions? node))
+                                  :else false))]
+                         (mentions? body))
+        ;; A source binding's declared completion occurs AFTER the map finishes.
+        ;; Keep that binder intact rather than moving its check onto allocation.
+        separate-result? (or aliases-outer? (:tag (meta result)) (:raster.type/tag (meta result)))
+        output (if separate-result? (fresh "pmap_output__") result)
+        buffer (with-meta output (merge (meta output)
+                                      {:tag (:array-tag facets) :raster.type/tag (:array-tag facets)
+                                       :raster.buffer/hoistable true}))
+        effect (with-meta (fresh "pmap_effect__") {:raster.effect/effectful true})
+        mapped (with-meta
+                 (list 'raster.par/map! output private-index count-id (or cast 'clojure.core/double)
+                       (list 'let* [index (list 'clojure.core/long private-index)] body))
+                 (assoc (meta source) :raster.type/elem-type element))
+        bindings (cond-> [[count-id (list 'clojure.core/int bound)]
+                          [buffer (list (:jvm-array-constructor facets) count-id)]
+                          [effect mapped]]
+                   separate-result? (conj [result output]))]
+    {:source source :bindings bindings :result result :element-type element
+     :count count-id :output output :map mapped
+     :form (list 'let* (vec (mapcat identity bindings)) result)}))
 
 (defn expand-par-active-ids
   "Expand a (raster.par/active-ids! ids n-active n-agents base-seed) form to sequential loop S-expression."

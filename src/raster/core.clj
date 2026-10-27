@@ -384,14 +384,15 @@
   [emitter class-name params tags return-tag body source-ns typed-interface mangled-sym & [preparation-inputs]]
   (loop [attempt 0]
     (let [{owned-body :body invocation-catalog :catalog binding-catalog :binding-catalog
-           reduction-catalog :reduction-catalog completion-catalog :completion-catalog
+           reduction-catalog :reduction-catalog pmap-catalog :pmap-catalog
+           completion-catalog :completion-catalog
            input-origins :input-origins}
           ((requiring-resolve 'raster.compiler.backend.jvm.bytecode/retain-invocation-occurrences) body)
           inputs (atom (assoc (merge {:static [] :values []}
                                      (select-keys preparation-inputs
                                                   [:static :values :definition-proofs
                                                    :producer-inputs]))
-                              :reduction-sources reduction-catalog))
+                              :reduction-sources reduction-catalog :pmap-sources pmap-catalog))
           _ (me/assert-definition-inputs-current! @inputs)
           dependencies ((requiring-resolve 'raster.compiler.backend.jvm.bytecode/prepare-emission-input-snapshots!)
                         body source-ns params)
@@ -414,6 +415,7 @@
                     :array-read-contexts (:array-read-contexts @inputs)
                     :array-allocation-contexts (:array-allocation-contexts @inputs)
                     :reduction-catalog reduction-catalog
+                    :pmap-catalog pmap-catalog :pmap-expansions (:pmap-expansions @inputs)
                     :input-origins input-origins
                     :reduction-expansions (:reduction-expansions @inputs)
                     :reduction-contexts (:reduction-contexts @inputs)

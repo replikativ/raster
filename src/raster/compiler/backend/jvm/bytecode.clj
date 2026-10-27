@@ -13,6 +13,8 @@
             [raster.compiler.core.binding-completion :as binding-completion]
             [raster.compiler.core.source-arithmetic :as source-arithmetic]
             [raster.compiler.core.source-policy :as source-policy]
+            [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.inference :as inf]
             [raster.compiler.core.types :as types]
             [raster.compiler.core.macroexpand :as mex]
@@ -641,6 +643,7 @@
   (if (instance? clojure.lang.IObj expression)
     (vary-meta expression dissoc ::call-occurrence ::binding-scope-occurrence
                ::reduction-occurrence ::reduction-witness ::reduction-role
+               ::pmap-occurrence
                ::completion-occurrence)
     expression))
 
@@ -671,7 +674,8 @@
    catalog is private to the owning emission, not a source/cache identity or
    authority reconstructed by comparing expressions. Quoted values stay opaque."
   [body]
-  (let [catalog (atom {}) scopes (atom {}) reductions (atom {}) completions (atom {}) origins (atom {})]
+  (let [catalog (atom {}) scopes (atom {}) reductions (atom {}) pure-maps (atom {})
+        completions (atom {}) origins (atom {})]
     (letfn [(visit [expression]
               (if (and (seq? expression)
                        (contains? #{'quote 'clojure.core/quote} (first expression)))
@@ -685,6 +689,12 @@
                           owned (vary-meta node assoc ::completion-occurrence token)]
                       (swap! completions assoc token owned)
                       (swap! origins update :completion (fnil conj []) [expression owned])
+                      owned)
+                    (par/par-map-pure-form? node)
+                    (let [token (Object.)
+                          owned (vary-meta node assoc ::pmap-occurrence token)]
+                      (swap! pure-maps assoc token owned)
+                      (swap! origins update :pmap (fnil conj []) [expression owned])
                       owned)
                     (par/par-reduce-form? node)
                     (let [token (Object.)
@@ -707,6 +717,7 @@
                       owned)))))]
       (let [owned (with-meta (mapv visit body) {::body-occurrence (Object.)})]
         {:body owned :catalog @catalog :binding-catalog @scopes :reduction-catalog @reductions
+         :pmap-catalog @pure-maps
          :completion-catalog @completions
          :input-origins (when (seq @origins)
                           (InputOrigins. body owned @origins))}))))
@@ -769,6 +780,42 @@
                  (assoc expansions token (if (contains? expansions token)
                                           {:status :ambiguous} record))))
         expanded))))
+
+(defn- expand-owned-pmap
+  "Consume the shared source materialization before wrapper/macro paths diverge.
+   The record owns a construction edge only, not numerical or storage admission."
+  [form]
+  (when me/*emission-inputs*
+    (doseq [v [#'par/pure-map-expansion #'descriptor/cast-result-tag #'descriptor/cast-ops
+               #'dtype/dtype-for-scalar-tag #'dtype/dtype-info]]
+      (me/observe-definition-input! v (:ns (meta v)) (:name (meta v)))))
+  (let [recipe (par/pure-map-expansion (gensym "pmap_result__") form)
+        token (::pmap-occurrence (meta form))
+        source (when me/*emission-inputs* (get-in @me/*emission-inputs* [:pmap-sources token]))]
+    (when (and source (identical? form source))
+      (swap! me/*emission-inputs* update :pmap-expansions
+             (fn [records]
+               (assoc records token
+                      (if (contains? records token) {:status :ambiguous}
+                          {:status :known :source source :recipe recipe
+                           :producer @#'par/pure-map-expansion})))))
+    (:form recipe)))
+
+(defn ^:no-doc retained-pmap-expansion
+  "The exact shared pmap recipe consumed by this original module.
+   Caller must authenticate the module owner. Copies and legacy/repeated sites
+   refuse; this is neither a physical result Class nor permission to move work."
+  [emission original]
+  (let [token (::pmap-occurrence (meta original))
+        record (get (:pmap-expansions emission) token)]
+    (when (and (= :jvm-bytecode (:backend emission)) token
+               (= :known (:status record))
+               (identical? original (get (:pmap-catalog emission) token))
+               (identical? original (:source record))
+               (identical? original (get-in record [:recipe :source]))
+               (identical? (:producer record) @#'par/pure-map-expansion))
+      (me/assert-emission-inputs-current! emission)
+      record)))
 
 (defn- reduction-result-fact
   "Normal-return fact for the observed carry load and divergent-if boxing path.
@@ -1625,6 +1672,9 @@
         (pre-expand-par-forms (list 'if pred then-expr false))
         ;; or pattern: (let [t (cmp)] (if t t expr)) → (if (cmp) true expr)
         (pre-expand-par-forms (list 'if pred true else-expr))))
+
+    (par/par-map-pure-form? form)
+    (pre-expand-par-forms (expand-owned-pmap form))
 
     (par/par-map-form? form)
     (try (par/expand-par-map! form)

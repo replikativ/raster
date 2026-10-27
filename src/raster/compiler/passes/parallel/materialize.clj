@@ -3,67 +3,29 @@
 
   Pure par/pmap forms (raster.par/pmap idx bound cast body) are value-producing
   with no output buffer. This pass converts them to:
-    out = (alloc bound)
-    sym = (raster.par/map! out idx bound cast body)
+    count = (clojure.core/int bound)
+    out = (alloc count)
+    sym = (raster.par/map! out private-idx count cast (let [idx (long private-idx)] body))
+
+  The runtime macro and JVM emitter use this same recipe. Bound evaluation,
+  allocation and the source binding's final completion retain their order.
 
   This runs after SOAC fusion so that fusion operates on pure forms.
   Downstream passes (segop-lower, backend, mem-merge) expect par/map!."
   (:require [raster.compiler.ir.par :as par]
+            [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.ir.form :as form]))
 
 (declare materialize-let)
 
-(def ^:private elem-type->alloc-fn
-  {:float  'clojure.core/float-array
-   :double 'clojure.core/double-array
-   :long   'clojure.core/long-array
-   :int    'clojure.core/int-array
-   :byte   'clojure.core/byte-array})
-
-(def ^:private elem-type->array-tag
-  {:float  'floats
-   :double 'doubles
-   :long   'longs
-   :int    'ints
-   :byte   'bytes})
-
 (defn- materialize-pure-map
-  "Convert a pure par/map form into [alloc-binding effect-binding]: the binding
-  symbol ITSELF becomes the buffer (allocated), and the par/map! writes it in place
-  as an effect. This avoids introducing a redundant alias (sym = a fresh out-buffer)
-  that every backend would then have to copy-propagate away.
-  Returns [[result-sym alloc-expr] [effect-sym map!-expr]]."
+  "Use the source pmap's one checked count, allocation and store recipe."
   [sym form]
-  (let [{:keys [idx bound cast body elem-type]} (par/extract-par-map-pure-info form)
-        ;; Derive elem-type from cast-fn if metadata doesn't carry it
-        elem-type (or elem-type
-                      (case cast
-                        (float clojure.core/float) :float
-                        (long clojure.core/long) :long
-                        (int clojure.core/int) :int
-                        (double clojure.core/double) :double
-                        (throw (ex-info (str "materialize: cannot determine element type for par/map with cast `"
-                                             cast "`. Ensure walker stamps :elem-type metadata.")
-                                        {:reason :unsupported-pure-map-materialization
-                                         :sym sym :cast cast}))))
-        alloc-fn (or (get elem-type->alloc-fn elem-type)
-                     (throw (ex-info (str "materialize: no alloc-fn for elem-type " elem-type)
-                                     {:reason :unsupported-pure-map-materialization
-                                      :elem-type elem-type})))
-        array-tag (or (get elem-type->array-tag elem-type)
-                      (throw (ex-info (str "materialize: no array-tag for elem-type " elem-type)
-                                      {:reason :unsupported-pure-map-materialization
-                                       :elem-type elem-type})))
-        ;; the binding symbol IS the buffer (no separate out-sym alias)
-        buf-sym (with-meta sym
-                  {:tag array-tag
-                   :raster.type/tag array-tag
-                   :raster.buffer/hoistable true})
-        map!-form (with-meta
-                    (list 'raster.par/map! sym idx bound cast body)
-                    (meta form))]
-    [[buf-sym (list alloc-fn bound)]
-     [(with-meta (gensym "_mapeff_") {:raster.effect/effectful true}) map!-form]]))
+  (let [cast (:cast (par/extract-par-map-pure-info form))]
+    (when-not (or (nil? cast) (descriptor/cast-op? cast))
+      (throw (ex-info "materialize requires a supported primitive map cast"
+                      {:reason :unsupported-pure-map-materialization :sym sym :cast cast})))
+    (:bindings (par/pure-map-expansion sym form))))
 
 (defn- materialize-expr
   "Recursively materialize pure par/map forms in an expression.
@@ -74,11 +36,8 @@
 
     (par/par-map-pure-form? expr)
     (let [result-sym (gensym "result__")
-          ;; buf-sym IS result-sym now (the buffer); eff-sym is the in-place map! write
-          [[buf-sym alloc-expr] [eff-sym map!-form]] (materialize-pure-map result-sym expr)]
-      (list 'let* [buf-sym alloc-expr
-                   eff-sym map!-form]
-            result-sym))
+          bindings (materialize-pure-map result-sym expr)]
+      (list 'let* (vec (mapcat identity bindings)) result-sym))
 
     (and (seq? expr) (= 'let* (first expr)))
     (materialize-let expr)
@@ -97,9 +56,7 @@
         new-pairs (mapcat
                    (fn [[sym init]]
                      (if (par/par-map-pure-form? init)
-                       ;; [sym alloc] (sym IS the buffer) + [eff map!-into-sym]
-                       (let [[buf-pair eff-pair] (materialize-pure-map sym init)]
-                         [buf-pair eff-pair])
+                       (materialize-pure-map sym init)
                        [[sym (materialize-expr init)]]))
                    pairs)
         new-bindings (vec (mapcat identity new-pairs))

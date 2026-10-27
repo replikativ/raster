@@ -119,6 +119,27 @@ readiness, and the inherited-history gate passes 34 / 300. Primitive Float
 rounding, boxed identity and nullable/unused array checks remain covered. No new
 function-purity registry or runtime target restamping is introduced.
 
+The allocating-map source paths now share one recipe. A real owned import
+previously evaluated its bound twice and allocated Double storage before failing
+a Float-array return check. Runtime `pmap`, late materialization and JVM
+pre-expansion now consume the same checked-count→allocation→map→result sequence.
+It preserves one bound evaluation before allocation, the source Long ordinal,
+outer-result shadowing and a tagged result's check after the map body. Logical
+element metadata cannot override the actual cast/storage recipe. Qualified core
+casts (including resolved unchecked conversions) normalize to the same four
+existing Float/Double/Long/Int storage families; this corrects an internal `pmap`
+token-spelling inconsistency, not the public combinator syntax. Other cast
+families retain the previous Double fallback or compiler refusal.
+
+Original modules retain the exact shared expansion they consumed and its
+definition history. Source import rejects legacy, copied, repeated or stale
+evidence; a construction edge grants no numerical projection or output-storage
+claim. The focused gate passes 7 tests / 196 assertions, including original,
+materialized, owned-import and public AOT execution; affected object/SIMD/return
+gates pass 58 / 984. Independent review found no blocker. The public mixed-scale
+GPU fixture still refuses at the protected body boundary, so source-context and
+numerical correspondence must be completed before treating that vertical as green.
+
 The next source closure must combine request-local cold readiness with a verified
 projection of complete result-context regions. Queries must remain non-preparing;
 neither removing result-context barriers nor warming all helpers indiscriminately

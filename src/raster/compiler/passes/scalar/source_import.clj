@@ -870,6 +870,12 @@
   (letfn [(walk [node]
             (cond
               (and (seq? node) (contains? '#{quote clojure.core/quote} (first node))) node
+              (par/par-map-pure-form? node)
+              (do
+                (when-not ((helper-backend 'retained-pmap-expansion) emission node)
+                  (decline! "Generated pmap import lacks its original shared expansion"
+                            {:operation (first node)}))
+                (util/remake-if-changed node (mapv walk node)))
               (and (seq? node) (= 'let* (first node)))
               (let [[head bindings & tail] node
                     previous (volatile! nil)
