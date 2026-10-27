@@ -2225,14 +2225,24 @@
               (Class/forName (:jvm-array-class-name facets))))
           dtype/dtype-info)))
 
+(defn- excluded-array-count?
+  "A private, identity-only abstention. Exclusion cannot validate or rewrite an expression."
+  [options expression]
+  (let [counts (::retained-allocation-counts options)]
+    (and (instance? java.util.IdentityHashMap counts)
+         (seq? expression) (= 2 (count expression))
+         (some? (direct-array-constructor-class expression))
+         (.containsKey ^java.util.IdentityHashMap counts (second expression)))))
+
 (defn- construct-contextual-array-count-frame
   "Name one exact owned newarray count at its original constructor site.
    The physical count is JVM Int, while every public/frame input remains in
    the existing Long domain. This transports wrapping and failure order only;
    it grants no equality with a mathematical Long extent or capacity fact."
-  [witness original binding facts projector]
+  [witness original binding facts projector options]
   (let [{:keys [emission input-body]} witness
-        array-class (direct-array-constructor-class original)
+        array-class (when-not (excluded-array-count? options original)
+                      (direct-array-constructor-class original))
         record (when (and array-class (seq? (second original)))
                  ((helper-backend 'retained-input-array-count-context)
                   emission input-body original))
@@ -2433,7 +2443,7 @@
                    observed (current-source-binding!
                              witness ordinal binder original :source-input-frame-binding :source-input-frame-observation)
                    frame (or (construct-contextual-array-count-frame
-                              witness original observed facts projector)
+                              witness original observed facts projector options)
                              (construct-contextual-input-frame
                               witness original observed facts projector))
                    constructed (cond-> constructed
@@ -2454,16 +2464,18 @@
 
 (defn ^:no-doc contextual-invocation-argument-candidate?
   "Cheap routing only; exact current invocation/constructor and callback closure are separate."
-  [source]
-  (boolean
-   (and (seq? source) (= 'let* (first source)) (vector? (second source))
-        (some (fn [[_ expression]]
-                (and (seq? expression)
-                     (or (and (= '.invk (first expression))
-                              (some seq? (drop 2 expression)))
-                         (and (direct-array-constructor-class expression)
-                              (seq? (second expression))))))
-              (partition 2 (second source))))))
+  ([source] (contextual-invocation-argument-candidate? source {}))
+  ([source options]
+   (boolean
+    (and (seq? source) (= 'let* (first source)) (vector? (second source))
+         (some (fn [[_ expression]]
+                 (and (seq? expression)
+                      (or (and (= '.invk (first expression))
+                               (some seq? (drop 2 expression)))
+                          (and (direct-array-constructor-class expression)
+                               (seq? (second expression))
+                               (not (excluded-array-count? options expression))))))
+               (partition 2 (second source)))))))
 
 (defn ^:no-doc project-contextual-reference-helpers
   "Project an exact witnessed flat prefix using owned operation evidence.

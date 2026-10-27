@@ -11,6 +11,7 @@
             [raster.compiler.passes.scalar.source-import :as source-import]
             [raster.compiler.ir.segmented-weighted-reduction :as swr]
             [raster.compiler.passes.parallel.structured-control-route :as structured-route]
+            [raster.compiler.passes.parallel.typed-soac-frontend :as typed-frontend]
             [raster.compiler.passes.parallel.typed-soac-route :as typed-route]
             [raster.compiler.ir.semantic-fingerprint :as semantic-fingerprint]
             [raster.compiler.ad.flatten :as flat]
@@ -57,6 +58,29 @@
     (is (= :segmented-reduction-marker-missing-plan
            (try (swr/protected-marker-plan marker :float) nil
                 (catch clojure.lang.ExceptionInfo failure (:reason (ex-data failure))))))))
+
+(deftest admitted-constructor-counts-do-not-start-optional-source-emission
+  (let [count-expression (list 'clojure.core/* 'width 'width)
+        source (list 'let* ['scratch (list 'clojure.core/float-array count-expression)] 'scratch)
+        options {:source-var #'identity :scalar-types {'width :long}}
+        retained (typed-frontend/retained-allocation-count-expressions source options)
+        frame-options {:required? true
+                       ::source-import/retained-allocation-counts retained}
+        preparations (atom 0)
+        projections (atom 0)
+        construct (#'pipeline/contextual-reduction-constructor options)]
+    (is (source-import/contextual-invocation-argument-candidate? source)
+        "the global/default SourceImport candidate remains unchanged")
+    (is (not (source-import/contextual-invocation-argument-candidate?
+              source frame-options)))
+    (with-redefs [source-import/prepare-contextual-source-witness
+                  (fn [& _] (swap! preparations inc) (throw (Exception. "unexpected emission")))
+                  source-import/project-contextual-invocation-arguments
+                  (fn [& _] (swap! projections inc) {:frames [:forged]})]
+      (is (nil? (construct {:kind :ordered-invocation-arguments :source source}))))
+    (is (zero? @preparations))
+    (is (zero? @projections)
+        "a denial can avoid proof construction but cannot manufacture a projection")))
 
 (deftest gpu-target-metadata-does-not-authorize-source-construction
   (let [constructed (atom 0)

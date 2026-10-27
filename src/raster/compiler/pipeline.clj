@@ -989,13 +989,19 @@
           (source-import/project-contextual-reference-helpers (owner! source)))
 
         (= kind :ordered-invocation-arguments)
-        (when (and (source-import/contextual-invocation-argument-candidate? source)
-                   (not (protected-semantic-source? source)))
-          ;; The current source may already contain schedule-neutral protected
-          ;; operations. Keep it unchanged rather than physically emitting a
-          ;; compiler marker to invent a JVM observation. Required final source
-          ;; adapters still need their own exact executable witness.
-          (source-import/project-contextual-invocation-arguments (owner! source) {:required? true}))
+        (let [retained-counts
+              (typed-soac-frontend/retained-allocation-count-expressions source options)
+              frame-options {:required? true
+                             ::source-import/retained-allocation-counts retained-counts}]
+          (when (and (source-import/contextual-invocation-argument-candidate?
+                      source frame-options)
+                     (not (protected-semantic-source? source)))
+            ;; The current source may already contain schedule-neutral protected
+            ;; operations. Keep it unchanged rather than physically emitting a
+            ;; compiler marker to invent a JVM observation. Required final source
+            ;; adapters still need their own exact executable witness.
+            (source-import/project-contextual-invocation-arguments
+             (owner! source) frame-options)))
 
         (= kind :checked-array-length-source)
         (when (source-import/contextual-array-length-candidate? source)

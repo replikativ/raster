@@ -3637,6 +3637,19 @@
     (into (set (filter symbol? (take-nth 2 bindings)))
           (mapcat keys type-maps))))
 
+(defn- declared-source-kinds
+  "Derive the exact array/scalar declarations used by normalization and cheap source queries."
+  [source array-types scalar-types]
+  (let [binders (when (and (seq? source) (contains? #{'let 'let*} (first source)))
+                  (filter symbol? (take-nth 2 (second source))))
+        tagged (fn [kind?]
+                 (set (filter #(kind? (types/sym-type-tag %)) binders)))]
+    {:arrays (into (set (keys array-types))
+                   (tagged #(some? (dtype/dtype-for-array-tag %))))
+     :scalars (into (set (keys scalar-types))
+                    (tagged #(contains? #{:long :int}
+                                        (some-> % dtype/dtype-for-scalar-tag dtype/canon))))}))
+
 (def ^:dynamic ^:private *declared-kinds*
   "Declared value kinds visible to `normalize-source`: `{:arrays #{sym} :scalars #{sym}}`."
   {:arrays #{} :scalars #{}})
@@ -3690,6 +3703,28 @@
         (list 'clojure.core/alength (first arguments))
 
         :else nil))))
+
+(defn ^:no-doc retained-allocation-count-expressions
+  "Return an identity set of direct-constructor counts already admitted by this frontend.
+
+   This is a denial aid for optional source normalization, not an allocation proof. It neither
+   rewrites source nor publishes scalar/dtype facts. Unknown calls, array-valued/unknown symbols
+   and unsupported arithmetic are absent."
+  [source {:keys [array-types scalar-types]}]
+  (let [counts (java.util.IdentityHashMap.)
+        declared (declared-source-kinds source array-types scalar-types)]
+    (binding [util/*shadowing-locals* (source-shadowing-locals source array-types scalar-types)
+              *declared-kinds* declared]
+      (when (and (seq? source) (contains? #{'let 'let*} (first source))
+                 (vector? (second source)))
+        (doseq [[_ expression] (partition 2 (second source))]
+          (when-let [extent (allocation-length expression)]
+            (let [arguments (when (seq? expression) (vec (descriptor/call-args expression)))]
+              ;; A direct one-argument constructor returns its exact count object. Alloc-like
+              ;; one-argument calls return `(alength exemplar)` and do not enter this set.
+              (when (and (= 1 (count arguments)) (identical? extent (first arguments)))
+                (.put counts extent true)))))))
+    counts))
 
 (defn- resolve-direct-allocation-alengths
   "Partially evaluate `alength` whose operand is itself a recognized allocation expression.
@@ -5169,22 +5204,11 @@
    so the same expression remains visible to JVM materialization and runtime specialization."
   ([source] (normalize-source source {}))
   ([source {:keys [array-types scalar-types] :as options}]
-   ;; The let's own binders declare kinds too: a `^long n` binder is a scalar, a `^floats y`
-   ;; binder an array, exactly as the walker stamps them.
-   (let [binders (when (and (seq? source) (contains? #{'let 'let*} (first source)))
-                   (filter symbol? (take-nth 2 (second source))))
-         tagged (fn [kind?]
-                  (set (filter #(kind? (types/sym-type-tag %)) binders)))]
+   (let [declared (declared-source-kinds source array-types scalar-types)]
      (binding [util/*shadowing-locals* (source-shadowing-locals source array-types scalar-types)
                *region-local-counter* (atom -1)
                *region-local-source-symbols* (source-symbols source options)
-               *declared-kinds*
-               {:arrays (into (set (keys array-types))
-                              (tagged #(some? (dtype/dtype-for-array-tag %))))
-                :scalars (into (set (keys scalar-types))
-                               (tagged #(contains? #{:long :int}
-                                                   (some-> % dtype/dtype-for-scalar-tag
-                                                           dtype/canon))))}]
+               *declared-kinds* declared]
        (normalize-source* (copy-allocations->maps source array-types (source-symbols source options))
                           array-types scalar-types options)))))
 

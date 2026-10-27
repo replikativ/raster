@@ -19,11 +19,29 @@ component; complete ordered subprogram correspondence ties it to the enclosing
 program, and only already-available predecessor scalar proofs enter. No source
 actions move and no executable equations or ABI ports are added. Independent
 review plus extent6/48, actual production-boundary1/9 and causal device2/232
-pass. Six of seven reported routing regressions recover under unchanged tests;
-dynamic GEMM still exposes the separate optional Int-count selection problem.
-The wider initialization gate also retains an ordered-preparation error; it is
-not a full-suite pass. Required Int-count/Long-product and foreign-algorithm
+pass. A denial-only count selector reuses the existing frontend admission rule,
+leaving already-supported constructors and their logical extent/runtime count
+checks unchanged. Unsupported compound typed calls still receive owned Int
+frames. No arithmetic classifier or type registry was added. All seven reported
+routing regressions now pass unchanged (7/124), and the broader fusion,
+initialization, scalar-activation and public-return matrix passes102/712.
+Selection controls pass4/46. This also recovers the initialization cross-compile
+gate; full CI remains required. Int-count/Long-product and foreign-algorithm
 negative controls remain intact.
+Final affected completion namespaces pass41/688, and the four actual local-backend
+replay tests pass432 assertions: groupnorm, compound argument frames, zero
+initialization order, and existing planned completions. These include changed
+inputs and changed extents on both OpenCL and Level Zero; GPU skips are not used
+as numerical qualification.
+
+Coverage reconciliation: the seven-assertion
+`generated-storage-actions-do-not-partition-fusible-maps` test was replaced by
+`generated-storage-actions-partition-causal-components-without-host-boundaries`.
+Its former cross-action fusion expectation was deliberately corrected: allocation
+and source-completion order is observable. The replacement checks retained source
+actions, exact order and return aliases, component prefixes, and unchanged
+projection-free compatibility behavior. Pure and uniformly materialized fusion
+remain covered by the full fusion namespace; this is not a waived CI failure.
 
 Protected numerical source is not JVM-executable source evidence. Optional input
 frame projection now abstains before physical preparation when an executable

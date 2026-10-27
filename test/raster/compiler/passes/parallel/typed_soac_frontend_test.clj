@@ -826,6 +826,26 @@
     (is (not-any? #(and (seq? %) (= 'clojure.core/alength (first %)))
                   (tree-seq coll? seq normalized)))))
 
+(deftest retained-allocation-count-query-reuses-declared-source-kinds
+  (let [count-expression (list 'clojure.core/* 'n 'width)
+        source (list 'let* ['out (list 'clojure.core/float-array count-expression)] 'out)
+        options {:scalar-types {'n :long 'width :long}}
+        retained (frontend/retained-allocation-count-expressions source options)
+        copied (with-meta (apply list count-expression) (meta count-expression))]
+    (is (.containsKey ^java.util.IdentityHashMap retained count-expression))
+    (is (not (.containsKey ^java.util.IdentityHashMap retained copied))
+        "denial follows the actual source occurrence, not structural equality")
+    (doseq [[expression candidate-options]
+            [[(list '.invk 'raster.numeric/_star__m_long_long-impl 'n 'width)
+              options]
+             ['unknown options]
+             ['array-count {:array-types {'array-count :float}}]]]
+      (let [candidate (list 'let* ['out (list 'clojure.core/float-array expression)] 'out)]
+        (is (zero? (.size ^java.util.IdentityHashMap
+                          (frontend/retained-allocation-count-expressions
+                           candidate candidate-options)))
+            "unsupported calls, unknown symbols and arrays acquire no scalar denial")))))
+
 (deftest cast-local-allocation-length-retains-the-conversion
   (doseq [cast ['clojure.core/long 'clojure.core/int]]
     (let [source (list 'let* ['buffer '(raster.arrays/zeros-like input n)

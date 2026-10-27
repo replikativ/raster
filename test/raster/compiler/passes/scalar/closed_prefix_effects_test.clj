@@ -133,8 +133,23 @@
              options {:source-var source :source-ns (.ns ^clojure.lang.Var source)
                       :lexical-inputs (get-in frontend [:emission :params])}
              witness (source-import/prepare-contextual-source-witness body options)
+             constructor (some (fn [[_ expression]]
+                                 (when (and (seq? expression)
+                                            (= 'clojure.core/float-array (first expression)))
+                                   expression))
+                               (partition 2 (second body)))
+             denied (doto (java.util.IdentityHashMap.)
+                      (.put (second constructor) true))
+             retained (typed-frontend/retained-allocation-count-expressions body options)
+             _ (is (nil? (source-import/project-contextual-invocation-arguments
+                          witness {:required? true
+                                   ::source-import/retained-allocation-counts denied}))
+                   "a selected exact count is only denied; no replacement proof is produced")
+             _ (is (zero? (.size ^java.util.IdentityHashMap retained))
+                   "the frontend does not claim a typed .invk count as core arithmetic")
              projected (source-import/project-contextual-invocation-arguments
-                        witness {:required? true})]
+                        witness {:required? true
+                                 ::source-import/retained-allocation-counts retained})]
          (is (= 1 (count (:frames projected))))
          (when projected
            (let [artifact (first (:frames projected))
