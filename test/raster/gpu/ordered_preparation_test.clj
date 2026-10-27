@@ -18,6 +18,7 @@
             [raster.compiler.fixtures.mixed-storage :as mixed]
             [raster.core :refer [deftm]]
             [raster.par :as par]
+            [raster.arrays :as arrays]
             [raster.numeric :as n]
             [raster.compiler.passes.scalar.effects :as effects]
             [raster.compiler.passes.scalar.source-import :as source-import]
@@ -301,27 +302,41 @@
   (let [count (n/* width (n/- height width))]
     (par/map! out i count float (n/+ (float i) (float width)))))
 
-(defn- check-compound-input-frame! [target]
-  (let [compilation (equation-first/compile #'compound-frame-map {:target target :dtype :float})]
-    (is (= 1 (count (:kernels compilation))))
+(deftm compound-frame-zero-map [x :- (Array float) width :- Long height :- Long] :- (Array float)
+  (let [span (n/- height width)
+        count (n/* width span)
+        out (arrays/zeros-like x (n/* width span))]
+    (par/map! out i count float (n/+ (aget out i) (n/+ (aget x i) (float width))))))
+
+(defn- check-compound-input-frame!
+  ([target] (check-compound-input-frame! target #'compound-frame-map 1 true))
+  ([target operation expected-kernels captured-state?]
+  (let [compilation (equation-first/compile operation {:target target :dtype :float})]
+    (if expected-kernels
+      (is (= expected-kernels (count (:kernels compilation))))
+      (is (pos? (count (:kernels compilation)))))
     (is (some #(> (count (:input-bindings %)) 1)
               (vals (:source-completion-adapters compilation))))
     ;; Reuse the same compiled adapters with different scalar bindings.
-    (doseq [[width height] [[2 6] [1 9]]]
-      (let [x (float-array 8)
+    (doseq [[width height] [[2 6] [1 9] [1 5]]]
+      (let [x (float-array (map #(+ 10.0 %) (range 8)))
+            resident-reference (aclone x)
             live (link/instantiate-ordered-invocation! compilation [x width height] {})]
         (try
           (doseq [scale [1.0 -0.5]]
             (dotimes [i 8] (aset x i (float (* scale (inc i) 0.1))))
-            (let [expected (compound-frame-map (aclone x) width height)]
+            ;; Written public arrays are captured resident state, not dynamic
+            ;; inputs. Poisoning their borrowed host array must NOT refresh
+            ;; untouched tails; read-only inputs DO refresh on each replay.
+            (let [expected (operation (if captured-state? resident-reference (aclone x)) width height)]
               (link/run! live)
               (let [actual (link/download live (first (keys (link/outputs live))))]
                 (is (= (class expected) (class actual)))
-                (is (= 8 (alength ^floats actual)))
-                (doseq [i (range 8)]
+                (is (= (alength ^floats expected) (alength ^floats actual)))
+                (doseq [i (range (alength ^floats expected))]
                   (is (< (Math/abs (- (double (aget ^floats expected i))
                                       (double (aget ^floats actual i)))) 2.0e-5))))))
-          (finally (link/close! live)))))))
+          (finally (link/close! live))))))))
 
 (deftest compound-input-frame-replays-on-local-backends
   (if @ocl-probe/opencl-available?
@@ -330,6 +345,14 @@
   (if @ze-probe/gpu-available?
     (check-compound-input-frame! :ze:0)
     (ze-probe/gpu-skip! "compound input frame")))
+
+(deftest completed-count-precedes-zero-initialization-on-local-backends
+  (if @ocl-probe/opencl-available?
+    (check-compound-input-frame! :ocl:0 #'compound-frame-zero-map nil false)
+    (ocl-probe/opencl-skip! "completed allocation count"))
+  (if @ze-probe/gpu-available?
+    (check-compound-input-frame! :ze:0 #'compound-frame-zero-map nil false)
+    (ze-probe/gpu-skip! "completed allocation count")))
 
 (deftm completed-float-terminal [completed :- Float] :- Float
   (let [out (float-array 1)]

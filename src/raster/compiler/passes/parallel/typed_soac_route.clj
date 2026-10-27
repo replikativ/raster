@@ -1586,9 +1586,14 @@
                   (filter symbol? (swr/runtime-parameter-values (:plan description))))))))
 
 (defn- component-runs
-  "Retain the existing SOAC/SWR partition while preserving intervening source entries.
-   Source actions do not introduce new partitions or execution authority. Their
-   host-boundary facts still delimit fusion under the existing legality policy."
+  "Partition numerical components at every retained source action.
+
+   Leading actions belong to the following numerical component's causal prefix.
+   Once a typed run starts, an action ends that run and is accumulated into the
+   next component's prefix. Trailing actions remain in the whole retained source;
+   they never manufacture an empty numerical component. SWR keeps its existing
+   independent component boundary. This partitions source order only and grants
+   no execution authority to an action."
   [entries]
   (doseq [entry entries]
     (when-not (contains? #{:typed-soac :source-action :segmented-weighted-reduction}
@@ -1603,8 +1608,7 @@
         (recur (next remaining) (conj prefix (first remaining)) components)
 
         :typed-soac
-        (let [[run suffix] (split-with #(contains? #{:typed-soac :source-action} (:kind %))
-                                      remaining)]
+        (let [[run suffix] (split-with #(= :typed-soac (:kind %)) remaining)]
           (recur suffix (into prefix run)
                  (conj components {:kind :typed-soac :entries (vec run)
                                    :prefix prefix :suffix (vec suffix)})))
@@ -1680,7 +1684,7 @@
               (mapcat (fn [{:keys [kind equation-id description]}]
                         (case kind
                           :typed-soac (nth (get equations-by-id equation-id) 2)
-                          :source-action []
+                          :source-action [(:sym description)]
                           :segmented-weighted-reduction [(:sym description)])))
               (:prefix component))
         ;; An allocator extent can be computed in an earlier component and absent from every
@@ -1832,7 +1836,28 @@
    form (mapv :description (filter #(= :segmented-weighted-reduction (:kind %)) entries))
    :protected-source-binding-mismatch))
 
-(defn- assemble-mixed-envelope
+(defn- certified-parallel-operation?
+  [operation]
+  (contains? #{:map :scatter :effect-map :stencil :reduce
+               :segmented-reduce :contract :product-reduce
+               :segmented-fold-map :scan}
+             (:kind (fusion/equation-info operation))))
+
+(defn- typed-component-equation?
+  "Recognize an actually realized TypedSOAC equation with a certified parallel operation.
+   Component construction itself is not scheduling authority, and scalar-only algorithms do
+   not become parallel merely by entering the common component envelope."
+  [equation]
+  (and (= :typed-soac (get-in equation [:attributes :algorithm-dialect]))
+       (some certified-parallel-operation?
+             (some-> equation :algorithm dialect/equations))))
+
+(defn- swr-component-equation?
+  [equation]
+  (= :segmented-weighted-reduction
+     (get-in equation [:attributes :algorithm-dialect])))
+
+(defn- assemble-component-envelope
   [form projection components typed-components]
   (if-let [decline (some :declined typed-components)]
       {:declined decline}
@@ -1855,6 +1880,8 @@
             values (apply merge (:values projection) (map :values typed-envelopes))
             inputs (parallel-program/infer-inputs equations)
             effects (reduce set/union #{} (map :effects equations))
+            swr-count (count (filter swr-component-equation? equations))
+            swr? (pos? swr-count)
             stats (apply merge-with
                          (fn [left right]
                            (if (and (number? left) (number? right)) (+ left right) right))
@@ -1863,7 +1890,7 @@
          ;; The structured-control route owns validation of this existing typed algorithm union.
          ;; The pipeline validates immediately after this attempt, avoiding a dependency cycle.
          (parallel-program/make
-          {:dialect :typed-parallel
+          {:dialect (if swr? :typed-parallel :typed-soac)
            :source source
            :values values
            :inputs inputs
@@ -1872,18 +1899,19 @@
            :effects effects
            :diagnostics (get-in projection [:facts :diagnostics])
            :provenance {:front-end :analyzed-source
-                        :pass :segmented-weighted-reduction-protection}
-           :attributes (assoc (:attributes (:facts projection))
-                              :host-control :typed-soac-materialization
-                              :mixed-algorithms true)})
-         :stats (merge stats
-                       {:route :typed-parallel
-                        :front-end :analyzed-source
-                        :segmented-weighted-reductions
-                        (count (filter #(= :segmented-weighted-reduction (:kind %))
-                                       components))})})))
+                        :pass (if swr?
+                                :segmented-weighted-reduction-protection
+                                :typed-soac-fusion)}
+           :attributes (cond-> (assoc (:attributes (:facts projection))
+                                      :host-control :typed-soac-materialization)
+                         swr? (assoc :mixed-algorithms true))})
+         :stats (cond-> (merge stats
+                               {:route (if swr? :typed-parallel :typed-soac)
+                                :front-end :analyzed-source})
+                  swr? (assoc :segmented-weighted-reductions swr-count)
+                  (not swr?) (assoc :typed-validated true))})))
 
-(defn- mixed-envelope
+(defn- component-envelope
   [form projection options]
   (let [components (component-runs (:entries projection))
         fused-components
@@ -1893,7 +1921,8 @@
                            (typed-component-program projection %) options)))
               components)
         provisional (when (public-source-return? options)
-                      (:program (assemble-mixed-envelope form projection components fused-components)))
+                      (:program (assemble-component-envelope
+                                 form projection components fused-components)))
         demand (set (source-return-demand
                      (when provisional (realization-program projection fused-components))
                      provisional options))
@@ -1902,7 +1931,7 @@
                 (realize-fused-component fused options
                                          (filterv demand (dialect/outputs program))))
               fused-components)]
-    (assemble-mixed-envelope form projection components typed-components)))
+    (assemble-component-envelope form projection components typed-components)))
 
 (defn program-envelope
   "Wrap an already constructed TypedSOAC program in the same ParallelProgram boundary used by
@@ -2117,9 +2146,33 @@
            (if-not admitted?
              (when-let [decline (frontend/coverage-decline form frontend-options)]
                {:declined decline})
-             (if (:segmented-plans? projection)
-               (update (mixed-envelope form projection optimization-options)
-                       :stats assoc :canonical-source-bindings-removed bindings-removed)
+             (if projection
+               (let [optimized (component-envelope form projection optimization-options)
+                     lost-terminal? (and (= 1 terminal-scalars-materialized)
+                                         (not= 1 (get-in optimized
+                                                        [:stats :resident-terminal-scalars])))
+                     optimized (if lost-terminal?
+                                 (component-envelope (:form live-projection)
+                                                     (:projection live-projection)
+                                                     optimization-options)
+                                 optimized)
+                     terminal-scalars-materialized (if lost-terminal?
+                                                     0 terminal-scalars-materialized)
+                     {program :program stats :stats decline :declined} optimized
+                     swr? (boolean (some swr-component-equation? (:equations program)))]
+                 (cond
+                   decline {:declined decline}
+
+                   (and (not host-scalars?) (not swr?)
+                        (not-any? typed-component-equation? (:equations program)))
+                   {:declined {:reason :no-certified-parallel-equation
+                               :stats stats}}
+
+                   :else
+                   {:program program
+                    :stats (assoc stats
+                                  :terminal-scalars-materialized terminal-scalars-materialized
+                                  :canonical-source-bindings-removed bindings-removed)}))
                (let [optimized (optimize-typed-component form typed-input optimization-options)
                      lost-terminal? (and (= 1 terminal-scalars-materialized)
                                          (not= 1 (get-in optimized [:stats :resident-terminal-scalars])))
@@ -2132,10 +2185,7 @@
                      terminal-scalars-materialized (if lost-terminal? 0 terminal-scalars-materialized)
                      {typed-result :program typed-stats :stats decline :declined} optimized]
                  (if (and (not host-scalars?)
-                          (not-any? #(contains? #{:map :scatter :effect-map :stencil :reduce
-                                             :segmented-reduce :contract :product-reduce
-                                             :segmented-fold-map :scan}
-                                           (:kind (fusion/equation-info %)))
+                          (not-any? certified-parallel-operation?
                                (dialect/equations typed-result)))
                    {:declined {:reason :no-certified-parallel-equation
                                :stats typed-stats}}

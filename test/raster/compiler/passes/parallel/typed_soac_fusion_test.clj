@@ -338,6 +338,34 @@
              (clojure.core/float (+ %element1 1.0))]
            (mapv projection/scalar-folds->source (:body-results region))))))
 
+(deftest horizontal-fusion-requires-uniform-result-storage-mode
+  (let [mixed-source
+        '(let* [out (clojure.core/float-array n)
+                fresh (raster.par/pmap i n float (+ (clojure.core/aget a i) 1.0))
+                stored (raster.par/map! out j n float (+ (clojure.core/aget b j) 2.0))]
+           [fresh stored])
+        mixed (source-program mixed-source {'a :float 'b :float})
+        [separate separate-stats] (typed-fusion/fusion-fixpoint mixed)
+        stored-source
+        '(let* [left (raster.par/map! out-a i n float
+                                      (+ (clojure.core/aget a i) 1.0))
+                right (raster.par/map! out-b j n float
+                                       (+ (clojure.core/aget b j) 2.0))]
+           [left right])
+        stored (source-program stored-source
+                               {'a :float 'b :float 'out-a :float 'out-b :float})
+        [combined combined-stats] (typed-fusion/fusion-fixpoint stored)]
+    (is (= {:vertical 0 :horizontal 0 :iterations 1} separate-stats))
+    (is (= 2 (count (dialect/equations separate))))
+    (is (= separate (dialect/validate! separate))
+        "fresh and explicit storage remain separate without inventing self storage")
+    (is (= {:vertical 0 :horizontal 1 :iterations 2} combined-stats))
+    (is (= 1 (count (dialect/equations combined))))
+    (is (= 2 (count (dialect/result-storage
+                     (dialect/facts combined) (second (first (dialect/equations combined)))))))
+    (is (= combined (dialect/validate! combined))
+        "the existing complete stored+stored result algebra remains fusible")))
+
 (deftest captured-map-fusion-has-the-certified-functional-result
   (let [source '(let* [y (raster.par/pmap i n float (* (aget x i) scale))
                        z (raster.par/pmap j n float (+ (aget y j) bias))]

@@ -122,24 +122,32 @@
         extent (first (nth definition 2))
         projection {:typed-program p :outputs (dialect/outputs p)}
         scalar-entry {:kind :typed-soac :equation-id (second definition)}
+        source-entry {:kind :source-action :description {:sym extent} :source-reads []}
         writer-entry {:kind :typed-soac :equation-id (second writer)}
-        component {:entries [writer-entry] :prefix [scalar-entry] :suffix []}
-        narrowed (#'route/typed-component-program projection component)
-        [scheduled stats] (initialization/materialize narrowed)]
-    (is (not (some #{extent} (:inputs (dialect/facts narrowed)))))
-    (is (not (some #{extent} (get-in (dialect/facts narrowed) [:attributes :source-bindings]))))
-    (is (some? (get (extent-proof/initial-environment narrowed) extent)))
-    (is (= 1 (:initialization-fills stats)))
-    (is (some #{extent} (:inputs (dialect/facts scheduled))))
-    (is (= scheduled (dialect/validate! scheduled)))
-    ;; The same scalar is unavailable when it has not executed in this component's prefix.
-    ;; Do not turn a future source binding into an incoming value merely because it has a type.
-    (let [future (#'route/typed-component-program
-                  projection (assoc component :prefix [] :suffix [scalar-entry]))]
-      (is (nil? (get (extent-proof/initial-environment future) extent)))
-      (is (= :typed-soac-initialization-contract
-             (try (initialization/materialize future) nil
-                  (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))))
+        component {:entries [writer-entry] :suffix []}]
+    (doseq [[producer prefix] [[:typed-scalar [scalar-entry]]
+                               [:source-action [source-entry]]]]
+      (let [narrowed (#'route/typed-component-program projection (assoc component :prefix prefix))
+            [scheduled stats] (initialization/materialize narrowed)]
+        (is (not (some #{extent} (:inputs (dialect/facts narrowed)))) (name producer))
+        (is (not (some #{extent} (get-in (dialect/facts narrowed) [:attributes :source-bindings])))
+            (name producer))
+        (is (some? (get (extent-proof/initial-environment narrowed) extent)) (name producer))
+        (is (= 1 (:initialization-fills stats)) (name producer))
+        (is (some #{extent} (:inputs (dialect/facts scheduled))) (name producer))
+        (is (= scheduled (dialect/validate! scheduled)) (name producer))))
+    ;; The same scalar is unavailable when either kind of producer has not executed in this
+    ;; component's prefix. Do not turn a future binding into an incoming value merely because
+    ;; it has a type or a retained source description.
+    (doseq [[producer future-entry] [[:typed-scalar scalar-entry]
+                                     [:source-action source-entry]]]
+      (let [future (#'route/typed-component-program
+                    projection (assoc component :prefix [] :suffix [future-entry]))]
+        (is (nil? (get (extent-proof/initial-environment future) extent)) (name producer))
+        (is (= :typed-soac-initialization-contract
+               (try (initialization/materialize future) nil
+                    (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))
+            (name producer))))))
 
 (deftest total-functional-domains-include-boundaries-and-scan-results
   (doseq [operation ['(raster.par/scan output accumulator (float 0.0) i 8 float

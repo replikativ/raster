@@ -1244,32 +1244,61 @@
     (is (not (contains? (:values analyzed) 'side))
         "an explicit source action still does not acquire a numerical value contract")))
 
-(deftest generated-storage-actions-do-not-partition-fusible-maps
+(deftest generated-storage-actions-partition-causal-components-without-host-boundaries
   (let [source '(let* [y (raster.par/pmap i n float (* (clojure.core/aget x i) 2.0))
                        scratch (clojure.core/float-array n)
                        alias scratch
                        z (raster.par/pmap j n float (+ (clojure.core/aget y j) 1.0))
-                       effect (raster.par/map! alias k n float (clojure.core/aget x k))]
-                 [z alias])
-        [_ bindings body] source
-        baseline (list 'let* (vec (concat (subvec bindings 2 6) (subvec bindings 0 2)
-                                         (subvec bindings 6))) body)
+                       effect (raster.par/map! alias k n float (clojure.core/aget x k))
+                       returned alias]
+                 [z returned])
         options {:dtype :float :array-types {'x :float}
                  :scalar-types {'n :long} :segmented-plans? true}
         analyzed (frontend/form->program-components source options)
         entries (:entries analyzed)
-        routed (route/attempt source :float {'x :float} {:scalar-types {'n :long}})
-        baseline (route/attempt baseline :float {'x :float} {:scalar-types {'n :long}})]
-    (is (= [:typed-soac :source-action :source-action :typed-soac :typed-soac]
+        components (#'route/component-runs entries)
+        routed (route/attempt source :float {'x :float}
+                              {:scalar-types {'n :long} :segmented-plans? true})
+        legacy (route/attempt source :float {'x :float} {:scalar-types {'n :long}})
+        source-order (mapv first (partition 2 (second (get-in routed [:program :source]))))
+        positions (zipmap source-order (range))
+        retained-positions (mapv positions '[scratch alias z effect returned])
+        source-pairs (into {} (map vec (partition 2 (second (get-in routed [:program :source])))))]
+    (is (= [:typed-soac :source-action :source-action :typed-soac :typed-soac :source-action]
            (mapv :kind entries)))
+    (is (= '[y scratch alias z effect returned]
+           (mapv #(get-in % [:description :sym]) entries))
+        "analysis retains the exact lexical action order")
     (is (not-any? :host-boundary? entries)
-        "generated allocation and reference aliases retain obligations without new fusion barriers")
-    (is (= 1 (count (#'route/component-runs entries))))
+        "causal splitting is an optimization boundary, not opaque host-boundary metadata")
+    (is (= 2 (count components)))
+    (is (= [[:typed-soac] [:typed-soac :typed-soac]]
+           (mapv #(mapv :kind (:entries %)) components)))
+    (is (= [:typed-soac :source-action :source-action]
+           (mapv :kind (:prefix (second components))))
+        "both source actions execute before the following numerical component")
+    (is (= :source-action (get-in components [1 :suffix 0 :kind]))
+        "the real trailing alias creates no empty numerical component")
     (is (= [] (get-in analyzed [:facts :attributes :host-binding-ids])))
-    (is (pos? (get-in baseline [:stats :vertical])))
-    (is (= (get-in baseline [:stats :vertical]) (get-in routed [:stats :vertical])))
-    (is (= (count (get-in baseline [:program :equations]))
-           (count (get-in routed [:program :equations]))))))
+    (is (= :typed-soac (get-in routed [:program :dialect])
+           (get-in routed [:stats :route]))
+        "an ordinary authenticated component projection keeps the ordinary route identity")
+    (is (nil? (get-in routed [:program :attributes :mixed-algorithms]))
+        "component use alone does not claim an SWR/mixed-algorithm program")
+    (is (zero? (get-in routed [:stats :vertical]))
+        "the causal component boundary deliberately prevents cross-action vertical fusion")
+    (is (= :typed-soac (get-in legacy [:program :dialect])
+           (get-in legacy [:stats :route])))
+    (is (pos? (get-in legacy [:stats :vertical]))
+        "without an authenticated component projection the legacy monolithic route is unchanged")
+    (is (and (every? integer? retained-positions) (apply < retained-positions))
+        "realization removes typed-owned y but preserves retained source actions in order")
+    (is (= 'alias (get source-pairs 'returned))
+        "the trailing source completion survives whole-route realization")
+    (is (= '[z returned] (last (get-in routed [:program :source])))
+        "the retained source keeps the semantic return aliases")
+    (is (= '[effect z] (get-in routed [:program :outputs]))
+        "the typed boundary independently exposes its canonical physical output ports")))
 
 (deftest coverage-diagnostics-share-program-host-boundary-admission
   (let [source '(let* [mapped (raster.par/pmap i n float

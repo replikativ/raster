@@ -27,6 +27,26 @@ The complete allocation-contract namespace passes21 tests /341 assertions.
 The broader ordered-root device gate reaches182 assertions then declines at the
 known incomplete TypedSOAC route; it is not a full device pass.
 
+The next reviewed consolidation uses the SAME component constructor for every
+authenticated analyzed projection, whether or not it contains a segmented
+weighted reduction. The projection-nil compatibility path is unchanged. Ordered
+source actions delimit numerical components; only actual preceding definitions
+become incoming extents. Global public-return validation, terminal-scalar rollback
+and post-optimization parallel admission remain intact. Ordinary programs retain
+ordinary dialect labels. Local matrix:101 tests /703 assertions; causal controls
+2/33; actual OCL+ZE zero-allocation replay1/108 and captured-state/partial-write
+replay1/124, with different allocation/launch sizes against one compilation per
+backend. Captured mutable buffers preserve their original untouched tails despite
+host poisoning; read-only inputs refresh each replay.
+
+Conservative performance limit: source actions currently split fusion regions.
+Horizontal fusion also refuses mixed fresh/materialized results because the
+current storage vector cannot represent partial physical destinations safely.
+Pure+pure and stored+stored fusion remain verified. Recovering mixed fusion needs
+an explicit per-result location algebra grounded in actual allocation/ABI facts,
+not fabricated self-storage, a relaxed validator, or a permanent model-specific
+kernel. Measure this gap after correctness; no performance neutrality is claimed.
+
 Latest completed exact-head CI is `430545f99`: all sixteen unit shards
 (35322) finish with 7,762 tests / 95,322 pass / 46 failures / 115 errors across
 133 failing Vars. Both JVM regression repairs recover. A new cold diagnostic
