@@ -396,6 +396,18 @@
 
 (def ^:dynamic ^:private *source-prerequisite-scope* nil)
 
+(def ^:private selected-source-preparation-authority (Object.))
+
+(defn- seal-selected-source-preparation [data]
+  (fn [authority]
+    (when (identical? authority selected-source-preparation-authority) data)))
+
+(def ^:private selected-source-preparation-class
+  ;; Bootstrap the brand from the compiler-owned factory without invoking a
+  ;; request. Validation compares this Class BEFORE calling the known closure,
+  ;; so an arbitrary IFn is never a compiler callback.
+  (class (seal-selected-source-preparation nil)))
+
 (declare fulfill-source-prerequisite!)
 
 (defn- pending-source-prerequisite? [scope failure]
@@ -932,6 +944,82 @@
                                {:carrier carrier :presence (if (.isPrimitive carrier) :present :unknown)})
                              parameter-carriers)))))))
 
+(defn ^:no-doc selected-source-preparation-request
+  "Describe one exact selected source prerequisite without preparing it.
+
+   The opaque request is process-local work selection, never source or emission
+   authority. Its SourceEntry comes from selected-source-entry-carriers, including
+   the pending JitSpec path; callers cannot construct it from metadata maps."
+  [mode operation implementation-op argument-count expected-source-var]
+  (when-not (contains? #{:semantic :physical} mode)
+    (throw (ex-info "selected source preparation has an unknown work mode"
+                    {:reason :invalid-source-preparation-mode :mode mode})))
+  (when-let [{:keys [definition source-entry pending-source? invocation-method
+                     parameters parameter-carriers result-carrier]}
+             (selected-source-entry-carriers
+              operation implementation-op argument-count expected-source-var)]
+    ;; A ready physical producer that still cannot satisfy the caller's proof is
+    ;; unsupported, not permission to rebuild that producer until it happens to
+    ;; fit. Both bounded work phases originate only from the authenticated pending
+    ;; JitSpec captured by selected-source-entry-carriers.
+    (when pending-source?
+      (let [{:keys [source-var generic-var receiver-var entry tags]} definition]
+        (seal-selected-source-preparation
+         {:mode mode :source-var source-var :lineage source-entry :operation operation
+          :implementation-op implementation-op :argument-count argument-count
+          :generic-var generic-var :receiver-var receiver-var :entry entry :tags tags
+          :parameters parameters :parameter-carriers parameter-carriers
+          :result-carrier result-carrier :invocation-method invocation-method})))))
+
+(def ^:private selected-source-preparation-keys
+  #{:mode :source-var :lineage :operation :implementation-op :argument-count
+    :generic-var :receiver-var :entry :tags :parameters :parameter-carriers
+    :result-carrier :invocation-method})
+
+(defn- selected-source-preparation-corresponds?
+  [selected current phase]
+  (let [{:keys [source-var lineage generic-var receiver-var entry tags parameters
+                parameter-carriers result-carrier invocation-method mode]} selected
+        definition (:definition current)]
+    (and current (source-entry-current? lineage) (= lineage (:source-entry current))
+         (identical? source-var (:source-var definition))
+         (identical? generic-var (:generic-var definition))
+         (identical? receiver-var (:receiver-var definition))
+         (= tags (:tags definition)) (= parameters (:parameters current))
+         (= parameter-carriers (:parameter-carriers current))
+         (identical? result-carrier (:result-carrier current))
+         (= invocation-method (:invocation-method current))
+         (case phase
+           :pending (and (:pending-source? current) (identical? entry (:entry definition)))
+           :completed (= (:pending-source? current) (= :semantic mode))
+           false))))
+
+(defn- selected-source-preparation-current!
+  [request]
+  (when-not (identical? selected-source-preparation-class (class request))
+    (throw (ex-info "source preparation requires its selected work request"
+                    {:reason :invalid-source-preparation-request})))
+  (let [{:keys [source-var operation implementation-op argument-count] :as selected}
+        (request selected-source-preparation-authority)
+        current (selected-source-entry-carriers
+                 operation implementation-op argument-count source-var)]
+    (when-not (and (= selected-source-preparation-keys (set (keys selected)))
+                   (contains? #{:semantic :physical} (:mode selected))
+                   (selected-source-preparation-corresponds? selected current :pending))
+      (throw (ex-info "selected source preparation no longer names its original declaration"
+                      {:reason :changed-source-prerequisite :source source-var})))
+    selected))
+
+(defn- selected-source-preparation-completed!
+  [selected]
+  (let [{:keys [source-var operation implementation-op argument-count mode]} selected
+        current (selected-source-entry-carriers
+                 operation implementation-op argument-count source-var)]
+    (when-not (selected-source-preparation-corresponds? selected current :completed)
+      (throw (ex-info "selected source preparation changed its original declaration"
+                      {:reason :changed-source-prerequisite :source source-var :mode mode})))
+    current))
+
 (deftype ^:private SourceFrontend [lineage body context preparation-inputs])
 (deftype ^:private FrontendSourceOwner [frontend implementation])
 
@@ -1409,34 +1497,97 @@
                               {:reason :source-prerequisite-no-progress :source source-var})))
             (throw failure)))))))
 
+(defn ^:no-doc demand-selected-source-preparation!
+  "Demand one authenticated semantic or physical preparation phase.
+
+   The opaque selected request chooses work only. The independent handler
+   revalidates its original SourceEntry and selected parents before mutation;
+   the following whole attempt must still derive every executable fact anew."
+  [request]
+  (let [scope (source-prerequisite-scope!)]
+    (let [selected (selected-source-preparation-current! request)
+          source (:source-var selected)
+          mode (:mode selected)
+          work-key [source mode]]
+      (when (or (contains? (:ready @scope) work-key)
+                (:pending @scope) (:preparing @scope))
+        (throw (ex-info "source prerequisite demand did not make progress"
+                        {:reason :source-prerequisite-no-progress
+                         :source source :mode mode})))
+      (let [before @scope token (Object.)
+            failure (ex-info "selected source preparation must precede allocation proof"
+                             {:reason :source-prerequisite-demand :source source :mode mode
+                              ::source-prerequisite token})
+            pending {:owner (:token before) :request token :failure failure
+                     :source source :mode mode :work-key work-key
+                     :selected-preparation request}]
+        (when-not (compare-and-set! scope before (assoc before :pending pending))
+          (throw (ex-info "source prerequisite owner changed during demand"
+                          {:reason :source-prerequisite-no-progress
+                           :source source :mode mode})))
+        (throw failure)))))
+
 (defn- fulfill-source-prerequisite! [scope failure]
   (when-not (pending-source-prerequisite? scope failure)
     (throw failure))
-  (let [{:keys [source frontend]} (:pending @scope)]
-    (when (contains? (:ready @scope) source)
+  (let [{:keys [source frontend mode work-key selected-preparation]} (:pending @scope)
+        ready-key (or work-key source)]
+    (when (contains? (:ready @scope) ready-key)
       (throw (ex-info "a satisfied source prerequisite cannot be prepared again"
-                      {:reason :source-prerequisite-no-progress :source source})))
-    (swap! scope assoc :pending nil :preparing source)
+                      {:reason :source-prerequisite-no-progress :source source :mode mode})))
+    (swap! scope assoc :pending nil :preparing ready-key)
     ;; False disables demand handling inside this independent fixed operation.
     ;; Its ordinary preparation retries remain unchanged and cannot adopt the
     ;; abandoned discovery collector or recursively retain this request's store.
     (let [ready
           (binding [*emission-inputs* nil *source-prerequisite-scope* false]
-            (call-with-definition-inputs
-             (fn []
-               (assert-frontend-source! frontend source)
-               (assert-frontend-semantic-selection! frontend source)
-               (let [prepared ((requiring-resolve 'raster.core/prepare-owned-source-frontend!) source)]
-                 (when-not (and prepared
-                                (identical? (:source-frontend frontend) (:source-frontend prepared))
-                                (identical? (:source-entry frontend) (:source-entry prepared)))
-                   (throw (ex-info "source prerequisite changed its original semantic producer"
-                                   {:reason :changed-source-prerequisite :source source})))
-                 (assert-frontend-source! prepared source)
-                 (assert-frontend-selection! prepared source)
-                 (assert-emission-inputs-current! (:emission prepared))
-                 {:frontend prepared :inputs @*emission-inputs*}))))]
-      (swap! scope #(-> % (assoc-in [:ready source] ready) (dissoc :preparing))))))
+            (if selected-preparation
+              ;; Pending receiver observations belong to a disposable preflight
+              ;; owner. Physical preparation legitimately promotes that receiver;
+              ;; carrying its old root into the preparation owner would turn valid
+              ;; progress into a generic stale retry and then an invalid re-demand.
+              (let [selected (call-with-definition-inputs
+                              #(selected-source-preparation-current! selected-preparation))
+                    lineage (:lineage selected)]
+                (call-with-definition-inputs
+                 (fn []
+                   (let [prepared
+                         (case mode
+                           :semantic
+                           (do
+                             ((requiring-resolve 'raster.core/prepare-deftm-frontend!) source)
+                             ((requiring-resolve 'raster.core/prepare-emission-source-walk!) source)
+                             (original-source-frontend source))
+
+                           :physical
+                           ((requiring-resolve 'raster.core/prepare-owned-source-frontend!) source))]
+                     (when-not (and prepared (= lineage (:source-entry prepared)))
+                       (throw (ex-info "source prerequisite changed its original declaration"
+                                       {:reason :changed-source-prerequisite
+                                        :source source :mode mode})))
+                     (assert-source-entry-current! lineage)
+                     (assert-frontend-source! prepared source)
+                     (assert-frontend-semantic-selection! prepared source)
+                     (when (= :physical mode)
+                       (assert-frontend-selection! prepared source)
+                       (assert-emission-inputs-current! (:emission prepared)))
+                     (selected-source-preparation-completed! selected)
+                     {:frontend prepared :inputs @*emission-inputs* :mode mode}))))
+              (call-with-definition-inputs
+               (fn []
+                 (assert-frontend-source! frontend source)
+                 (assert-frontend-semantic-selection! frontend source)
+                 (let [prepared ((requiring-resolve 'raster.core/prepare-owned-source-frontend!) source)]
+                   (when-not (and prepared
+                                  (identical? (:source-frontend frontend) (:source-frontend prepared))
+                                  (identical? (:source-entry frontend) (:source-entry prepared)))
+                     (throw (ex-info "source prerequisite changed its original semantic producer"
+                                     {:reason :changed-source-prerequisite :source source})))
+                   (assert-frontend-source! prepared source)
+                   (assert-frontend-selection! prepared source)
+                   (assert-emission-inputs-current! (:emission prepared))
+                   {:frontend prepared :inputs @*emission-inputs*})))))]
+      (swap! scope #(-> % (assoc-in [:ready ready-key] ready) (dissoc :preparing))))))
 
 (defn source-var-body-entry-carriers
   "Actual registered typed formals for an already-resolved source Var.

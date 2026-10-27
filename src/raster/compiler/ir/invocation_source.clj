@@ -203,12 +203,14 @@
 (defn- selected-length-expression
   "Derive a length expression from the selected source, never its Object return tag.
    The actual input interface, original body and lookup history must agree."
-  [expression value values]
+  ([expression value values] (selected-length-expression expression value values nil))
+  ([expression value values actual-array-class]
   (let [{:keys [dispatch? semantic-op implementation-op arguments lexical-callee]}
         (descriptor/call-description expression)]
     (when (and dispatch? (not lexical-callee) (= 1 (count arguments))
-               (= :tensor (:kind value)) (= [] (:shape value))
-               (contains? #{:int :long} (:dtype value))
+               (or actual-array-class
+                   (and (= :tensor (:kind value)) (= [] (:shape value))
+                        (contains? #{:int :long} (:dtype value))))
                (descriptor/alength-op? semantic-op)
                (= semantic-op (mangled/impl->op implementation-op)))
       (method-entry/call-with-definition-inputs
@@ -226,9 +228,12 @@
                    [body & more] (:body context)
                    parameters (set (:parameters definition))]
                (when (and storage-dtype (symbol? operand)
-                          (= storage-dtype (:dtype actual)) (= 1 (count (:shape actual)))
-                          (= {:kind :plain} (:representation actual))
-                          (nil? (:logical-layout actual)) body (empty? more))
+                          (if actual-array-class
+                            (identical? actual-array-class carrier)
+                            (and (= storage-dtype (:dtype actual)) (= 1 (count (:shape actual)))
+                                 (= {:kind :plain} (:representation actual))
+                                 (nil? (:logical-layout actual))))
+                          body (empty? more))
                  (let [policy (delay (some-> (find-ns 'raster.compiler.backend.jvm.bytecode)
                                             (ns-resolve 'binding-completion-plan)
                                             binding-completion/capture-resolution-context))
@@ -261,12 +266,56 @@
                                          (when-let [inner (project (second node))]
                                            (list operation inner)))))))]
                          (when (and caller-hint? (reference-compatible? operand)) (project body)))]
-                   (when (and projected (projection-corresponds? projected value))
-                     projected)))))))))))
+                   (when (and projected (or actual-array-class (projection-corresponds? projected value)))
+                     projected))))))))))))
+
+(defn ^:no-doc selected-array-length-body
+  "Derive only the selected source's core length/cast body, conditional on an
+   independently proved actual array Class. The caller still owns the exact
+   invocation/input completion, callback-free prefix, result publication and
+   use context. This grants neither that Class nor a shape/range/motion proof.
+   Ordinary shape canonicalization keeps its narrower final-algebra gate."
+  [expression actual-array-class]
+  (when (dtype/dtype-for-jvm-array-class actual-array-class)
+    (selected-length-expression expression nil nil actual-array-class)))
+
+(defn- checked-int-array-length-chain [expression]
+  (when (and (seq? expression) (= 'clojure.core/int (first expression)))
+    (loop [node expression]
+      (when (and (seq? node) (= 2 (count node)))
+        (case (first node)
+          (clojure.core/int clojure.core/long) (recur (second node))
+          clojure.core/alength (when (symbol? (second node)) (second node))
+          nil)))))
+
+(defn checked-int-array-length-projection
+  "One complete checked Int chain over a canonical array length. source-views
+   MUST contain causal full source-view contracts, not numerical read domains.
+   This conditional algebra grants no such contract or source correspondence.
+   Runtime still produces/checks the final Int from the visible buffer shape at
+   this source cursor; an out-of-range virtual view is never silently narrowed."
+  [expression value source-views]
+  (when-let [source (checked-int-array-length-chain expression)]
+    (let [view (get source-views source)
+          hint (binding-completion/declared-binding-hint source)
+          hinted-dtype (or (dtype/dtype-for-array-tag hint)
+                           (when (class? hint) (dtype/dtype-for-jvm-array-class hint)))]
+      (when (and (= :tensor (:kind value)) (= [] (:shape value)) (= :int (:dtype value))
+                 (= :tensor (:kind view)) (= 1 (count (:shape view)))
+                 (= {:kind :plain} (:representation view)) (nil? (:logical-layout view))
+                 (get-in dtype/dtype-info [(:dtype view) :jvm-array-class-name])
+                 (or (nil? hint) (= hinted-dtype (:dtype view))
+                     (contains? '#{Object java.lang.Object} hint) (identical? Object hint)))
+        source))))
 
 (defn canonicalize-shape-projection
   [program-values public-inputs symbol expression]
-  (let [expression (or (selected-length-expression expression (get program-values symbol) program-values)
+  (if (checked-int-array-length-chain expression)
+    ;; Retaining checked source is not an admission grant. Its caller must use
+    ;; the full-view theorem above; do not replace this chain by an internal
+    ;; dimension and thereby discard the original Int production/check.
+    expression
+    (let [expression (or (selected-length-expression expression (get program-values symbol) program-values)
                        expression)
         source (shape-projection-source expression)
         dimension (when (and source (not (contains? public-inputs source)))
@@ -278,7 +327,7 @@
                               (:dtype (get program-values dimension)))]
         (if (or (nil? dimension-dtype) (= result-dtype dimension-dtype))
           dimension
-          (list (dtype/scalar-tag-for-dtype result-dtype) dimension))))))
+          (list (dtype/scalar-tag-for-dtype result-dtype) dimension)))))))
 
 (defn allocation-pair
   [values result extent]
@@ -431,25 +480,54 @@
           tag (dtype/scalar-tag-for-dtype dtype)]
       (typed-store-value (symbol "clojure.core" (name tag)) expression))))
 
+(defn- allocation-source-attempt
+  [expression values]
+  (let [{:keys [status projection] :as attempt}
+        (descriptor/direct-allocation-projection-attempt expression values)]
+    (case status
+      :missing-source attempt
+      :projection
+      (let [{:keys [constructor]} projection
+            operation (descriptor/semantic-op constructor)
+            tag (get descriptor/alloc-sym->array-tag operation)
+            initializations (descriptor/allocation-projection-initializations projection)]
+        (if (and tag initializations)
+          {:status :projection
+           :projection
+           (assoc projection :extent (descriptor/array-allocation-size constructor)
+                             :dtype (some-> tag dtype/dtype-for-array-tag dtype/canon)
+                             ;; The executable leaf may be a zeroing JVM constructor
+                             ;; while its authenticated outer allocator deliberately
+                             ;; promises only fresh unspecified storage. Keep both;
+                             ;; readiness follows the public source contract.
+                             :initialization (:public initializations)
+                             :realized-initialization (:realized initializations))}
+          {:status :unsupported}))
+      {:status :unsupported})))
+
 (defn allocation-source
   "Project one definition-derived allocation to its exact source constructor. The caller must
    retain and compare helper correspondence with its compilation; this is not a check-hoisting
    or definition-lifetime witness. Constructor conversions remain executable source operations."
   [expression values]
-  (when-let [{:keys [constructor] :as projection}
-             (descriptor/direct-allocation-projection expression values)]
-    (let [operation (descriptor/semantic-op constructor)
-          tag (get descriptor/alloc-sym->array-tag operation)
-          initializations (descriptor/allocation-projection-initializations projection)]
-      (when (and tag initializations)
-        (assoc projection :extent (descriptor/array-allocation-size constructor)
-                          :dtype (some-> tag dtype/dtype-for-array-tag dtype/canon)
-                          ;; The executable leaf may be a zeroing JVM constructor
-                          ;; while its authenticated outer allocator deliberately
-                          ;; promises only fresh unspecified storage. Keep both;
-                          ;; readiness follows the public source contract.
-                          :initialization (:public initializations)
-                          :realized-initialization (:realized initializations))))))
+  (let [attempt (allocation-source-attempt expression values)]
+    (when (= :projection (:status attempt)) (:projection attempt))))
+
+(defn ^:no-doc required-allocation-source!
+  "Project an allocation required by actual typed source construction.
+
+   An exact pending selected source may request one bounded preparation phase.
+   The outer definition owner restarts and rederives the complete projection;
+   the opaque request is never retained as allocation or execution authority."
+  [expression values]
+  (let [{:keys [status projection request]} (allocation-source-attempt expression values)]
+    (case status
+      :projection projection
+      :missing-source
+      (do (method-entry/demand-selected-source-preparation! request)
+          (throw (ex-info "source prerequisite demand unexpectedly returned"
+                          {:reason :source-prerequisite-no-progress})))
+      nil)))
 
 (defn ^:no-doc allocation-definition-projection
   "Return the complete retained definition proof from a freshly rederived allocation-source.

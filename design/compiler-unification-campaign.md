@@ -4,7 +4,31 @@
 
 ### Current boundary ledger
 
-Latest completed exact-head CI is `87aea1e78`: all sixteen unit shards
+Latest completed exact-head CI is `667d2c8ca`: all sixteen unit shards
+(35308) finish with 7,740 tests / 95,063 pass / 46 failures / 117 errors across
+135 failing Vars. Both resident preflight regressions recover, no new failing
+Vars appear, and all prior outcome Vars remain. CPU-OpenCL 35309 finishes all
+four shards unchanged at 678 tests / 7,456 pass / 12 failures / 76 errors across
+78 failing Vars. Emission 35310 fails; dependent vendor checks are unqualified.
+The draft is not merge-ready and no failures are waived.
+
+The next local batch reuses the existing source, allocation and resident IRs:
+actual consumed map recipes establish bounded callback closure; whole checked
+Int length expressions remain ordered source actions, not hoisted dimensions;
+cold allocator prerequisites restart construction under fresh ownership; and
+materialized aliases retain only already-owned storage with identical source,
+view and representation. Alias retention grants no initialization, acquisition
+or completion credit. The permanent mixed-storage projected-gradient device
+test now passes 24 assertions on OpenCL and Level Zero, including changed-input
+replays. The two alias contract/integration tests pass 63 assertions. The wider
+86-test source/allocation/ordering gate has 881 passing assertions and one
+remaining allocation-owner error; no failure is waived. Existing loop replay
+probes still refuse at TypedSOAC admission before reaching execution, so loop
+parity and source-only tail-alias qualification are not established here.
+Static lint reports zero errors. Exact-head CI remains required. The disabled
+native-reference prototype is excluded from this batch.
+
+Previous completed exact-head CI is `87aea1e78`: all sixteen unit shards
 (35302) finish with 7,740 tests / 95,060 pass / 48 failures / 118 errors across
 137 failing Vars. The three prior cold-root Vars recover, but two allocation
 cases still expose cold helper readiness, and two resident preflight tests now

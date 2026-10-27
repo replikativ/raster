@@ -392,7 +392,8 @@
                                      (select-keys preparation-inputs
                                                   [:static :values :definition-proofs
                                                    :producer-inputs]))
-                              :reduction-sources reduction-catalog :pmap-sources pmap-catalog))
+                              :reduction-sources reduction-catalog :pmap-sources pmap-catalog
+                              :invocation-catalog invocation-catalog))
           _ (me/assert-definition-inputs-current! @inputs)
           dependencies ((requiring-resolve 'raster.compiler.backend.jvm.bytecode/prepare-emission-input-snapshots!)
                         body source-ns params)

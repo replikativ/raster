@@ -4934,7 +4934,10 @@
             source-value-options
             (assoc :source-value-analysis
                    (advance-source-value-analysis (:source-value-analysis state) description
-                                                  default-dtype (:array-types described))))))
+                                                  default-dtype (:array-types described)))
+            source-value-options
+            (assoc-in [:source-description-origins (first binding)]
+                      {:source (second (second binding)) :description description}))))
       (cond-> (assoc (initial-source-description-state array-types scalar-types)
                      :extent-normalization {:extents {} :scalar-representatives {}})
         source-value-options
@@ -5076,7 +5079,8 @@
     false))
 
 (defn- admitted-description?
-  [physical-outputs description]
+  ([physical-outputs description] (admitted-description? physical-outputs description #{}))
+  ([physical-outputs description checked-shape-ids]
   ;; Ordinary host scalar bindings are opaque control/dataflow boundaries around TypedSOAC
   ;; islands. Unsupported parallel operations still decline: executing those through a second
   ;; lowering route inside one program would duplicate semantics.
@@ -5092,17 +5096,19 @@
            ;; occurred, the same scalar remains a decline until the graph represents
            ;; the required device-to-host sequencing explicitly.
            (not (contains-parallel-form? (:expr description)))
-           (or (not (requires-ordered-evaluation? (:expr description)))
+           (or (contains? checked-shape-ids (:id description))
+               (not (requires-ordered-evaluation? (:expr description)))
                (and (:before-parallel? description)
                     ;; This value becomes a typed input of the following island. Its
                     ;; source declaration/metadata must therefore attest the ABI; the
                     ;; extent use is not permission to guess `long`.
-                    (:scalar-dtype description))))))
+                    (:scalar-dtype description)))))))
 
 (defn- supported-descriptions?
-  [descriptions]
+  ([descriptions] (supported-descriptions? descriptions #{}))
+  ([descriptions checked-shape-ids]
   (let [physical-outputs (physical-output-symbols descriptions)]
-    (every? #(admitted-description? physical-outputs %) descriptions)))
+    (every? #(admitted-description? physical-outputs % checked-shape-ids) descriptions))))
 
 (defn- copy-allocation-source
   [expression]
@@ -6561,13 +6567,17 @@
                         known)) values descriptions))]
     (cond-> {:descriptions (preserve-map-storage-inputs descriptions values
                                                      (get-in source-analysis [:source-value-analysis :checked-boundaries]))
-             :values values :allocations allocations}
+             :values values :allocations allocations :source-capacities capacities}
       source-value-options
-      (assoc :source-value-analysis (:source-value-analysis source-analysis))))))
+      (assoc :source-value-analysis (:source-value-analysis source-analysis)
+             :source-description-origins (:source-description-origins source-analysis))))))
 
-(defn- retain-allocation-projections [allocations values]
+(defn- retain-allocation-projections [allocations values required?]
   (mapv (fn [{:keys [source-expression] :as allocation}]
-          (let [projection (invocation-source/allocation-source source-expression values)]
+          (let [projection ((if required?
+                              invocation-source/required-allocation-source!
+                              invocation-source/allocation-source)
+                            source-expression values)]
             (cond-> allocation
               (:helper projection)
               (assoc :source-projection
@@ -6625,7 +6635,7 @@
                              :extent (canonical-extent shape-equalities (:values analysis)
                                                        (allocation-length expression))))))
                 (:allocations analysis))
-          allocations (retain-allocation-projections allocations (:values analysis))]
+          allocations (retain-allocation-projections allocations (:values analysis) false)]
       (assoc analysis
              :numerical-binding-ids (mapv :id (filter soac-description? descriptions))
              :attributes (source-attributes
@@ -6968,6 +6978,36 @@
       (:equation projection)
       (operation-equation description))))
 
+(defn- checked-source-shape-descriptions
+  "Admission only: retain these scalars as ordered source actions, never scalar
+   equations. Full view capacities come from the existing causal analysis,
+   independently of numerical access domains or later equality refinement."
+  ([pairs descriptions capacities storage-values lexical-inputs]
+   (checked-source-shape-descriptions pairs descriptions capacities storage-values lexical-inputs nil))
+  ([pairs descriptions capacities storage-values lexical-inputs origins]
+  (let [by-id (into {} (map (juxt :id identity)) descriptions)
+        facets [:kind :dtype :shape :representation :logical-layout]]
+    (:admitted
+     (reduce (fn [{:keys [visible] :as state} [ordinal [binder expression]]]
+               (let [description (get by-id ordinal)
+                     views (select-keys (:definition-values capacities) visible)
+                     origin (get origins ordinal)
+                     source (when (and (= :scalar (:kind description))
+                                       (= binder (:sym description))
+                                       (or (identical? expression (:expr description))
+                                           (and (identical? expression (:source origin))
+                                                (identical? description (:description origin)))))
+                              (invocation-source/checked-int-array-length-projection
+                               expression {:kind :tensor :shape [] :dtype (:scalar-dtype description)} views))]
+                 (cond-> (update state :visible conj binder)
+                   (and source (contains? (:available capacities) source)
+                        (= source (invocation-source/checked-int-array-length-projection
+                                   (:expr description) {:kind :tensor :shape [] :dtype (:scalar-dtype description)} views))
+                        (= (select-keys (get views source) facets)
+                           (select-keys (get storage-values source) facets)))
+                   (update :admitted conj ordinal))))
+             {:visible (set lexical-inputs) :admitted #{}} (map-indexed vector pairs))))))
+
 (defn- construct-source-program
   [source {:keys [dtype array-types scalar-types values shape-equalities segmented-plans? lexical-inputs
                  preserve-declared-array-storage? host-scalars?]
@@ -6978,12 +7018,16 @@
           pairs (vec (partition 2 bindings))
           array-types (binder-array-types pairs array-types dtype preserve-declared-array-storage?)
           {descriptions :descriptions storage-values :values allocations :allocations
+           source-capacities :source-capacities
+           source-description-origins :source-description-origins
            source-value-analysis :source-value-analysis}
           (source-storage-analysis pairs dtype array-types scalar-types segmented-plans?
                                    values shape-equalities lexical-inputs
                                    {:lexical-inputs (if (some? lexical-inputs) lexical-inputs
                                                        (util/free-syms source))})
-          descriptions (consumer-descriptions descriptions segmented-plans?)]
+          descriptions (consumer-descriptions descriptions segmented-plans?)
+          checked-shape-ids (checked-source-shape-descriptions
+                             pairs descriptions source-capacities storage-values lexical-inputs source-description-origins)]
       (when (and (even? (count bindings))
                  (seq descriptions)
                  (or (some semantic-description? descriptions)
@@ -6994,7 +7038,7 @@
                  ;; cannot contain an unrepresented parallel leaf; structured control or the
                  ;; compatibility scheduler must retain that lexical operation instead.
                  (not-any? contains-parallel-form? body)
-                 (supported-descriptions? descriptions))
+                 (supported-descriptions? descriptions checked-shape-ids))
         (let [operation-descriptions
               (filterv soac-description? descriptions)
               swr-descriptions (filterv swr-description? descriptions)
@@ -7238,7 +7282,7 @@
               ;; Capture helper correspondence where all source argument values
               ;; have been established, before fusion or runtime realization.
               ;; A storage-only allocation may have no InvocationPlan step.
-              allocations (retain-allocation-projections allocations values)
+              allocations (retain-allocation-projections allocations values true)
               facts (dialect/default-program-facts
                      {:values values :inputs inputs :equations equation-facts
                       :effects total-effects

@@ -16,6 +16,7 @@
             [raster.compiler.core.value-completion :as completion]
             [raster.compiler.ir.emitted-parallel-program :as emitted-program]
             [raster.compiler.ir.invocation-plan :as invocation]
+            [raster.compiler.ir.invocation-source :as invocation-source]
             [raster.compiler.ir.par :as par]
             [raster.compiler.ir.parallel-program :as parallel-program]
             [raster.compiler.ir.semantic-fingerprint :as semantic]))
@@ -902,14 +903,29 @@
                                 (cond
                                   (.containsKey children node) (.get children node)
                                   (and (seq? node) (contains? '#{quote clojure.core/quote} (first node))) node
+                                  (and (seq? node) (= 'let* (first node)) (vector? (second node)))
+                                  (let [observations (mapv #((helper-backend 'retained-binding-context)
+                                                             emission node %)
+                                                           (range (quot (count (second node)) 2)))]
+                                    (when-not (every? some? observations)
+                                      (decline! "Owned pmap wrapper has no actual binding chain" {}))
+                                    (let [pairs (mapcat (fn [[id init] observed]
+                                                        [(if-let [hint (get-in observed [:after :hint])]
+                                                           (vary-meta id assoc :tag hint) id)
+                                                         (visit init)])
+                                                      (partition 2 (second node)) observations)
+                                          result (util/remake-from node
+                                                   (list* 'let* (vec pairs) (mapv visit (nnext node))))]
+                                      ;; Generated ordinal and outer storage
+                                      ;; bindings use their actual emitted local
+                                      ;; declaration, never a map-consumer guess.
+                                      (.put ^java.util.IdentityHashMap binding-contexts result observations)
+                                      result))
                                   (or (seq? node) (vector? node))
                                   (util/remake-if-changed node (mapv visit node))
                                   :else node))]
                         (visit scope))
-              pairs (mapcat (fn [[id value] observation]
-                              [(vary-meta id assoc :tag (get-in observation [:after :hint])) value])
-                            (partition 2 (second rebuilt)) bindings)
-              result (with-meta (list 'let* (vec pairs) (nth rebuilt 2)) (meta rebuilt))]
+              result rebuilt]
           ;; The actual count/allocated-array/map-result locals all have stable
           ;; builtin declarations. Contexts match the actual new initializer
           ;; site; no completion is dropped from an arbitrary source node.
@@ -1412,6 +1428,42 @@
     (method-entry/call-with-independent-definition-inputs
      #(construct-static-helper candidate occurrence source-options))))
 
+(defn- construct-reference-application
+  "Shared construction AFTER the caller route authenticates its exact inputs,
+   selected frontend and reference bridge. This private function grants neither
+   occurrence correspondence nor permission to freeze a later source call."
+  [frontend emission bridge invocation inputs caller-context source-ns context-for]
+  (let [saved (:body-context bridge)
+        region-context (if (:object-call-result? caller-context)
+                         (context-for caller-context :object-region) caller-context)
+        projected? (volatile! false)
+        destination {:context (completion/bytecode-operand-context
+                               (context-for region-context :initializer))
+                     :return-class (:body-return-carrier bridge)
+                     :projected? projected?}
+        {:keys [body binding-facts]}
+        (qualified-helper-body
+         emission source-ns
+         (fn [module receivers contexts]
+           (checked-helper-body module receivers contexts destination)))
+        body (if (= 1 (count body)) (first body) (list* 'do body))
+        ;; Detach only the newly constructed numerical source, never original
+        ;; module descendants or the caller's positional operand occurrences.
+        body (if @projected?
+               ((helper-backend 'detach-emission-occurrences) body)
+               body)
+        values (mapv (fn [tag]
+                       (with-meta (gensym "reference_input__") {:raster.type/tag tag}))
+                     (:tags emission))
+        contracts (cond-> [(completion/bytecode-result-context-contract
+                            (:result-context saved) (:emitted-result-type saved))]
+                    (not= Object (:body-return-carrier bridge))
+                    (conj (completion/reference-check-contract (:body-return-carrier bridge))))
+        artifact (construct-helper-application
+                  frontend invocation inputs (:params emission) values body binding-facts
+                  contracts (:return-tag emission) true)]
+    (retain-owned-import! (assoc artifact :reference-return bridge) frontend)))
+
 (defn ^:no-doc instantiate-ready-reference-helper
   "Construct an ordinary application using an ALREADY owned reference-return
    emission. This is the emitted alternative to the cold scalar body planner,
@@ -1440,44 +1492,11 @@
                                 (= (:policy scope) (get-in frontend [:source-entry :source-policy]))
                                 (= (:parameter-carriers physical) (:parameter-carriers bridge))
                                 (not (:unretained-sibling-calls? saved)))
-                       (let [context-for (get-in scope [:functions 'source-evaluation-context])
-                             caller-context (:caller-context planned)
-                             region-context (if (:object-call-result? caller-context)
-                                              (context-for caller-context :object-region) caller-context)
-                             projected? (volatile! false)
-                             destination {:context (completion/bytecode-operand-context
-                                                    (context-for region-context :initializer))
-                                          :return-class (:body-return-carrier bridge)
-                                          :projected? projected?}
-                             {:keys [body binding-facts]}
-                             (qualified-helper-body
-                              emission (get-in scope [:context :source-ns])
-                              (fn [module receivers contexts]
-                                (checked-helper-body module receivers contexts destination)))
-                             body (if (= 1 (count body)) (first body) (list* 'do body))
-                             ;; Only the newly derived, checked pmap projection
-                             ;; crosses into ordinary numerical source here.
-                             ;; The original module and caller operands retain
-                             ;; their occurrence ownership and are not detached.
-                             body (if @projected?
-                                    ((helper-backend 'detach-emission-occurrences) body)
-                                    body)
-                             values (mapv (fn [tag]
-                                            (with-meta (gensym "reference_input__")
-                                              {:raster.type/tag tag}))
-                                          (:tags emission))
-                             contracts (cond-> [(completion/bytecode-result-context-contract
-                                                 (:result-context saved) (:emitted-result-type saved))]
-                                         (not= Object (:body-return-carrier bridge))
-                                         (conj (completion/reference-check-contract
-                                                (:body-return-carrier bridge))))
-                             artifact (construct-helper-application
-                                       frontend (assoc (:plan planned) :expression occurrence)
-                                       (:inputs planned) (:params emission) values body binding-facts
-                                       contracts (:return-tag emission) true)]
-                         (retain-owned-import!
-                          (assoc artifact :reference-return bridge)
-                          frontend))))))))))))))
+                       (construct-reference-application
+                        frontend emission bridge (assoc (:plan planned) :expression occurrence)
+                        (:inputs planned) (:caller-context planned)
+                        (get-in scope [:context :source-ns])
+                        (get-in scope [:functions 'source-evaluation-context]))))))))))))))
 
 (defn- assert-helper-occurrence-current!
   ([emission input-body original record]
@@ -1608,6 +1627,614 @@
            (:emission witness) (:input-body witness) original-call
            (:source-ns witness) (:source-policy witness) {:caller-witness witness}
            (fn [] (validate-contextual-source-witness! witness)))))))
+
+(defn- closed-prefix-local
+  "A leaf load is closed only at the exact physical local version. Conditional
+   normal-return facts are not promoted to presence or an earlier definition."
+  [before facts operand]
+  (when (and (symbol? operand) (contains? before operand))
+    (let [local (get before operand)
+          retained (get facts operand)]
+      (cond-> {:local local}
+        (= local (:local retained)) (merge (:result retained))
+        (contains? #{Float Double} (:reference-class local))
+        (assoc :builtin-class (:reference-class local))))))
+
+(defn- construct-prefix-reference-application
+  "Consume one exact witnessed call AFTER its ordered prefix has been closed.
+   Only direct lexical operands are admitted here; actual conversions remain in
+   the shared application. This does not close the callee for a later call."
+  [witness original binding facts]
+  (let [{:keys [emission input-body source-ns source-policy]} witness
+        record ((helper-backend 'retained-input-invocation-context) emission input-body original)
+        typed (when record (owned-occurrence-typed-call original record))
+        description (when typed (descriptor/call-description typed))
+        signature (when typed
+                    (call-boundary/selected-typed-signature
+                     (:semantic-op description) (:implementation-op description)
+                     (count (:inputs record)) (:method record)))
+        original-arguments (vec (descriptor/call-args original))
+        before (:before binding)
+        direct-inputs?
+        (and (= (count original-arguments) (count (:inputs record))
+                (count (:input-completions record)))
+             (every? true?
+                     (map (fn [argument input completed]
+                            (let [local (closed-prefix-local before facts argument)]
+                              (and local (= argument (:operand input) (:operand completed))
+                                   (= {argument (:local local)} (:ports input))
+                                   (false? (:unretained-sibling-calls? input))
+                                   (or (not= :ref (:emitted-type completed))
+                                       (not (.isPrimitive ^Class (:parameter-carrier completed)))
+                                       (contains? #{Float Double} (:builtin-class local))))))
+                          original-arguments (:inputs record) (:input-completions record))))
+        source (get-in signature [:definition :source-var])
+        frontend (when (and direct-inputs? (= :known (:status signature)) source)
+                   (method-entry/original-source-frontend source))]
+    (when (and frontend (= :known (:status record))
+               (identical? (:initializer binding) (:expression record))
+               (= :global-typed-indy (:invocation-mode record))
+               (identical? Object (:return-carrier record))
+               ((helper-backend 'completed-invocation-inputs?) record))
+      (method-entry/assert-frontend-selection! frontend source)
+      (when-let [callee-emission (method-entry/observed-frontend-emission frontend)]
+        (when-let [bridge (method-entry/frontend-reference-return-bridge frontend)]
+          (when (and (= (:method record) (:invocation-method bridge))
+                     (= (:parameter-classes signature) (:parameter-carriers bridge))
+                     (identical? (:implementation callee-emission)
+                                 (get-in signature [:definition :entry :typed-impl]))
+                     (= source-policy (get-in frontend [:source-entry :source-policy]))
+                     (not (get-in bridge [:body-context :unretained-sibling-calls?])))
+            (let [inputs (mapv (fn [input completed]
+                                 (assoc input :completion completed
+                                        :contract (completion/planned-bytecode-input-contract
+                                                   (:parameter-carrier completed) (:context input)
+                                                   (:emitted-type completed))))
+                               (:inputs record) (:input-completions record))
+                  application (construct-reference-application
+                               frontend callee-emission bridge (assoc record :expression original)
+                               inputs (:input-context binding) source-ns
+                               (helper-backend 'source-evaluation-context))]
+              (retain-owned-artifact!
+               (assoc (dissoc application :receipt) :caller-witness witness :physical-call record)
+               #(do (validate-helper-application! application)
+                    (validate-contextual-source-witness! witness)
+                    (assert-helper-occurrence-current! emission input-body original record))))))))))
+
+(defn- owned-effect-record
+  "Join an actual operand edge OR an original catalog node to an existing
+   operation observation. A copied token alone cannot establish either edge."
+  [emission node observer]
+  (let [token (:raster.compiler.backend.jvm.bytecode/call-occurrence (meta node))
+        original (get (:invocation-catalog emission) token)
+        record (when original ((helper-backend observer) emission original))]
+    (when (and record (or (identical? node original) (identical? node (:expression record))))
+      (assoc record :source original))))
+
+(defn- array-origin-at-local [result local]
+  (if (and (:array-origin result)
+           (not (and (= :ref (:type local)) (class? (:reference-class local))
+                     (.isAssignableFrom ^Class (:reference-class local) ^Class (:array-class result)))))
+    (dissoc result :array-origin :array-class)
+    result))
+
+(defn- closed-source-effect-projector
+  "A private, non-executable effect projection of actual owned producers.
+   Unknown operations stop coverage. No arbitrary AST operation is classified
+   by name, and this grants no motion, bounds, totality or concurrent-code claim."
+  [memo]
+  (let [primitive? #(contains? #{:int :long :float :double :bool} %)
+        builtin? #(boolean (some (fn [known] (identical? known (:builtin-class %)))
+                                (vals types/primitive-info)))
+        reference? (fn [carrier]
+                     (and (class? carrier)
+                          (or (identical? Object carrier)
+                              (and (.isArray ^Class carrier)
+                                   (.isPrimitive (.getComponentType ^Class carrier))))))
+        ports? (fn [locals ports] (every? (fn [[id local]] (= local (get locals id))) ports))]
+    (letfn [(local-result [locals values id]
+              (when-let [local (get locals id)]
+                (let [old (get values id)]
+                  (cond-> {:stack (:type local) :actual id}
+                    (= local (:local old)) (merge (dissoc (:result old) :actual))
+                    (and (= :ref (:type local))
+                         (some #(identical? % (:reference-class local)) (vals types/primitive-info)))
+                    (assoc :builtin-class (:reference-class local))))))
+            (close-input [emission locals values input raw]
+              (when (and (false? (:unretained-sibling-calls? input)) (ports? locals (:ports input)))
+                (when-let [result (close-value emission locals values (:operand input))]
+                  (when (= raw (:stack result)) result))))
+            (close-call [emission locals values record]
+              (when (and (= :global-typed-indy (:invocation-mode record))
+                         (identical? Object (:return-carrier record))
+                         ((helper-backend 'completed-invocation-inputs?) record))
+                (let [results (mapv #(close-input emission locals values %1 (:emitted-type %2))
+                                    (:inputs record) (:input-completions record))
+                      inputs-closed?
+                      (and (= (count results) (count (:inputs record)) (count (:input-completions record)))
+                           (every? some? results)
+                           (every? true?
+                                   (map (fn [result completed]
+                                          (let [carrier (:parameter-carrier completed)]
+                                            (and (or (.isPrimitive ^Class carrier) (reference? carrier))
+                                                 (or (not (.isPrimitive ^Class carrier))
+                                                     (primitive? (:emitted-type completed))
+                                                     (builtin? result)))))
+                                        results (:input-completions record))))
+                      typed (when inputs-closed? (owned-occurrence-typed-call (:source record) record))
+                      description (when typed (descriptor/call-description typed))
+                      selected (when typed
+                                 (call-boundary/selected-typed-signature
+                                  (:semantic-op description) (:implementation-op description)
+                                  (count results) (:method record)))
+                      source (get-in selected [:definition :source-var])
+                      callee (when (= :known (:status selected)) (method-entry/original-source-frontend source))]
+                  (when callee
+                    (when-let [result (close-owner callee)]
+                      (when (and (= (:method record) (:method result))
+                                 (identical? (get-in selected [:definition :entry :typed-impl])
+                                             (:implementation result)))
+                        ;; A callee formal/slot is not the caller's source view.
+                        ;; Array origin needs a separate actual argument join.
+                        (assoc (dissoc result :method :implementation :array-origin :array-class)
+                               :actual (:expression record))))))))
+            (close-scope [emission locals values node]
+              (let [[head bindings & body] (when (seq? node) node)
+                    token (:raster.compiler.backend.jvm.bytecode/binding-scope-occurrence (meta node))
+                    scope (get (:binding-catalog emission) token)]
+                (when (and (identical? node scope)
+                           (= 'let* head) (vector? bindings) (even? (count bindings)) (= 1 (count body)))
+                  (loop [ordinal 0 locals locals values values]
+                    (if (= ordinal (quot (count bindings) 2))
+                      (when-let [result (close-value emission locals values (first body))]
+                        (assoc result :actual node))
+                      (let [observation (when scope ((helper-backend 'retained-binding-context) emission scope ordinal))
+                            binder (nth bindings (* 2 ordinal))
+                            original (nth bindings (inc (* 2 ordinal)))]
+                        (when (and observation (= locals (:before observation))
+                                   (= binder (:binder observation)))
+                          (when-let [result (close-value emission locals values original)]
+                            (when (and (identical? (:actual result) (:initializer observation))
+                                       (= (:stack result) (get-in observation [:after :type])))
+                              (recur (inc ordinal)
+                                     (assoc locals binder (:after observation))
+                                     (assoc values binder {:local (:after observation)
+                                                           :result (array-origin-at-local result (:after observation))})))))))))))
+            (close-completion [emission locals values node]
+              (let [token (:raster.compiler.backend.jvm.bytecode/completion-occurrence (meta node))
+                    source (get (:completion-catalog emission) token)
+                    record (when source ((helper-backend 'retained-owned-completion-context) emission source))
+                    parts (completion/canonical-parts node)]
+                (when (and record (= locals (:locals-before record))
+                           (or (identical? node source) (identical? node (:expression record)))
+                           (= (:contract parts) (:contract record)))
+                  ;; Traverse the actual recorded operand, not a token-bearing
+                  ;; source copy. Completion observers do not equate the two.
+                  (when-let [input (close-value emission locals values (:operand record))]
+                    (let [context (get-in record [:contract :source-context])
+                          target (get-in record [:contract :target-carrier])
+                          raw (:input-carrier record)
+                          adaptation (:adaptation record)
+                          closed?
+                          (case context
+                            :jvm-object-input (= :identity adaptation)
+                            (:jvm-checkcast :jvm-bytecode-reference-input)
+                            (and (= :checkcast adaptation) (reference? target))
+                            :jvm-bytecode-boxed-parameter-input
+                            (or (and (= :checkcast adaptation) (reference? target))
+                                (and (= :boxed-unbox adaptation) (builtin? input)))
+                            (:jvm-bytecode-floating-input :jvm-bytecode-integral-input
+                             :source-floating-cast :source-integral-cast)
+                            (or (primitive? raw) (and (= :ref raw) (builtin? input)))
+                            :jvm-bytecode-result-context (= :identity adaptation)
+                            false)]
+                      (when (and closed?
+                                 (or (= raw (:stack input))
+                                     ;; Object completion's recorded raw carrier
+                                     ;; is AFTER the actual root boxing producer.
+                                     (and (= :jvm-object-input context)
+                                          (= (:stack input) (:operand-before-box-carrier record)))))
+                        (merge (when (= :ref (:returned-carrier record))
+                                 (merge (select-keys input [:builtin-class])
+                                        (when (and (:array-origin input)
+                                                   (or (and (contains? #{:jvm-object-input :jvm-bytecode-result-context} context)
+                                                            (= :ref raw) (= :identity adaptation))
+                                                       (and (= :checkcast adaptation) (class? target)
+                                                            (.isAssignableFrom ^Class target ^Class (:array-class input)))))
+                                          (select-keys input [:array-origin :array-class]))))
+                               (:result-fact record)
+                               {:stack (:returned-carrier record) :actual (:expression record)})))))))
+            (close-map-effect [emission locals values expansion]
+                (let [{:keys [output index cast body actual-expanded bound-observation]} expansion
+                      ordinal-source body
+                      ordinal ((helper-backend 'retained-binding-context) emission ordinal-source 0)
+                      effect actual-expanded
+                      bound-pair (when (= 'let* (first effect)) (second effect))
+                      bound-id (first bound-pair)
+                      loop-node (nth effect 2 nil)
+                      branch (nth loop-node 2 nil)
+                      store (second (nth branch 2 nil))
+                      actual-cast (nth store 3 nil)
+                      actual-ordinal (second actual-cast)
+                      index-local (get-in ordinal [:before index])
+                      bound-local (get-in ordinal [:before bound-id])
+                      context {:source-ns (:source-ns emission) :pending-source? false
+                               :dependency-snapshots (:dependency-snapshots emission)}
+                      canonical-cast (when (symbol? cast)
+                                       (method-entry/observed-body-operation context cast (set (keys (:before ordinal)))))
+                      cast-tag (descriptor/cast-result-tag canonical-cast)
+                      expected-store (list 'clojure.core/aset output index actual-cast)
+                      expected-effect
+                      (list 'let* [bound-id (:initializer bound-observation)]
+                            (list 'loop* [index (list 'int 0)]
+                                  (list 'if (list '< index bound-id)
+                                        (list 'do expected-store
+                                              (list 'recur (list 'clojure.core/unchecked-inc-int index)))
+                                        (:returned expansion))))]
+                  ;; This is the exact consumed compiler recipe, not admission
+                  ;; of arbitrary loops or stores. All user-controlled work is
+                  ;; in count/body/cast and is closed separately below. The
+                  ;; scaffold contributes only primitive integer control and
+                  ;; primitive-array storage (which may still throw).
+                  (when (and (= locals (:before bound-observation))
+                             (= effect expected-effect)
+                             (= 2 (count bound-pair))
+                             (= :int (:type index-local) (:type bound-local))
+                             (= locals
+                                (dissoc (:before ordinal) index bound-id))
+                             (= (:after bound-observation) bound-local)
+                             (let [carrier (get-in locals [output :reference-class])]
+                               (and (class? carrier) (.isArray ^Class carrier)
+                                    (.isPrimitive (.getComponentType ^Class carrier))))
+                             (= 2 (count actual-cast)) (= cast (first actual-cast))
+                             (= 'let* (first actual-ordinal)) (= 3 (count actual-ordinal))
+                             (vector? (second actual-ordinal)) (= 2 (count (second actual-ordinal)))
+                             (= (:binder ordinal) (first (second actual-ordinal)))
+                             (identical? (:initializer ordinal) (second (second actual-ordinal)))
+                             (= (meta actual-ordinal) (meta ordinal-source))
+                             (contains? '#{float double long int} cast-tag)
+                             (intrinsic-source/observe-original! (:source-ns context) canonical-cast)
+                             (close-value emission locals values (:initializer bound-observation)))
+                    (let [body-locals (assoc (:before ordinal) (:binder ordinal) (:after ordinal))
+                          original-body (close-value emission body-locals values (nth ordinal-source 2))
+                          ;; Generic scopes are catalog-identity-only. The
+                          ;; rebuilt actual wrapper above has a separate exact
+                          ;; parent/binding/body edge from this owned recipe.
+                          body-result (close-scope emission (:before ordinal) values ordinal-source)]
+                      (when (and original-body body-result (primitive? (:stack body-result))
+                                 (identical? (:actual original-body) (nth actual-ordinal 2 nil)))
+                        (assoc (select-keys (local-result locals values output) [:array-origin :array-class])
+                               :stack :ref :actual effect))))))
+            (close-pmap [emission locals values source]
+              (when-let [spine ((helper-backend 'retained-pmap-spine) emission source)]
+                (let [[count-binding allocation-binding effect-binding] (:bindings spine)]
+                  (when (and (= locals (:before count-binding))
+                             (close-value emission locals values (:initializer count-binding))
+                             (close-value emission (:before allocation-binding) values (:initializer allocation-binding))
+                             (identical? (:initializer effect-binding) (get-in spine [:map-effect :actual-expanded]))
+                             (close-map-effect emission (:before effect-binding) values (:map-effect spine)))
+                    (cond-> {:stack :ref :actual source}
+                      (= :int (get-in spine [:allocation :count :input-type]))
+                      (assoc :array-class (:array-class spine)
+                             :array-origin {:kind :int-count-allocation :emission emission
+                                            :allocation (:allocation spine)}))))))
+            (close-current-map [emission locals values node]
+              (some (fn [[_ record]]
+                      (when (= :map-effect (:source-kind record))
+                        (when-let [expansion ((helper-backend 'retained-map-effect-expansion)
+                                             emission (:source record))]
+                          (when (identical? node (:actual-expanded expansion))
+                            (close-map-effect emission locals values expansion)))))
+                    (:pmap-expansions emission)))
+            (close-reduction [emission locals values node]
+              (let [token (:raster.compiler.backend.jvm.bytecode/reduction-occurrence (meta node))
+                    witness (:raster.compiler.backend.jvm.bytecode/reduction-witness (meta node))
+                    source (or (when token (get (:reduction-catalog emission) token))
+                               (when witness
+                                 (some (fn [[_ expansion]]
+                                         (when (identical? witness (:witness expansion)) (:source expansion)))
+                                       (:reduction-expansions emission))))
+                    record (when source ((helper-backend 'retained-reduction-emission) emission source))
+                    {:keys [bound loop recur exit root-result result-fact]} record
+                    [index carry] (:variables loop)
+                    [index-init carry-init] (:initializers loop)
+                    [index-next carry-next] (:values recur)
+                    loop-locals (:locals loop)
+                    count-id (:binder bound)
+                    actual-bound (:initializer bound)
+                    control (:control exit)
+                    expected-exit (list 'if (:predicate control) (:expression recur) carry)]
+                (when (and record root-result result-fact
+                           (or (identical? node source) (identical? node (:expression bound)))
+                           (= locals (:before bound))
+                           (= 2 (count (:variables loop)) (count (:initializers loop)) (count (:values recur)))
+                           (= 1 (count (:body loop)))
+                           (identical? (:expression exit) (first (:body loop)))
+                           (= expected-exit (:expression exit))
+                           (= :int-less-than (:kind control))
+                           (= [index count-id] (:operands control))
+                           (= [:int :int] (:input-types control))
+                           (= loop-locals (:locals control))
+                           (= :if-icmpge (:false-branch control))
+                           (= (list '< index count-id) (:predicate control))
+                           (= (list 'int 0) (:initializer index-init))
+                           (= :int (:input-type index-init) (:completed-type index-init)
+                              (get-in index-init [:after :type]))
+                           (= (:outer-locals loop) (:before index-init))
+                           (= (assoc (:before index-init) index (:after index-init)) (:before carry-init))
+                           (= (assoc (:before carry-init) carry (:after carry-init)) loop-locals)
+                           (= (list 'clojure.core/unchecked-inc-int index) (:operand index-next))
+                           (= :int (:input-type index-next) (:type index-next))
+                           (= loop-locals (:locals index-next) (:locals carry-next))
+                           (= 'int (first actual-bound)) (= 2 (count actual-bound))
+                           ;; Only the owned expansion supplies these Int
+                           ;; control operations. The evaluated bound, seed and
+                           ;; entire update remain ordinary recursive obligations.
+                           (primitive? (:input-type carry-init)) (primitive? (:completed-type carry-init))
+                           (primitive? (:input-type carry-next)) (primitive? (:type carry-next)))
+                  (let [count-result (close-value emission locals values (second actual-bound))
+                        seed-result (close-value emission (:before carry-init) values (:initializer carry-init))
+                        update-result (close-value emission loop-locals values (:operand carry-next))]
+                    (when (and count-result (or (primitive? (:stack count-result)) (builtin? count-result))
+                               (= (:input-type carry-init) (:stack seed-result))
+                               (= (:input-type carry-next) (:stack update-result)))
+                      (merge result-fact {:stack (:result-type root-result) :actual (:expression bound)}))))))
+            (close-value [emission locals values node]
+              (cond
+                (symbol? node) (local-result locals values node)
+                (types/numeric-literal-carrier node)
+                {:stack (types/numeric-literal-carrier node) :actual node}
+                (completion/canonical-form? node) (close-completion emission locals values node)
+                :else
+                (let [arithmetic (owned-effect-record emission node 'retained-arithmetic)
+                      conversion (owned-effect-record emission node 'retained-scalar-conversion)
+                      read (owned-effect-record emission node 'retained-array-read)
+                      length (owned-effect-record emission node 'retained-array-length)
+                      allocation (owned-effect-record emission node 'retained-zero-array-allocation)
+                      call (owned-effect-record emission node 'retained-invocation-context)]
+                  (cond
+                    arithmetic
+                    (when (and (every? #(primitive? (:emitted-type %)) (:input-completions arithmetic))
+                               (every? some? (map #(close-input emission locals values %1 (:emitted-type %2))
+                                                  (:inputs arithmetic) (:input-completions arithmetic))))
+                      {:stack (:result-carrier arithmetic) :actual (:expression arithmetic)})
+
+                    conversion
+                    (when (ports? locals (:ports conversion))
+                      (when-let [input (close-value emission locals values (:operand conversion))]
+                        (when (and (= (:stack input) (:input-type conversion))
+                                   (or (primitive? (:input-type conversion)) (builtin? input)))
+                          {:stack (:result-carrier conversion) :actual (:expression conversion)})))
+
+                    read
+                    ;; The existing index-route proof closes actual primitive
+                    ;; operations; it explicitly leaves unknown calls open.
+                    (when (and (symbol? (:array read)) (= (:array-local read) (get locals (:array read)))
+                               (= :ref (get-in read [:array-local :type]))
+                               (true? (:primitive-index? read)) (ports? locals (get-in read [:input :ports]))
+                               (primitive? (:result-type read)))
+                      {:stack (:result-type read) :actual (:expression read)})
+
+                    length
+                    (when (and (= :jvm-arraylength (:operation length))
+                               (symbol? (:array length))
+                               (= {(:array length) (get locals (:array length))} (get-in length [:input :ports]))
+                               (= :ref (get-in locals [(:array length) :type]) (:input-carrier length)))
+                      {:stack (:result-carrier length) :actual (:expression length)})
+
+                    allocation
+                    (when (and (true? (:fresh? allocation)) (= :jvm-zero (:initialization allocation))
+                               (true? (:primitive-count? allocation))
+                               (close-input emission locals values (:count allocation)
+                                            (get-in allocation [:count :input-type])))
+                      (cond-> {:stack :ref :actual (:expression allocation)}
+                        (= :int (get-in allocation [:count :input-type]))
+                        (assoc :array-class (:array-class allocation)
+                               :array-origin {:kind :int-count-allocation :emission emission
+                                              :allocation allocation})))
+
+                    call (close-call emission locals values call)
+                    :else (or (close-pmap emission locals values node)
+                              (close-current-map emission locals values node)
+                              (close-reduction emission locals values node)
+                              (close-scope emission locals values node))))))
+            (close-owner [owner]
+              (when-let [emission (method-entry/observed-frontend-emission owner)]
+                (if (.containsKey ^java.util.IdentityHashMap memo emission)
+                  (let [result (.get ^java.util.IdentityHashMap memo emission)] (when (map? result) result))
+                  (do
+                    ;; Recursion is not a callback-free proof. No fixed-point
+                    ;; guess or refreshed global definition is introduced.
+                    (.put ^java.util.IdentityHashMap memo emission ::in-progress)
+                    (let [bridge (method-entry/frontend-boxed-entry-bridge owner)
+                          context (:body-context bridge)
+                          body (:body emission)
+                          result (when (and context (= 1 (count body))
+                                            (not (:unretained-sibling-calls? context)))
+                                   (close-value emission (:locals context) {} (first body)))
+                          result
+                          (when (and result (= (:stack result) (:emitted-result-type context)))
+                            (case (:kind bridge)
+                              :reference-static-return
+                              (when (and (= :ref (:stack result)) (reference? (:body-return-carrier bridge)))
+                                (assoc result :stack :ref))
+                              :boxed-primitive-static-return
+                              (when (or (primitive? (:stack result)) (builtin? result))
+                                (when-let [builtin (get types/primitive-info
+                                                       (symbol (.getName ^Class (:payload-carrier bridge))))]
+                                  {:stack :ref :builtin-class builtin}))
+                              nil))
+                          result (when result
+                                   (assoc result :method (:invocation-method bridge)
+                                          :implementation (:implementation emission)))]
+                      (.put ^java.util.IdentityHashMap memo emission (or result ::unsupported))
+                      result)))))]
+      {:owner close-owner :value close-value})))
+
+(defn ^:no-doc project-contextual-reference-helpers
+  "Project an exact witnessed flat prefix using owned operation evidence.
+   Unknown callbacks/coordination stop the interval. Crossing an imported call
+   additionally closes its whole original producer, including owned pmap or
+   reduction scaffolds and every evaluated operand. No preparation, motion,
+   scalar evaluation, totality or global concurrent stability claim."
+  [witness]
+  (when method-entry/*emission-inputs*
+    (method-entry/call-with-independent-definition-inputs
+     (fn []
+       (validate-contextual-source-witness! witness)
+       (let [source (:scope witness)
+             bindings (second source)
+             projector (closed-source-effect-projector (java.util.IdentityHashMap.))
+             finish (fn [constructed applications endpoint]
+                      (when (seq applications)
+                        (let [form (util/remake-from source
+                                     (list* 'let* constructed (drop 2 source)))]
+                          (retain-owned-artifact!
+                           {:source source :form form :applications applications
+                            :witness witness :prefix-endpoint endpoint}
+                           #(do (validate-contextual-source-witness! witness)
+                                (doseq [application applications]
+                                  (validate-helper-application! application)))))))]
+         (loop [ordinal 0 facts {} constructed bindings applications [] endpoint nil]
+           (if (= ordinal (quot (count bindings) 2))
+             (finish constructed applications endpoint)
+             (let [binder (nth bindings (* 2 ordinal))
+                   original (nth bindings (inc (* 2 ordinal)))
+                   observed (current-source-binding!
+                             witness ordinal binder original
+                             :closed-prefix-binding :closed-prefix-observation)
+                   application (construct-prefix-reference-application witness original observed facts)
+                   constructed (if application
+                                 (assoc constructed (inc (* 2 ordinal)) (:expression application)) constructed)
+                   applications (cond-> applications application (conj application))
+                   endpoint (if application ordinal endpoint)
+                   result ((:value projector) (:emission witness) (:before observed) facts (:initializer observed))]
+               (if (and result (= (:stack result) (get-in observed [:after :type]))
+                        (identical? (:actual result) (:initializer observed)))
+                 (recur (inc ordinal) (assoc facts binder {:local (:after observed) :result result})
+                        constructed applications endpoint)
+                 (finish constructed applications endpoint))))))))))
+
+(defn ^:no-doc contextual-reference-helper-candidate?
+  "Syntax-only routing for generated flat source whose earlier completions
+   prevent static call substitution. This grants no callee/effect authority."
+  [source]
+  (when (and (seq? source) (= 'let* (first source)) (vector? (second source)))
+    (loop [pairs (seq (partition 2 (second source))) completed? false]
+      (when-let [[_ expression] (first pairs)]
+        (or (and completed? (:dispatch? (descriptor/call-description expression)))
+            (recur (next pairs) (or completed? (completion/canonical-form? expression))))))))
+
+(defn- contextual-array-entry-facts [witness]
+  (let [context ((helper-backend 'retained-input-body-context)
+                 (:emission witness) (:input-body witness))]
+    (into {}
+          (keep (fn [[parameter carrier]]
+                  (let [local (get-in context [:locals parameter])]
+                    (when (and (dtype/dtype-for-jvm-array-class carrier)
+                               (= :ref (:type local)) (identical? carrier (:reference-class local)))
+                      [parameter {:local local
+                                  :result {:stack :ref :array-class carrier
+                                           :array-origin {:kind :entry-array :parameter parameter
+                                                          :local local}}}]))))
+          (map vector (:parameters witness) (:parameter-carriers witness)))))
+
+(defn- integral-array-length-body? [expression operand]
+  (and (seq? expression) (= 2 (count expression))
+       (case (first expression)
+         clojure.core/alength (= operand (second expression))
+         (clojure.core/int clojure.core/long)
+         (integral-array-length-body? (second expression) operand)
+         false)))
+
+(defn- contextual-int-length-source [witness observation original facts projector]
+  ;; Publication is use-closed here: the actual Object(Long) result is consumed
+  ;; immediately by this original checked Int initializer, never aliased.
+  (when (and (seq? original) (= 2 (count original))
+             (= 'clojure.core/int (first original)))
+    (let [emission (:emission witness) input-body (:input-body witness)
+          call-source (second original)
+          conversion ((helper-backend 'retained-input-scalar-conversion) emission input-body original)
+          call ((helper-backend 'retained-input-invocation-context) emission input-body call-source)
+          input (first (:inputs call))
+          completed (first (:input-completions call))
+          operand (:operand input)
+          local (get-in observation [:before operand])
+          result (when (= local (get-in facts [operand :local])) (get-in facts [operand :result]))
+          carrier (:array-class result)
+          call-result (when call ((:value projector) emission (:before observation) facts (:expression call)))
+          typed (when call (owned-occurrence-typed-call call-source call))
+          body (when (and typed carrier)
+                 (invocation-source/selected-array-length-body typed carrier))]
+      (when (and conversion call typed (:array-origin result)
+                 (dtype/dtype-for-jvm-array-class carrier)
+                 (= :int (get-in observation [:after :type]) (:result-carrier conversion))
+                 (= 'clojure.core/int (:source-operation conversion))
+                 (identical? Integer/TYPE (:target-carrier conversion))
+                 (= :ref (:input-type conversion) (:stack call-result))
+                 (identical? Long (:builtin-class call-result))
+                 (identical? (:initializer observation) (:expression conversion))
+                 (identical? (:operand conversion) (:expression call))
+                 ((helper-backend 'completed-invocation-inputs?) call)
+                 (= 1 (count (:inputs call)) (count (:input-completions call)))
+                 (symbol? operand) (= :ref (:type local) (:emitted-type completed))
+                 (= {operand local} (:ports input)) (false? (:unretained-sibling-calls? input))
+                 (identical? carrier (:parameter-carrier completed))
+                 (integral-array-length-body? body operand)
+                 (intrinsic-source/observe-original! (:source-ns witness) 'clojure.core/int))
+        ;; The actual view Class, not a logical AV, supplies this source operand
+        ;; annotation. Its ordinary emitter check preserves null/CHECKCAST order.
+        (let [tag (dtype/array-tag-for-dtype (dtype/dtype-for-jvm-array-class carrier))
+              body (util/subst-syms {operand (with-meta operand (assoc (meta operand) :tag tag :raster.type/tag tag))} body)]
+          ((helper-backend 'detach-emission-occurrences)
+           (with-meta (list 'clojure.core/int body) (meta original))))))))
+
+(defn ^:no-doc project-contextual-array-lengths
+  "Construct canonical integral array-length SOURCE at an exact checked Int
+   binding after a closed current prefix. Actual entry/allocation view origins,
+   selected Method/input conversions and use-closed result publication remain
+   private to this constructor. No AV capacity, presence, motion or host/device
+   transfer is granted; the downstream source ShapeProjection proves its view."
+  [witness]
+  (when method-entry/*emission-inputs*
+    (method-entry/call-with-independent-definition-inputs
+     (fn []
+       (validate-contextual-source-witness! witness)
+       (let [source (:scope witness) bindings (second source)
+             projector (closed-source-effect-projector (java.util.IdentityHashMap.))
+             finish (fn [bindings rewrites]
+                      (when (seq rewrites)
+                        (retain-owned-artifact!
+                         {:source source :form (util/remake-from source (list* 'let* bindings (drop 2 source)))
+                          :rewrites rewrites :witness witness}
+                         #(validate-contextual-source-witness! witness))))]
+         (loop [ordinal 0 facts (contextual-array-entry-facts witness) constructed bindings rewrites []]
+           (if (= ordinal (quot (count bindings) 2))
+             (finish constructed rewrites)
+             (let [binder (nth bindings (* 2 ordinal)) original (nth bindings (inc (* 2 ordinal)))
+                   observation (current-source-binding! witness ordinal binder original
+                                                        :contextual-length-binding :contextual-length-observation)
+                   result ((:value projector) (:emission witness) (:before observation) facts (:initializer observation))]
+               (if (and result (= (:stack result) (get-in observation [:after :type]))
+                        (identical? (:actual result) (:initializer observation)))
+                 (let [replacement (contextual-int-length-source witness observation original facts projector)]
+                   (recur (inc ordinal) (assoc facts binder {:local (:after observation)
+                                                            :result (array-origin-at-local result (:after observation))})
+                          (if replacement (assoc constructed (inc (* 2 ordinal)) replacement) constructed)
+                          (cond-> rewrites replacement (conj {:ordinal ordinal :source original :expression replacement}))))
+                 (finish constructed rewrites))))))))))
+
+(defn ^:no-doc contextual-array-length-candidate?
+  "Cheap routing for the whole-final-Int constructor; no selection or proof."
+  [source]
+  (and (seq? source) (= 'let* (first source)) (vector? (second source))
+       (boolean
+        (some (fn [[_ expression]]
+                (when (and (seq? expression) (= 2 (count expression))
+                           (= 'clojure.core/int (first expression)))
+                  (let [call (descriptor/call-description (second expression))]
+                    (and (:dispatch? call) (descriptor/alength-op? (:semantic-op call))))))
+              (partition 2 (second source))))))
 
 (defn- direct-double-map-helper? [node]
   (when (and (par/par-map-form? node) (= 6 (count node)))

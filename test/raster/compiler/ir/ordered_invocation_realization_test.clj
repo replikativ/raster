@@ -67,6 +67,116 @@
 (defn- reason [f]
   (try (f) nil (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
 
+(deftest retained-materialized-aliases-do-not-create-or-strengthen-storage
+  (doseq [source [(double-array [1 2 3]) nil]
+          initialization [:unspecified :zero]]
+    (let [abstract (av/tensor {:dtype :double :shape [3]})
+          token [:test :shared-storage]
+          buffer (materialization/->MaterializedBuffer token abstract [3] source initialization)
+          owned {:id token :compiler-values #{'original} :abstract abstract
+                 :shape [3] :source source :initialization :unspecified}
+          realized {:buffers {'original token 'unrelated :other}
+                    :storage {token owned} :acquired-storage #{token}}
+          materialized {:program-buffers {'alias buffer}}
+          retain (fn [state prefix values]
+                   (#'invocation-link/retain-materialized-storage-aliases state prefix values))
+          result (retain realized materialized {'alias abstract})]
+      (is (= (assoc (:buffers realized) 'alias token) (:buffers result)))
+      (is (= #{'original 'alias} (get-in result [:storage token :compiler-values])))
+      (is (= owned (assoc (get-in result [:storage token]) :compiler-values #{'original})))
+      (is (identical? source (get-in result [:storage token :source])))
+      (is (= (:acquired-storage realized) (:acquired-storage result)))
+      (is (= result (retain result materialized {'alias abstract})) "retention is idempotent")
+      (is (= realized (retain realized materialized {})) "non-program names gain no binding")
+      (let [unowned (assoc realized :storage {})]
+        (is (= unowned (retain unowned materialized {'alias abstract}))
+            "materialization alone does not acquire or initialize storage"))
+      (doseq [[bad-state bad-prefix bad-values]
+              [[(assoc-in realized [:buffers 'alias] :different-storage) materialized {'alias abstract}]
+               [(assoc-in realized [:storage token :id] :different-storage) materialized {'alias abstract}]
+               [realized (assoc-in materialized [:program-buffers 'alias :source] (double-array [1 2 3]))
+                {'alias abstract}]
+               [realized (assoc-in materialized [:program-buffers 'alias :shape] [2]) {'alias abstract}]
+               [realized materialized {'alias (av/tensor {:dtype :float :shape [3]})}]
+               [(assoc-in realized [:storage token :abstract] (av/tensor {:dtype :float :shape [3]}))
+                materialized {'alias abstract}]]]
+        (is (= :invocation-ordered-input-storage
+               (reason #(retain bad-state bad-prefix bad-values)))
+            "tokens cannot override source identity, views, representation, or an existing binding")))))
+
+(deftest ordered-stages-retain-materialized-input-aliases-with-one-acquisition
+  ;; Use the real frontend, source ordering, materializer and LinkPlan constructors.
+  ;; Only synchronous device completion is simulated: this is a storage/lifecycle
+  ;; test, not a numerical execution oracle.
+  (let [alias (with-meta 'alias {:tag 'java.lang.Object :raster.type/tag 'doubles})
+        identity (fn [source]
+                   (vary-meta (completion/complete-value completion/object-input-contract source)
+                              assoc :raster.effect/preserve-evaluation true))
+        source (list 'let*
+                     [alias (identity 'xs)
+                      'first-write '(raster.par/map! early i 1 double
+                                      (+ (clojure.core/aget alias i) 1.0))
+                      'second-write '(raster.par/map! out i n double
+                                       (+ (clojure.core/aget xs i) 2.0))]
+                     'second-write)
+        arrays {'xs :double 'early :double 'out :double}
+        values (into {} (map (fn [id] [id (av/tensor {:dtype :double :shape [2]})]))
+                     (keys arrays))
+        options {:dtype :double :target-dialect :opencl-portable
+                 :preserve-declared-array-storage? true :values values
+                 :public-parameters '[xs early out n] :active-params '[xs early out n]
+                 :array-types arrays :scalar-types {'n :long}}
+        numerical (:program (typed-route/attempt
+                             source :double arrays
+                             {:scalar-types (:scalar-types options) :values values
+                              :lexical-inputs (:public-parameters options)
+                              :preserve-declared-array-storage? true}))
+        semantic (route/promote-program numerical options)
+        emitted (:program (program-c-family/emit-program
+                           (route/schedule-program semantic options) options))
+        initial (invocation-link/begin-ordered-realization
+                 {:semantic semantic :emitted emitted :target :ocl:0}
+                 [(double-array [3 4]) (double-array 2) (double-array 2) 2] nil)
+        input-token (:id (get-in (materialization/prefix-bindings (:materialization initial))
+                                [:program-buffers 'xs]))
+        acquisitions (atom {})
+        stages (atom [])
+        completed
+        (loop [state initial]
+          (let [position (:source-cursor state)
+                entry (nth (:source-order state) position nil)]
+            (if-not entry
+              state
+              (if-let [span (get (:equation-spans state) position)]
+                (let [ready (invocation-link/realize-ready-equation state (:equation span) nil)
+                      next-state (:state ready)]
+                  (swap! stages conj ready)
+                  (doseq [token (keys (:new-storage ready))]
+                    (swap! acquisitions update token (fnil inc 0)))
+                  (recur (-> next-state
+                             (update :acquired-storage into (keys (:new-storage ready)))
+                             (assoc :pending nil :source-cursor
+                                    (invocation-link/ordered-stage-source-end state next-state)))))
+                (recur
+                 (cond
+                   (= :storage-alias (get-in state [:source-realizations position :kind]))
+                   (invocation-link/advance-source-alias state nil)
+                   (:invocation-step entry)
+                   (invocation-link/advance-host-source
+                    state scalar/evaluate-invocation-step scalar/evaluate-host-equation nil)
+                   :else (update state :source-cursor inc)))))))
+        final (invocation-link/finish-ordered-realization completed nil)
+        first-stage (first @stages)
+        second-stage (second @stages)]
+    (is (= 2 (count @stages)) "distinct map domains retain two source stages")
+    (is (= input-token (get-in first-stage [:state :realized :buffers 'alias])))
+    (is (= input-token (get-in first-stage [:state :realized :buffers 'xs]))
+        "the first fragment must retain the original name even though only its alias is read")
+    (is (= input-token (get-in second-stage [:state :realized :buffers 'xs])))
+    (is (= 1 (get @acquisitions input-token)) "the second name does not acquire/upload the input again")
+    (is (not (contains? (:new-storage second-stage) input-token)))
+    (is (some? (:plan final)))))
+
 (deftest compound-source-spans-cannot-skip-observable-work-or-imports
   (let [semantic {:equations [{:id :host :attributes {:host-only true}}
                               {:id :producer} {:id :consumer}]}

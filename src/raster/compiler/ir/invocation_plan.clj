@@ -986,6 +986,20 @@
                  {:step (:id step) :expected expected}))))
     plan))
 
+(defn- advance-source-view-ids
+  "Retain only existing full-view producers after their source correspondence
+   has been checked: actual public buffers, Int-count allocations, and aliases.
+   Numerical result dtypes/read domains are not source-view provenance."
+  [ids step lexical-values]
+  (let [extent (when (= 1 (count (get-in step [:value :shape])))
+                 (first (get-in step [:value :shape])))
+        int-count? (or (and (integer? extent) (<= 0 extent Integer/MAX_VALUE))
+                       (and (symbol? extent) (scalar-value? (get lexical-values extent))
+                            (= :int (get-in lexical-values [extent :dtype]))))]
+    (if (or (and (buffer-allocation? step) int-count?)
+            (and (value-alias? step) (contains? ids (:source step))))
+      (conj ids (:id step)) ids)))
+
 (defn- derive-source-order
   [plan program]
   (let [[head bindings & body] (:source program)]
@@ -1005,10 +1019,13 @@
           expected-steps
           (:steps
            (reduce
-            (fn [{:keys [steps environment]} [ordinal [symbol expression]]]
+            (fn [{:keys [steps environment source-view-ids]} [ordinal [symbol expression]]]
               (let [actual (get steps-by-symbol symbol)
                     lexical-values (into {} (map (fn [[symbol id]]
                                                    [symbol (get-in plan [:values id])])) environment)
+                    source-views (into {} (keep (fn [[symbol id]]
+                                                 (when (contains? source-view-ids id)
+                                                   [symbol (get-in plan [:values id])])) environment))
                     ;; Allocation operands may name earlier prefix aliases whose values are
                     ;; stored under invocation IDs. Compare their immutable shape relation in
                     ;; the causal symbol environment, never a future program-wide value table.
@@ -1031,8 +1048,10 @@
                                "source clone differs from the retained direct lexical copy"
                                {:binding symbol :source canonical}))
                     _ (when (and (shape-projection? actual)
-                                 (not (invocation-source/projection-corresponds?
-                                       canonical (:value actual))))
+                                 (not (or (invocation-source/projection-corresponds?
+                                           canonical (:value actual))
+                                          (invocation-source/checked-int-array-length-projection
+                                           canonical (:value actual) source-views))))
                         (fail! :invocation-source-projection
                                "source length conversions are not the retained exact projection"
                                {:binding symbol :source canonical}))
@@ -1044,8 +1063,11 @@
                                       lexical-values
                                       (when (program-result-import? actual)
                                         (result-import-for-source program symbol expression)))]
-                {:steps (conj steps step) :environment (assoc environment symbol (:id step))}))
-            {:steps [] :environment (into {} (map (juxt :symbol :id)) (:parameters plan))}
+                {:steps (conj steps step) :environment (assoc environment symbol (:id step))
+                 :source-view-ids (advance-source-view-ids source-view-ids step lexical-values)}))
+            {:steps [] :environment (into {} (map (juxt :symbol :id)) (:parameters plan))
+             :source-view-ids (into #{} (keep #(when (buffer-value? (:value %)) (:id %)))
+                                    (:parameters plan))}
             (map-indexed vector step-pairs)))
           _ (when-not (semantic/retained-source-equivalent? expected-steps (:steps plan))
               (fail! :invocation-source-step-mismatch

@@ -308,16 +308,18 @@
   (doseq [n [0 3 2049]]
     (let [x (double-array (take n (cycle [1.5 -2.0 0.25])))
           coefficient (float 2.0)
-          expected (storage/mixed-scale-energy-gradient coefficient x)
           artifact (compiled/compile
                     #'storage/mixed-scale-energy-gradient [coefficient x]
                     (merge storage/policy
                            {:compiler :equation-first :target target :dtype :double}))]
       (try
-        (dotimes [_ 2]
+        (doseq [offset [0.0 0.5]]
           ;; Select by the public result's tangent representation, never generated ABI
           ;; names. Other returned arrays are Double intermediates, not scalar gradients.
-          (let [results (map value/->host (vals (artifact {})))
+          (let [input (double-array (map #(+ (double %) offset) x))
+                expected (storage/mixed-scale-energy-gradient coefficient input)
+                results (map value/->host
+                             (vals (compiled/invoke-compiled artifact {:values input})))
                 gradients (filter #(instance? (class (float-array 0)) %) results)]
             (is (= 1 (count gradients)))
             (is (= [expected] (vec (first gradients))))))

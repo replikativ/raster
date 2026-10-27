@@ -185,7 +185,8 @@
 
   Also handles offset variant: (raster.par/map! out idx bound :offset base cast body)"
   ([form] (expand-par-map! form identity))
-  ([form retain-result]
+  ([form retain-result] (expand-par-map! form retain-result identity))
+  ([form retain-result retain-expansion]
   (if (and (>= (count form) 8) (= :offset (nth form 4)))
     ;; Offset variant
     (let [[_ out-sym i-sym bound-expr _kw base-expr cast-fn body-expr] form
@@ -207,14 +208,24 @@
           n-sym (gensym "n__")
           aset-expr (if cast-fn
                       (list cast-fn body-expr)
-                      body-expr)]
-      (list 'let* [n-sym (list 'int bound-expr)]
-            (list 'loop* [i-sym '(int 0)]
-                  (list 'if (list '< i-sym n-sym)
-                        (list 'do
-                              (list 'clojure.core/aset out-sym i-sym aset-expr)
-                              (list 'recur (list 'clojure.core/unchecked-inc-int i-sym)))
-                        (retain-result out-sym))))))))
+                      body-expr)
+          count-input (list 'int bound-expr)
+          store (list 'clojure.core/aset out-sym i-sym aset-expr)
+          returned (retain-result out-sym)
+          branch (list 'if (list '< i-sym n-sym)
+                       (list 'do store
+                             (list 'recur (list 'clojure.core/unchecked-inc-int i-sym)))
+                       returned)
+          loop-node (list 'loop* [i-sym '(int 0)] branch)
+          expanded (list 'let* [n-sym count-input] loop-node)]
+      ;; These are the nodes consumed by this constructor, not a parser's
+      ;; reconstruction. The optional observer grants no execution semantics.
+      (retain-expansion {:source form :expanded expanded :bound bound-expr
+                         :count-input count-input :count n-sym :index i-sym
+                         :output out-sym :cast cast-fn :body body-expr
+                         :value aset-expr :store store :loop loop-node
+                         :branch branch :returned returned})
+      expanded))))
 
 (defn expand-par-map2!
   "Expand a (raster.par/map2! out1 out2 idx bound cast body1 body2) form to

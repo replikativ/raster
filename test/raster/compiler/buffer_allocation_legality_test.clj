@@ -58,7 +58,8 @@
                           {:raster.op/original (symbol (namespace op) "pure-like")}))
             call (make-call '[x cnt])
             values {'x {:dtype :double :shape ['m]} 'cnt {:dtype :long :shape []}}
-            projection (descriptor/direct-allocation-projection call values)]
+            projection (method-entry/call-with-definition-inputs
+                        #(invocation-source/required-allocation-source! call values))]
         (is (= '(clojure.core/double-array (clojure.core/long cnt)) (:constructor projection))
             "projection retains the conversion authored in the actual helper body")
         (is (= implementation (get-in projection [:helper :implementation])))
@@ -105,6 +106,8 @@
             call (with-meta (list '.invk implementation 'x 'cnt)
                    {:raster.op/original (symbol (namespace op) "bare-like")})
             int-values {'x {:dtype :double :shape ['m]} 'cnt {:dtype :int :shape []}}
+            _ (method-entry/call-with-definition-inputs
+               #(invocation-source/required-allocation-source! call int-values))
             project #(binding [method-entry/*emission-inputs* nil]
                        (descriptor/direct-allocation-projection call int-values))]
         (is (= '(clojure.core/double-array cnt)
@@ -168,6 +171,89 @@
     (core/ensure-bytecode-implementation! receiver)
     (with-meta (list* '.invk implementation arguments)
       {:raster.op/original (symbol (str (ns-name source)) (str helper-name))})))
+
+(defn- cold-source-call [source helper-name tags arguments]
+  (let [operation (operation source helper-name tags)
+        implementation (symbol (namespace operation) (str (name operation) "-impl"))
+        source-var (ns-resolve source (symbol (name operation)))
+        receiver (ns-resolve source (symbol (name implementation)))]
+    {:source source-var :receiver receiver
+     :call (with-meta (list* '.invk implementation arguments)
+             {:raster.op/original (symbol (str (ns-name source)) (str helper-name))})}))
+
+(deftest required-allocation-construction-prepares-only-the-exact-cold-forwarder
+  (with-source
+    (fn [source-ns]
+      (define-allocator 'cold-leaf '[ref :- (Array double) n :- Long]
+        '(double-array n))
+      (define-allocator 'cold-semantic '[ref :- (Array double) n :- Long]
+        '(double-array n))
+      (define-allocator 'alloc-like '[ref :- (Array double) n :- Long]
+        '(cold-leaf ref n))
+      (let [values {'reference {:dtype :double :shape ['capacity]}
+                    'count {:dtype :long :shape []}}
+            leaf (cold-source-call source-ns "cold-leaf" "doubles_long"
+                                   '[reference count])
+            semantic (cold-source-call source-ns "cold-semantic" "doubles_long"
+                                       '[reference count])
+            forward (cold-source-call source-ns "alloc-like" "doubles_long"
+                                      '[reference count])
+            forward-metadata (meta (:receiver forward))]
+        (is (descriptor/alloc-op? (descriptor/semantic-op (:call forward)))
+            "the cold candidate survives allocation classification before proof")
+        (is (map? (:raster.core/jit-spec forward-metadata))
+            "the fixture must exercise a genuinely pending selected implementation")
+        (is (nil? (invocation-source/allocation-source (:call leaf) values))
+            "optional correspondence does not populate a cold semantic source")
+        (is (map? (:raster.core/jit-spec (meta (:receiver leaf))))
+            "the optional direct constructor query does not acquire a physical helper module")
+        (alter-meta! (:source semantic) dissoc :raster.core/deftm-walked-body)
+        (alter-meta! (:receiver semantic) update :raster.core/jit-spec
+                     dissoc :frontend-source-owner)
+        (let [attempts (atom 0)
+              projection
+              (method-entry/call-with-definition-inputs
+               #(do (swap! attempts inc)
+                    (invocation-source/required-allocation-source! (:call semantic) values)))]
+          (is (= 2 @attempts) "missing semantic source causes one bounded fresh restart")
+          (is (= '(clojure.core/double-array count) (:constructor projection)))
+          (is (map? (:raster.core/jit-spec (meta (:receiver semantic))))
+              "semantic preparation does not acquire a physical module"))
+        (is (nil? (invocation-source/allocation-source (:call forward) values))
+            "optional correspondence never prepares a missing physical source")
+        (is (identical? forward-metadata (meta (:receiver forward))))
+        (let [attempts (atom 0)
+              projection
+              (method-entry/call-with-definition-inputs
+               #(do (swap! attempts inc)
+                    (invocation-source/required-allocation-source! (:call forward) values)))]
+          (is (< 1 @attempts) "the required owner restarts after bounded preparation")
+          (is (= '(clojure.core/double-array count) (:constructor projection)))
+          (is (= 'alloc-like (-> projection :helper :operation name symbol)))
+          (is (= 2 (count (take-while some?
+                                      (iterate #(get-in % [:delegation :definition])
+                                               (get-in projection [:helper :definition]))))))
+          (is (= :unspecified (:initialization
+                               (invocation-source/allocation-source
+                                (:call forward) values))))
+          (is (= '(clojure.core/double-array count)
+                 (:constructor (invocation-source/allocation-source (:call leaf) values))))
+          (alter-meta! (:source forward) dissoc :raster.core/deftm-walked-body)
+          (is (= (:constructor projection)
+                 (:constructor (invocation-source/allocation-source
+                                (:call forward) values)))
+              "a ready physical module reuses its authenticated original body when the cache is absent")
+          (let [preparations (atom 0)]
+            (with-redefs [bytecode/retained-input-invocation-context (constantly nil)
+                          core/prepare-owned-source-frontend!
+                          (fn [& _]
+                            (swap! preparations inc)
+                            (throw (AssertionError. "a ready unsupported source was re-prepared")))]
+              (is (nil? (method-entry/call-with-definition-inputs
+                         #(invocation-source/required-allocation-source!
+                           (:call forward) values))))
+              (is (zero? @preparations)
+                  "ready-but-unsupported source is a final decline, not a renewal request"))))))))
 
 (deftest delegated-allocation-projection-retains-the-outer-public-contract
   (doseq [[dtype array-value expected-constructor]

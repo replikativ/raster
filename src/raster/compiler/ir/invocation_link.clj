@@ -413,6 +413,34 @@
                           (:source buffer) initialization))))))
    state (:program-buffers materialized)))
 
+(defn- retain-materialized-storage-aliases
+  "Join a checked materialization prefix to storage already known by this owner.
+   This only retains logical names: it never creates storage, acquires it, changes
+   its source/initialization, or proves a producer completed. The caller must
+   validate materialization first; identical tokens alone are not alias proof."
+  [realized materialized program-values]
+  (reduce-kv
+   (fn [realized compiler-value buffer]
+     (let [token (:id buffer)
+           owned (get-in realized [:storage token])
+           expected (get program-values compiler-value)]
+       (if-not (and owned expected)
+         realized
+         (let [existing (get-in realized [:buffers compiler-value])]
+           (when-not (and (= token (:id owned))
+                          (or (nil? existing) (= existing token))
+                          (= (:shape owned) (:shape buffer))
+                          (identical? (:source owned) (:source buffer))
+                          (av/storage-contract-compatible? (:abstract owned) (:value buffer))
+                          (av/storage-contract-compatible? expected (:value buffer)))
+             (fail! :invocation-ordered-input-storage
+                    "materialized alias differs from its existing owner storage"
+                    {:value compiler-value :storage token}))
+           (-> realized
+               (assoc-in [:buffers compiler-value] token)
+               (update-in [:storage token :compiler-values] conj compiler-value))))))
+   realized (:program-buffers materialized)))
+
 (defn- lower-loop-storage
   [state invocation-id equation scalars caller-options]
   (let [operation (first (:operations equation))
@@ -1524,18 +1552,21 @@
           overwrite (write-before-read-inputs boundaries available scalars)
           acquired (:acquired-storage state)
           root-roles (checked-ordered-entry-root-roles state)
+          realized-prefix (retain-materialized-storage-aliases
+                           (:realized state) available (:values program))
           unacquired (update available :program-buffers
                              (fn [buffers]
                                (into {} (remove (fn [[id buffer]]
                                                   (when (contains? acquired (:id buffer))
                                                     (when-not (= (:id buffer)
-                                                                 (get-in state [:realized :buffers id]))
+                                                                 (get-in realized-prefix [:buffers id]))
                                                       (fail! :invocation-ordered-input-storage
                                                              "acquired input lost its logical storage binding"
                                                              {:value id}))
                                                     true))) buffers)))
-          realized (add-materialized-inputs (:realized state) unacquired (:values program)
+          realized (add-materialized-inputs realized-prefix unacquired (:values program)
                                             overwrite required)
+          realized (retain-materialized-storage-aliases realized available (:values program))
           realized (retain-ordered-scratch-storage realized root-roles)
           realized (lower-equation-storage realized (get-in materialization [:plan :id]) equation
                                             (:values program) scalars (:projections (checked-ordered-validation state))
@@ -1562,7 +1593,10 @@
           _ (when loop?
               (program-call/preparation-plan-with-retained-program
                call [:ordered-equation equation-id] fragment-validation caller-options))
-          realized (assoc realized :buffers buffers)
+          ;; A fragment owns only its equation's bindings. Its result/parity
+          ;; selections may update those names, never discard the enclosing
+          ;; source environment needed by later aliases and shape actions.
+          realized (update realized :buffers merge buffers)
           outputs (vec (distinct (vals (:outputs call))))
           tokens (vec (distinct (concat (map second (program-call/buffer-bindings-with-retained-program
                                                      call fragment-validation caller-options))
@@ -2051,6 +2085,8 @@
                   (= (:source-cursor state) (count (:source-order state))))
      (fail! :invocation-ordered-incomplete "source work has not completed" {}))
    (let [materialized (materialization/finish-materialization (:materialization state))
+         state (update state :realized retain-materialized-storage-aliases
+                       materialized (get-in state [:program :values]))
          initialized-tokens (into #{}
                                   (keep (fn [[token storage]]
                                           (when (= :zero (:initialization storage)) token)))

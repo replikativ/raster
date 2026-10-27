@@ -973,6 +973,14 @@
                        created)))]
     (fn [{:keys [kind source ordinal binder expression accept?]}]
       (cond
+        (= kind :closed-prefix-reference-helpers)
+        (when (source-import/contextual-reference-helper-candidate? source)
+          (source-import/project-contextual-reference-helpers (owner! source)))
+
+        (= kind :checked-array-length-source)
+        (when (source-import/contextual-array-length-candidate? source)
+          (source-import/project-contextual-array-lengths (owner! source)))
+
         (= kind :direct-double-map-payloads)
         (when (and (source-import/direct-double-map-helper-candidate? source)
                    (dtype/known? (:dtype opts)) (= :double (dtype/canon (:dtype opts))))
@@ -1079,11 +1087,17 @@
    (if (and *gpu-source-construction*
             (device/gpu-target? (:target-device opts)) (var? (:source-var opts)))
     (let [construct (contextual-reduction-constructor opts)
+          references (construct {:kind :closed-prefix-reference-helpers :source source})
+          source (if references (inline/flatten-nested-lets (:form references)) source)
           projection (construct {:kind :direct-double-map-payloads :source source})
-          source (or (:form projection) source)]
+          source (or (:form projection) source)
+          lengths (construct {:kind :checked-array-length-source :source source})
+          source (or (:form lengths) source)]
       (typed-soac-frontend/call-with-contextual-reduction-constructor
        construct
        #(cond-> (semantic-program-attempt* source opts abstract-machine)
+          references (assoc-in [:stats :owned-reference-helpers] (count (:applications references)))
+          lengths (assoc-in [:stats :owned-array-lengths] (count (:rewrites lengths)))
           projection (assoc-in [:stats :owned-map-payloads] (count (:applications projection))))))
     (semantic-program-attempt* source opts abstract-machine))))
 

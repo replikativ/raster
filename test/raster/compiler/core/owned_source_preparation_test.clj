@@ -106,6 +106,14 @@
         (is (map? (:raster.core/jit-spec (meta receiver))))
         (is (empty? @events))))))
 
+(deftest selected-source-preparation-refuses-arbitrary-work-callbacks
+  (let [called (atom 0)
+        forged (fn [_] (swap! called inc) {:mode :physical})]
+    (is (= :invalid-source-preparation-request
+           (reason #(entry/call-with-definition-inputs
+                     (fn [] (entry/demand-selected-source-preparation! forged))))))
+    (is (zero? @called) "work request validation never invokes an unknown callback")))
+
 (deftest swallowed-prerequisite-demand-discards-the-abandoned-result
   (with-cold-source
     (fn [{:keys [source events]}]
