@@ -70,6 +70,19 @@ varying background load; this is not a controlled workload speedup claim.
 Compilation remains multi-second, with whole target-attempt restart visible in
 the pass trace. Static proof reuse and binding/epoch readiness remain separate.
 
+The subsequent batch projection shares structural InvocationPlan checking and
+whole-source correspondence only within one independent validation invocation.
+Every contributing region still checks its exact contiguous slice, and EPP
+compares every alternative against the canonical region's expected guards.
+No reusable receipt or cache is added. Independent review found no blocker;
+the new boundary test passes1/15, ordered/host-binding/math-request gates40/516,
+and real changed-input OpenCL+Level Zero gates5/464. Full affected graph tests
+retain the one CI-confirmed earlier-global-extent diagnostic-path error (29tests,
+171pass,1error before adding the15-assertion test); this is not waived.
+The same wrapped warm microcase now checks the plan150times versus178, with
+source-history checks unchanged212. This is count evidence, not a benchmark
+speedup claim. Multi-second compilation and remaining validation still need work.
+
 Coverage reconciliation: the seven-assertion
 `generated-storage-actions-do-not-partition-fusible-maps` test was replaced by
 `generated-storage-actions-partition-causal-components-without-host-boundaries`.

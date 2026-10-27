@@ -218,13 +218,19 @@
         source-context (or (get-in parallel-program [:attributes ::equation-origin :program])
                            parallel-program)
         {source-program :program source-regions :regions}
-        (when (some (fn [equation]
-                      (some (fn [candidate]
-                              (equation-graph/invocation-scalar-proof-demand?
-                               source-context (candidate-numerical-equations candidate)))
-                            (candidates-for (first (:operations equation)))))
-                    (:equations parallel-program))
-          (expanded-source-program! source-context candidates-for))]
+        (when (equation-graph/invocation-scalar-proof-demand-for-regions?
+               source-context
+               (for [equation (:equations parallel-program)
+                     candidate (candidates-for (first (:operations equation)))]
+                 (candidate-numerical-equations candidate)))
+          (expanded-source-program! source-context candidates-for))
+        numerical-equations (filterv #(not (true? (get-in % [:attributes :host-only])))
+                                     (:equations parallel-program))
+        expected-by-equation
+        (when source-program
+          (zipmap (mapv :id numerical-equations)
+                  (equation-graph/invocation-scalar-preconditions-for-regions
+                   source-program (mapv #(get source-regions (:id %)) numerical-equations))))]
   (loop [host-prefix [] remaining (:equations parallel-program)]
     (when-let [equation (first remaining)]
       (if (true? (get-in equation [:attributes :host-only]))
@@ -237,12 +243,8 @@
                                          body-equations)
                   numerical-body (candidate-numerical-equations candidate)
                   source-equations (get-in equation [:attributes :emitted-source-equations])
-                  source-region (get source-regions (:id equation))
                   expected-invocation-preconditions
-                  (if source-program
-                    (equation-graph/invocation-scalar-preconditions
-                     source-program source-region)
-                    [])
+                  (get expected-by-equation (:id equation) [])
                   actual-invocation-preconditions
                   (equation-graph/body-invocation-scalar-preconditions body)
                   exact-source?

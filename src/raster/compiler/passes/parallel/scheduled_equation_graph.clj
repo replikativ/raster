@@ -276,25 +276,14 @@
                (empty? locals) (= 1 (count body-results)))
       (first body-results))))
 
-(defn- invocation-scalar-precondition-candidates
+(defn- project-invocation-scalar-candidates
   "Project possible constraints without granting correspondence to the enclosing program.
 
    Demand and the checked projection share this exact eligibility logic. In particular, a body
    attribute cannot suppress demand by deleting its guards. These candidates are not proof until
    the complete retained InvocationPlan has been checked against its source program."
-  [parallel-program equations]
-  (let [equations (vec equations)]
-    ;; SegmentedWeightedReduction plans have a separate schedule-neutral graph constructor which
-    ;; does not consume derived scalar definitions or retain these guards. Keep this first bounded
-    ;; projection on exact TypedSOAC regions; attaching unactioned proof to a plan body would be a
-    ;; false executable contract.
-    (if-not (every? (comp soac/program-form? :algorithm) equations)
-      []
-      (let [plan (get-in parallel-program [:attributes :invocation-plan])]
-        (if-not plan
-          []
-          (let [plan (invocation/validate! plan)
-            values (:values parallel-program)
+  [parallel-program equations plan]
+  (let [values (:values parallel-program)
             numerical-inputs (program/infer-inputs equations)
             scalar-inputs
             (into [] (filter #(integral-scalar-value? (get values %))) numerical-inputs)
@@ -354,13 +343,53 @@
                                        (set/subset? references scalar-input-set)
                                        (not (contains? references result)))
                               {:expression result :op := :value projection}))))
-                  (:steps plan))))))))
+                  (:steps plan))))
+
+(defn- invocation-scalar-candidates-for-regions
+  [parallel-program regions]
+  (let [regions (mapv vec regions)
+        ;; SWR bodies do not consume this scalar proof. Preserve that eligibility
+        ;; boundary before asking even for structural InvocationPlan validation.
+        eligible? #(every? (comp soac/program-form? :algorithm) %)
+        plan (get-in parallel-program [:attributes :invocation-plan])
+        plan (when (and plan (some eligible? regions)) (invocation/validate! plan))]
+    (mapv (fn [equations]
+            (if (and plan (eligible? equations))
+              (project-invocation-scalar-candidates parallel-program equations plan)
+              []))
+          regions)))
+
+(defn invocation-scalar-proof-demand-for-regions?
+  "Independently check one ordered batch's scalar proof demand. The shared plan
+   is structurally checked once; no source correspondence or receipt is granted."
+  [parallel-program regions]
+  (boolean (some seq (invocation-scalar-candidates-for-regions parallel-program regions))))
 
 (defn invocation-scalar-proof-demand?
   "Whether the retained invocation can constrain this actual numerical input boundary.
    This is only demand for a subsequent full source proof, never a validation receipt."
   [parallel-program equations]
-  (boolean (seq (invocation-scalar-precondition-candidates parallel-program equations))))
+  (invocation-scalar-proof-demand-for-regions? parallel-program [equations]))
+
+(defn invocation-scalar-preconditions-for-regions
+  "Independently derive guards for ordered regions of this exact source program.
+   Structural and whole-source checks are shared only inside this invocation;
+   each contributing region still proves its own contiguous source slice. No
+   checked-plan flag, persistent cache or reusable validation authority escapes."
+  [parallel-program regions]
+  (let [regions (mapv vec regions)
+        candidates (invocation-scalar-candidates-for-regions parallel-program regions)]
+    (loop [remaining (seq (map vector regions candidates)), matched? false]
+      (when-let [[equations constraints] (first remaining)]
+        (if (seq constraints)
+          (do
+            (contiguous-equation-region! parallel-program equations)
+            (when-not matched?
+              (invocation/validate-against!
+               (get-in parallel-program [:attributes :invocation-plan]) parallel-program))
+            (recur (next remaining) true))
+          (recur (next remaining) matched?))))
+    candidates))
 
 (defn invocation-scalar-preconditions
   "Derive integral equality guards only after proving the complete invocation/source boundary.
@@ -369,15 +398,7 @@
    an unrelated extended emitted boundary merely because its attributes retain an old plan.
    Unsupported or ambiguous scalar computations contribute no proof."
   [parallel-program equations]
-  (let [equations (vec equations)
-        candidates (invocation-scalar-precondition-candidates parallel-program equations)]
-    (if (seq candidates)
-      (do
-        (contiguous-equation-region! parallel-program equations)
-        (invocation/validate-against! (get-in parallel-program [:attributes :invocation-plan])
-                                      parallel-program)
-        candidates)
-      [])))
+  (first (invocation-scalar-preconditions-for-regions parallel-program [equations])))
 
 (defn body-invocation-scalar-preconditions
   "Validate and return the invocation-derived equality guards retained by one scheduled body."

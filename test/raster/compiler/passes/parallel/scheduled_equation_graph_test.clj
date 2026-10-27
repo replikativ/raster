@@ -4,6 +4,7 @@
             [raster.compiler.pipeline :as pipeline]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.emitted-parallel-program :as emitted-program]
+            [raster.compiler.ir.invocation-plan :as invocation]
             [raster.compiler.ir.parallel-program :as program]
             [raster.compiler.ir.kernel-precondition :as precondition]
             [raster.compiler.ir.kernel-graph-call :as graph-call]
@@ -474,6 +475,46 @@
     (is (= :kernel-precondition-failed
            (reason-of #(precondition/check! constraints {'slab 0 'rows 2 'width 3})))
         "a zero traversal extent cannot bypass the scalar equality guard")))
+
+(deftest scalar-proof-batches-share-only-the-current-source-check
+  (let [scheduled (scheduled-invocation-scalar-program)
+        plan (get-in scheduled [:attributes :invocation-plan])
+        region (filterv #(not (true? (get-in % [:attributes :host-only])))
+                        (:equations scheduled))
+        expected (equation-graph/invocation-scalar-preconditions scheduled region)
+        structural (atom 0) correspondence (atom 0)
+        validate invocation/validate!
+        validate-against invocation/validate-against!]
+    (is (seq expected))
+    (with-redefs [invocation/validate!
+                  (fn [candidate]
+                    (when (identical? plan candidate) (swap! structural inc))
+                    (validate candidate))
+                  invocation/validate-against!
+                  (fn [candidate source]
+                    (when (and (identical? plan candidate) (identical? scheduled source))
+                      (swap! correspondence inc))
+                    (validate-against candidate source))]
+      (doseq [call [1 2]]
+        (is (= [expected expected]
+               (equation-graph/invocation-scalar-preconditions-for-regions
+                scheduled [region region])))
+        (is (= (* 2 call) @structural)
+            "one structural projection check plus validate-against's independent check")
+        (is (= call @correspondence) "the next public call must check the source again"))
+      (is (equation-graph/invocation-scalar-proof-demand-for-regions?
+           scheduled [region region]))
+      (is (= 5 @structural))
+      (is (= 2 @correspondence) "demand is not a source-correspondence proof")
+      (is (= [[]] (equation-graph/invocation-scalar-preconditions-for-regions scheduled [[]])))
+      (is (= 6 @structural))
+      (is (= 2 @correspondence) "guard-free regions impose no unrelated source correspondence"))
+    (is (= :scheduled-equation-region
+           (reason-of #(equation-graph/invocation-scalar-preconditions-for-regions
+                        scheduled [region [(assoc (first region) :id :foreign-region)]]))))
+    (is (= :invocation-program-mismatch
+           (reason-of #(equation-graph/invocation-scalar-preconditions-for-regions
+                        (assoc scheduled :outputs []) [region region]))))))
 
 (deftest invocation-scalar-captures-substitute-simultaneously
   (let [project #'equation-graph/project-integral-launch-expression
