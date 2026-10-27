@@ -42,6 +42,11 @@
                           :verified (boolean (and hint (not= hint 'Object)))}
                     (= :ref actual) (assoc :reference-class (or checkcast Object)))}))
 
+(defn ^:no-doc resolved-binding-completion-plan
+  "The same binding producer with an already-resolved hint Class; performs no lookup."
+  [hint actual resolved]
+  (completion-plan hint actual resolved))
+
 (deftype ^:private BindingResolutionContext [loader inputs])
 
 (defn capture-resolution-context

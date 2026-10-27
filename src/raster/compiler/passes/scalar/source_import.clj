@@ -3,6 +3,10 @@
    Receipts, original JVM return recipes and unresolved source completions stay
    outside the portable numerical frontend and its TypedSOAC programs."
   (:require [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.inference :as inference]
+            [raster.compiler.core.op-descriptor :as descriptor]
+            [raster.compiler.core.inline-call-plan :as call-plan]
+            [raster.compiler.core.call-boundary :as call-boundary]
             [raster.compiler.core.types :as types]
             [raster.compiler.core.util :as util]
             [raster.compiler.core.method-entry :as method-entry]
@@ -838,3 +842,484 @@
       {:root root :result-tag tag :result-fact fact :before (:before binding)
        :result-context context :ordinal ordinal :binder binder :expression expression
        :witness witness})))
+
+;; JVM lookup is deferred: importing source helpers must not load an emitter.
+(defn- helper-backend [name]
+  (or (some-> (find-ns 'raster.compiler.backend.jvm.bytecode) (ns-resolve name))
+      (fail! :generated-body-unsupported "helper construction needs its existing JVM producer" {:function name})))
+
+(defn- decline! [message data]
+  (throw (ex-info message (assoc data :reason :generated-body-unsupported))))
+
+(defn- reference-check [carrier value]
+  (if (or (nil? carrier) (= Object carrier)) value
+      (completion/complete-value (completion/reference-check-contract carrier) value)))
+
+(def ^:private local-fact-keys [:type :hint :verified :reference-class])
+
+(defn- checked-helper-body
+  "Materialize actual lexical reference checks before hygiene or simplification."
+  [emission receivers binding-contexts]
+  (letfn [(walk [node]
+            (cond
+              (and (seq? node) (contains? '#{quote clojure.core/quote} (first node))) node
+              (and (seq? node) (= 'let* (first node)))
+              (let [[head bindings & tail] node
+                    previous (volatile! nil)
+                    observations (volatile! [])
+                    pairs
+                    (mapcat
+                     (fn [index [id value]]
+                       (let [observed ((helper-backend 'retained-binding-context) emission node index)]
+                         (when-not observed
+                           (throw (ex-info "Generated import has no owned lexical binding context"
+                                           {:reason :generated-body-binding-context :binder id})))
+                         (when (and (zero? index)
+                                    (= 1 (count (:body emission)))
+                                    (identical? node (first (:body emission)))
+                                    (not= (:before observed)
+                                          (:locals ((helper-backend 'retained-body-context) emission))))
+                           (decline! "Generated helper binding chain differs from its actual entry" {:binder id}))
+                         (when (and @previous (not= @previous (:before observed)))
+                           (throw (ex-info "Generated import has a discontinuous lexical binding chain"
+                                           {:reason :generated-body-binding-context :binder id})))
+                         (vreset! previous (assoc (:before observed) (:binder observed) (:after observed)))
+                         (vswap! observations conj observed)
+                         ;; The helper's initializer context is independent of
+                         ;; the enclosing return completion. Anchor it before
+                         ;; constructing a new outer program: moving the let
+                         ;; alone must not switch Object-return call selection
+                         ;; or consume a one-shot result flag differently.
+                         (let [raw (get-in observed [:after :type])
+                               context (:input-context observed)]
+                           (when-not (and (contains? #{:ref :double :float :long :int :bool} raw)
+                                          (completion/bytecode-operand-context? context))
+                             (decline! "Generated helper binding has no retained initializer context"
+                                       {:binder id}))
+                           (let [anchored (completion/complete-value
+                                           (completion/bytecode-result-context-contract context raw)
+                                           (walk value))]
+                             [(if-let [hint (get-in observed [:after :hint])]
+                                (vary-meta id assoc :tag hint)
+                                id)
+                              (if (= :ref raw)
+                                   (reference-check (get-in observed [:after :reference-class]) anchored)
+                                   anchored)]))))
+                     (range) (partition 2 bindings))]
+                (let [bindings (vec pairs)
+                      terminal (when (< 1 (count tail))
+                                 ((helper-backend 'retained-terminal-context) emission node))
+                      _ (when (and (< 1 (count tail))
+                                   (not (and terminal
+                                             (= (count tail) (count (:body terminal)))
+                                             (not (:unretained-sibling-calls? terminal))
+                                             (completion/bytecode-operand-context? (:context terminal)))))
+                          (decline! "Generated helper statements have no complete owned terminal context" {}))
+                      statements
+                      (when terminal
+                        (mapcat
+                         (fn [statement]
+                           (let [id (with-meta (gensym "generated_effect__")
+                                      {:raster.effect/effectful true})
+                                 value (completion/complete-value
+                                        (completion/bytecode-result-context-contract
+                                         (:context terminal) :ref)
+                                        ;; The shared do/emit-body path discards
+                                        ;; this statement in its ORIGINAL void
+                                        ;; context, then supplies nil as the new
+                                        ;; SSA value. No discarded value boxes.
+                                        (list 'do (walk statement) nil))]
+                             (vswap! observations conj
+                                     {:after {:type :ref :hint nil :verified false
+                                              :reference-class Object}})
+                             [id value]))
+                         (butlast tail)))
+                      constructed (with-meta
+                                    (list* head (into bindings statements)
+                                           (if terminal [(walk (last tail))] (mapv walk tail)))
+                                    (meta node))]
+                  (.put ^java.util.IdentityHashMap binding-contexts constructed @observations)
+                  constructed))
+              (and (seq? node) (= '.invk (first node)))
+              (let [observed ((helper-backend 'retained-invocation-context) emission node)
+                    receiver (second node)]
+                (when-not (and (= :global-typed-indy (:invocation-mode observed))
+                               (qualified-symbol? receiver) (identical? receiver (:receiver observed)))
+                  (decline! "Generated helper contains an unobserved or local typed receiver" {}))
+                ;; Global typed indy uses literal namespace/name bootstrap
+                ;; arguments, not source-ns alias resolution. Protect this exact
+                ;; owned receiver from the source qualifier, then restore it.
+                (let [placeholder (gensym "owned_receiver__")]
+                  (vswap! receivers assoc placeholder receiver)
+                  (with-meta (list* '.invk placeholder (mapv walk (nnext node))) (meta node))))
+              (or (seq? node) (vector? node))
+              (util/remake-if-changed node (mapv walk node))
+              (coll? node) (decline! "Generated helper contains an unsupported executable collection" {})
+              :else node))]
+    (mapv walk (:body emission))))
+
+(defn- qualified-helper-body [emission outer-ns]
+  (let [receivers (volatile! {})
+        binding-contexts (java.util.IdentityHashMap.)
+        binding-facts (volatile! {})
+        body (checked-helper-body emission receivers binding-contexts)
+        parameters (into (set (:params emission)) (keys @receivers))
+        used (volatile! (into parameters (filter symbol?) (tree-seq coll? seq body)))
+        allocated (volatile! #{}) allocator util/*fresh-binder*
+        hygienic (binding [util/*fresh-binder*
+                           (fn [original]
+                             (let [fresh (allocator original)]
+                               (when-not (and (symbol? fresh) (nil? (namespace fresh))
+                                              (not (contains? @used fresh))
+                                              (identical? (meta original) (meta fresh)))
+                                 (decline! "Generated helper requires fresh metadata-preserving binders" {}))
+                               (vswap! used conj fresh)
+                               (vswap! allocated conj fresh)
+                               fresh))]
+                   (mapv #(util/alpha-convert
+                           {} %
+                           (fn [original constructed _]
+                             (when-let [observations (.get binding-contexts original)]
+                               (let [ids (vec (take-nth 2 (second constructed)))]
+                                 (when-not (= (count ids) (count observations))
+                                   (decline! "Generated helper hygiene changed a binding interval" {}))
+                                 (doseq [[id observed] (map vector ids observations)]
+                                   (when (contains? @binding-facts id)
+                                     (decline! "Generated helper hygiene reused a binding" {:binder id}))
+                                   (vswap! binding-facts assoc id
+                                           (select-keys (:after observed) local-fact-keys))))))) body))
+        context {:source-ns (:source-ns emission) :pending-source? false
+                 :dependency-snapshots (:dependency-snapshots emission)}
+        authenticate!
+        (fn [symbol candidate]
+          (let [canonical (method-entry/observed-body-operation context symbol #{})
+                original (when canonical (ns-resolve (:source-ns emission) canonical))
+                target (when canonical (ns-resolve outer-ns canonical))]
+            (when-not (and (var? candidate) canonical
+                           (identical? candidate original) (identical? candidate target))
+              (decline! "Generated helper lookup has no namespace-independent historical meaning"
+                        {:symbol symbol}))
+            (method-entry/observe-source-resolution!
+             {:kind :symbol-resolution :source-ns outer-ns :symbol canonical :result target})
+            canonical))
+        qualified
+        (mapv #(inference/qualify-body-symbols
+                % (:source-ns emission) parameters
+                (fn [{:keys [kind symbol result]}]
+                  (if (and (= :symbol-resolution kind) (var? result))
+                    (authenticate! symbol result)
+                    (decline! "Generated helper has an unsupported class, alias or unresolved lookup"
+                              {:symbol symbol :kind kind})))) hygienic)
+        local-names (into parameters @allocated)]
+    ;; The shared qualifier intentionally leaves casts alone, because a symbol
+    ;; such as `float` can also be positional IR data (pmap's element dtype).
+    ;; Only genuine call heads are completed here; quoted data stays opaque.
+    (letfn [(walk [node]
+              (cond
+                (and (seq? node) (contains? '#{quote clojure.core/quote} (first node))) node
+                (seq? node)
+                (let [head (first node)
+                      head (if (and (symbol? head) (nil? (namespace head))
+                                    (descriptor/cast-op? head) (not (contains? local-names head)))
+                             (let [canonical (method-entry/observed-body-operation context head local-names)]
+                               (when-not canonical
+                                 (decline! "Generated helper cast lacks its original lookup" {:symbol head}))
+                               (with-meta (authenticate! head (ns-resolve (:source-ns emission) canonical)) (meta head)))
+                             head)]
+                  (util/remake-if-changed node (into [head] (map walk (rest node)))))
+                (vector? node) (util/remake-if-changed node (mapv walk node))
+                :else node))]
+      {:body (mapv #(util/subst-syms @receivers (walk %)) qualified)
+       :binding-facts @binding-facts})))
+
+(defn- expose-anchored-result-spine
+  "Distribute result completions through a complete owned sequential binding
+   spine. Each moved initializer independently replays its original context;
+   conversion of the helper result stays after all bindings, on the tail.
+   This constructor is private to authenticated helper import."
+  [expression binding-facts]
+  (cond
+    (completion/canonical-form? expression)
+    (let [[bindings tail] (expose-anchored-result-spine (nth expression 2) binding-facts)]
+      [bindings (util/remake-from expression [(first expression) (second expression) tail])])
+
+    (and (seq? expression) (= 'let* (first expression)))
+    (let [[_ bindings & body] expression
+          tail (first body)
+          pairs (partition 2 bindings)]
+      (when-not (and (= 1 (count body)) (vector? bindings) (even? (count bindings))
+                     (every? #(contains? binding-facts (first %)) pairs))
+        (decline! "Generated helper result has no complete anchored binding spine"
+                  {:body-count (count (nnext expression))
+                   :unowned-binders (vec (remove #(contains? binding-facts %)
+                                                 (map first pairs)))}))
+      ;; Do not descend into an initializer, branch, loop, call or collection.
+      ;; Nested helpers/control retain their own existing execution position.
+      (let [[later result] (expose-anchored-result-spine tail binding-facts)]
+        [(into (vec bindings) later) result]))
+
+    :else [[] expression]))
+
+(defn- optional-terminal-return [frontend]
+  (try
+    ((requiring-resolve
+      'raster.compiler.passes.scalar.source-import/terminal-reduction-return-contract)
+     {:frontend frontend :input-body (:body frontend) :root (first (:body frontend))})
+    (catch clojure.lang.ExceptionInfo error
+      (if (contains? #{:terminal-reduction-import-root :terminal-reduction-import-return}
+                     (:reason (ex-data error)))
+        nil
+        (throw error)))))
+
+(defn- consume-terminal-return
+  [consume! {:keys [return-contract argument-bindings binding-facts] :as request}]
+  (let [validate! (requiring-resolve
+                   'raster.compiler.passes.scalar.source-import/validate-terminal-reduction-return!)]
+    (validate! return-contract)
+    (when-let [constructed (consume! request)]
+      (validate! return-contract)
+      (let [expression (when (map? constructed) (:expression constructed))
+            facts (when (map? constructed) (:binding-facts constructed))
+            [head bindings & body] (when (seq? expression) expression)]
+        (when-not (and (map? constructed)
+                       (= #{:expression :binding-facts} (set (keys constructed)))
+                       (seq? expression) (= 'let* head) (vector? bindings)
+                       (even? (count bindings)) (= 1 (count body))
+                       (<= (count argument-bindings) (count bindings))
+                       (every? true? (map identical? argument-bindings bindings))
+                       (map? facts)
+                       (every? (fn [[id original]] (= original (get facts id))) binding-facts))
+          (decline! "Terminal consumer changed argument completion or existing local obligations" {}))
+        constructed))))
+
+
+(defn ^:no-doc validate-helper-application!
+  "Validate the complete owner-local application, not a detached projection.
+   This construction grants no numerical projection or execution permission."
+  [application]
+  (validate-owned-import! application :application :helper-application-correspondence))
+
+(defn- construct-helper-application
+  [frontend invocation inputs parameters values body binding-facts return-contracts
+   return-tag expose-spine?]
+  (let [argument-bindings
+        (mapv (fn [value input]
+                [value (completion/complete-value (:contract input) (:operand input))])
+              values inputs)
+        instantiated (util/subst-syms (zipmap parameters values) body)
+        returned (reduce (fn [value contract] (completion/complete-value contract value))
+                         instantiated return-contracts)
+        [body-bindings result] (if expose-spine?
+                                 (expose-anchored-result-spine returned binding-facts)
+                                 [[] returned])
+        result (if return-tag (vary-meta result assoc :raster.type/tag return-tag) result)
+        application {:caller-occurrence (:expression invocation)
+                     :selected-method (:method invocation) :frontend frontend
+                     :input-slots (mapv (fn [ordinal formal value input]
+                                          {:ordinal ordinal :formal formal :value value
+                                           :operand (:operand input) :contract (:contract input)})
+                                        (range) parameters values inputs)
+                     :payload-ports values :numerical-projection nil
+                     :return-recipe return-contracts
+                     :dependencies @method-entry/*emission-inputs*}]
+    {:expression (list 'let* (into (vec (mapcat identity argument-bindings)) body-bindings) result)
+     :binding-facts binding-facts :argument-bindings argument-bindings
+     :result-form result :application application}))
+
+(defn- construct-emitted-helper
+  [expression locals context capture! consume-terminal-reduction terminal-only?]
+  (let [[_ receiver & arguments] expression
+        invocation ((helper-backend 'typed-invocation-plan) receiver (count arguments) locals context)]
+    (when (and (:global? invocation)
+               (not (:lexical-callee (descriptor/call-description expression))))
+      (when-let [inputs ((helper-backend 'plan-resolved-invocation-inputs)
+                        (:method invocation) (vec arguments) locals context)]
+        (let [{:keys [semantic-op implementation-op]} (descriptor/call-description expression)
+              owner (capture! semantic-op implementation-op (count arguments) (:method invocation))
+              signature (call-boundary/selected-typed-signature
+                         semantic-op implementation-op (count arguments) (:method invocation))
+              emission (:emission owner)
+              source (get-in owner [:signature :definition :source-var])
+              frontend (when source (method-entry/original-source-frontend source))]
+          (when (and (= :known (:status signature))
+                     (ifn? (:guard owner))
+                     (= (:method invocation) (:method owner) (get-in owner [:signature :method]))
+                     (every? #(identical? (get-in signature [:definition %])
+                                         (get-in owner [:signature :definition %]))
+                             [:source-var :receiver-var :entry])
+                     emission frontend (identical? emission (:emission frontend))
+                     (identical? (:implementation emission)
+                                 (get-in signature [:definition :entry :typed-impl])))
+            ((:guard owner))
+            (method-entry/assert-frontend-selection! frontend source)
+            (method-entry/assert-emission-inputs-current! emission)
+            (let [bridge (when-not terminal-only?
+                           (or (method-entry/frontend-primitive-body-return-bridge frontend)
+                               (method-entry/frontend-reference-return-bridge frontend)))
+                  ;; Authenticate this third, weaker return contract BEFORE
+                  ;; hygiene. It is useful only to an actual consuming owner;
+                  ;; ordinary JVM/C expansion keeps its existing abstention.
+                  terminal-return (when (and (nil? bridge) consume-terminal-reduction)
+                                    (optional-terminal-return frontend))
+                  saved (or (:body-context bridge)
+                            (when terminal-return
+                              ((helper-backend 'retained-input-body-context) emission (:input-body terminal-return))))]
+              (when (and (or bridge terminal-return)
+                         saved (not (:unretained-sibling-calls? saved)))
+                (let [{:keys [body binding-facts]} (qualified-helper-body emission (:source-ns context))
+                      body (if (= 1 (count body)) (first body) (list* 'do body))
+                      ;; Retain the selected formal's existing logical
+                      ;; declaration. This is not a raw-carrier inference: the
+                      ;; input recipe and final emitter still check conversion.
+                      values (mapv (fn [tag]
+                                     (with-meta (gensym "generated_input__") {:raster.type/tag tag}))
+                                   (:tags emission))
+                      bindings (vec (mapcat (fn [value input]
+                                             [value (completion/complete-value
+                                                     (:contract input) (:operand input))]) values inputs))
+                      instantiated (util/subst-syms (zipmap (:params emission) values) body)]
+                  ;; All operands, including unused ones, are completed once in
+                  ;; positional order before the exact helper body. There is no
+                  ;; synthesized receiver term for the global args-first path.
+                  (if bridge
+                    (let [contracts [(completion/bytecode-result-context-contract
+                                      (:result-context saved) (:emitted-result-type saved))]
+                          contracts (cond-> contracts
+                                      (= :reference-static-return (:kind bridge))
+                                      (into (when-not (or (nil? (:body-return-carrier bridge))
+                                                          (= Object (:body-return-carrier bridge)))
+                                              [(completion/reference-check-contract (:body-return-carrier bridge))]))
+                                      (not= :reference-static-return (:kind bridge))
+                                      (conj completion/object-input-contract))]
+                      (retain-owned-import!
+                       (construct-helper-application frontend (assoc invocation :expression expression)
+                                                     inputs (:params emission) values body binding-facts
+                                                     contracts (:return-tag emission) true)
+                       ;; Capture's guard rechecks its ORIGINAL selection and
+                       ;; readiness history directly. Reentering a collecting
+                       ;; frontend-selection query here would validate the
+                       ;; enclosing owner containing this very receipt.
+                       frontend (:guard owner)))
+                    (consume-terminal-return
+                     consume-terminal-reduction
+                     {:return-contract terminal-return :frontend frontend :invocation invocation
+                      :inputs inputs :expression expression :locals locals :context context
+                      :argument-bindings bindings
+                      :input-values values :instantiated-body instantiated
+                      :saved-return-context saved :binding-facts binding-facts})))))))))))
+
+
+(defn- effective-inline-body [body]
+  (if (> (count body) 1) [(apply list 'do body)] body))
+
+(defn- hygienic-inline-body [body parameters]
+  (let [used (volatile! (into (set parameters) (mapcat util/free-syms) body))
+        allocate util/*fresh-binder*]
+    (binding [util/*fresh-binder*
+              (fn [original]
+                (let [fresh (allocate original)]
+                  (when-not (and (symbol? fresh) (nil? (namespace fresh))
+                                 (not (contains? @used fresh))
+                                 (identical? (meta original) (meta fresh)))
+                    (throw (ex-info "source transformation requires fresh metadata-preserving binders"
+                                    {:reason :nonfresh-source-import-binder})))
+                  (vswap! used conj fresh)
+                  fresh))]
+      (mapv util/alpha-convert body))))
+
+(defn ^:no-doc prepare-original-helper-source [frontend body parameters tags source-ns]
+  (let [construct
+        (fn []
+          (when frontend
+            (method-entry/assert-frontend-source! frontend (get-in frontend [:source-entry :source-var]))
+            (when-not (and (identical? body (:body frontend))
+                           (= parameters (get-in frontend [:source-entry :params]))
+                           (= tags (get-in frontend [:source-entry :tags]))
+                           (identical? source-ns (get-in frontend [:source-entry :source-ns])))
+              (throw (ex-info "helper transformation differs from its original input"
+                              {:reason :source-import-input-mismatch})))
+            (method-entry/observe-frontend-source-identity! frontend))
+          (let [qualified-tags
+                (when tags
+                  (mapv (fn [tag]
+                          (if (or (nil? source-ns) (nil? tag)
+                                  (contains? '#{double long float int Double Long Float Integer
+                                                doubles floats longs ints objects} tag)
+                                  (.contains (str tag) "."))
+                            tag
+                            (let [lookup (symbol (str tag))
+                                  result (try (ns-resolve source-ns lookup) (catch Exception _ nil))]
+                              (method-entry/observe-source-resolution!
+                               {:kind :symbol-resolution :source-ns source-ns :symbol lookup :result result})
+                              (if (class? result) (symbol (.getName ^Class result)) tag)))) tags))
+                hygienic (hygienic-inline-body (effective-inline-body body) parameters)
+                parameter-set (set (map #(if (symbol? %) % (symbol (name %))) parameters))
+                qualified (if source-ns
+                            (mapv #(inference/qualify-body-symbols % source-ns parameter-set
+                                                           method-entry/observe-source-reference!) hygienic)
+                            hygienic)]
+            (when frontend
+              (method-entry/assert-frontend-source! frontend (get-in frontend [:source-entry :source-var])))
+            {:walked-body qualified :tags qualified-tags}))]
+    (construct)))
+
+
+(defn- construct-static-helper
+  "Derive a whole-call application from the exact current candidate and occurrence.
+   Rebuilds physical plans and imports the original callee under historical inputs;
+   caller-provided bodies, plans and detached application maps are not authority."
+  [candidate occurrence source-options]
+  (when method-entry/*emission-inputs*
+    (when-let [scope (call-plan/source-context source-options)]
+      (when-let [planned (.get ^java.util.IdentityHashMap (call-plan/call-plans scope candidate) occurrence)]
+        (let [source (get-in planned [:physical :definition :source-var])
+              frontend (when source (method-entry/original-source-frontend source))]
+          (when frontend
+            (method-entry/assert-frontend-source! frontend source)
+            (let [lineage (:source-entry frontend)
+                  parameters (:params lineage)
+                  {:keys [walked-body]} (prepare-original-helper-source
+                                        frontend (:body frontend) parameters (:tags lineage) (:source-ns lineage))
+                  body (first (effective-inline-body walked-body))
+                  arguments (:arguments planned)
+                  info {:source-var source :original-frontend frontend :params parameters}]
+              (when-let [whole (call-plan/whole-call scope planned info arguments body)]
+                (let [values (mapv #(with-meta (gensym (str "completed_" (name %) "_"))
+                                     {:raster.effect/effectful true}) parameters)
+                      context (:body-context whole)
+                      contracts [(completion/bytecode-result-context-contract context (:body-raw whole))
+                                 (if (= Object (:return-class whole))
+                                   completion/object-input-contract
+                                   (completion/planned-bytecode-input-contract
+                                    (:return-class whole) context (:body-raw whole)))
+                                 completion/object-input-contract]
+                      artifact (construct-helper-application
+                                frontend (assoc (:plan planned) :expression occurrence)
+                                (:inputs whole) parameters values body {} contracts nil false)
+                      ;; Keep every operand evaluation, including unused inputs.
+                      artifact (update artifact :argument-bindings
+                                       #(mapv (fn [[id value]]
+                                                [id (vary-meta value assoc :raster.effect/preserve-evaluation true)]) %))
+                      artifact (assoc artifact :expression
+                                      (list 'let* (vec (mapcat identity (:argument-bindings artifact)))
+                                            (:result-form artifact)))]
+                  (retain-owned-artifact!
+                   artifact
+                   #(method-entry/assert-frontend-source! frontend source)))))))))))
+
+(defn ^:no-doc instantiate-emitted-helper
+  "Derive one emitted application under a fresh, fully fenced dependency closure.
+   The capture callback is independently crosschecked against the actual call."
+  [expression locals context capture! consume-terminal-reduction terminal-only?]
+  (when (and method-entry/*emission-inputs* (seq? expression) (= '.invk (first expression)))
+    (method-entry/call-with-independent-definition-inputs
+     #(construct-emitted-helper expression locals context capture!
+                                consume-terminal-reduction terminal-only?))))
+
+(defn ^:no-doc instantiate-static-helper
+  "Derive one static application under a fresh, fully fenced dependency closure.
+   No plan or imported body from before the entry fence is accepted as evidence."
+  [candidate occurrence source-options]
+  (when method-entry/*emission-inputs*
+    (method-entry/call-with-independent-definition-inputs
+     #(construct-static-helper candidate occurrence source-options))))

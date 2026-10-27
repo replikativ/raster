@@ -4289,6 +4289,14 @@
          (and (coll? expression)
               (some #(method-local-callee-candidate? % ctx) expression)))))))
 
+(defn ^:no-doc ordinary-evaluation-base
+  "Evaluation base of an ordinary method entry, shared with physical planning.
+   Result/void/one-shot input flags are absent here. Actual emission adds its
+   compute return mode and resources; outlined input contexts remain explicit
+   overrides. This factory alone authenticates neither source nor an occurrence."
+  [source-ns]
+  {:source-ns source-ns})
+
 (defn ^:no-doc binding-initializer-context
   "The actual lexical initializer context, shared with pre-emission planning.
    This chooses evaluation context, not a value's physical carrier."
@@ -4912,23 +4920,18 @@
                 (contains? #{:double :float :long :int :bool}
                            (:type (get locals arg))))))))
 
-(defn ^:no-doc typed-invocation-plan
-  "Resolve the emitter's existing typed invk mechanism before code generation.
+(defn ^:no-doc resolved-typed-invocation-plan
+  "Construct the existing typed invk descriptor from an ALREADY resolved Class.
+   Does not load or initialize Classes. The caller owns Class/occurrence correspondence.
    The interface Method supplies actual parameter Classes. Neither its tags nor
    this plan establish operand carriers, selected-definition ownership or purity.
    :global? selects the emitter's args-first path, not an ordering proof. The
    primitive result Class is an emission request, not return-bridge authority."
-  [obj arity locals ctx]
+  [obj arity locals ctx cls]
   (when (symbol? obj)
     (let [tag (or (:raster.type/tag (meta obj)) (:tag (meta obj)) (:hint (get locals obj)))]
       (when (and tag (typed-interface? tag))
-        (let [src-ns (or (:source-ns ctx) *ns*)
-              cls (or (try (Class/forName (str tag)) (catch Exception _ nil))
-                      (when-let [r (ns-resolve src-ns (symbol (str tag)))]
-                        (when (class? r) r)))
-              _ (when-not cls
-                  (throw (ex-info (str "Cannot resolve IFn__ interface: " tag) {:obj obj :tag tag})))
-              method (first (filter #(and (= (.getName ^java.lang.reflect.Method %) "invk")
+        (let [method (first (filter #(and (= (.getName ^java.lang.reflect.Method %) "invk")
                                           (= (.getParameterCount ^java.lang.reflect.Method %) arity))
                                     (.getMethods cls)))
               _ (when-not method
@@ -4949,6 +4952,20 @@
            :interface-result-class (.getReturnType ^java.lang.reflect.Method method)
            :primitive-result-class primitive-result
            :global? (and (namespace obj) (not (get locals obj)))})))))
+
+(defn ^:no-doc typed-invocation-plan
+  "Resolve the emitter's existing typed invk mechanism before code generation."
+  [obj arity locals ctx]
+  (when (symbol? obj)
+    (let [tag (or (:raster.type/tag (meta obj)) (:tag (meta obj)) (:hint (get locals obj)))]
+      (when (and tag (typed-interface? tag))
+        (let [src-ns (or (:source-ns ctx) *ns*)
+              cls (or (try (Class/forName (str tag)) (catch Exception _ nil))
+                      (when-let [r (ns-resolve src-ns (symbol (str tag)))]
+                        (when (class? r) r)))]
+          (when-not cls
+            (throw (ex-info (str "Cannot resolve IFn__ interface: " tag) {:obj obj :tag tag})))
+          (resolved-typed-invocation-plan obj arity locals ctx cls))))))
 
 (defn- emit-dot-handler
   "Emit bytecode for (. obj method args...) — instance method or field access.
@@ -6649,10 +6666,17 @@
              :class-desc (class-desc-of cls)
              :stack-type :ref}))))))
 
+(defn ^:no-doc builtin-jvm-info
+  "The emitter's builtin descriptor producer, without name lookup or initialization."
+  [tag]
+  (when-let [cls (get types/tag->java-class tag)]
+    {:class cls :class-desc (class-desc-of cls) :stack-type (class-type->stack cls)}))
+
 (defn- param-tag->jvm
   "Map a specialized function param type hint to JVM descriptor info for fn-spec params.
   Returns {:class-desc ClassDesc, :stack-type keyword}"
   [tag]
+  (or (builtin-jvm-info tag)
   (if (class? tag)
     {:class tag :class-desc (class-desc-of tag) :stack-type (class-type->stack tag)}
     (case tag
@@ -6690,7 +6714,7 @@
       (if-let [cls (when (pos? (count tag-str))
                      (try (Class/forName tag-str) (catch Exception _ nil)))]
         {:class cls :class-desc (class-desc-of cls) :stack-type :ref}
-        {:class Object :class-desc obj-cd :stack-type :ref})))))
+        {:class Object :class-desc obj-cd :stack-type :ref}))))))
 
 ;; ================================================================
 ;; compile-specialized-class!
@@ -6965,7 +6989,8 @@
                                                               (update result parameter merge
                                                                       (select-keys original [:hint :verified :reference-class])))
                                                             locals input-port-layout)))
-                                                       ctx {:class-desc       class-desc
+                                                       ctx (merge (ordinary-evaluation-base source-ns)
+                                                           {:class-desc       class-desc
                                                             :prepare-static-source prepare-source!
                                                             :literal-owner literal-owner
                                                             :object-result? (= :ref return-stack-type)
@@ -6973,8 +6998,7 @@
                                                             :sibling-methods  sibling-methods
                                                             :typed-sibling-methods typed-sibling-methods
                                                             :local-callee-names local-callee-names
-                                                            :next-slot        next-slot
-                                                            :source-ns        source-ns}
+                                                            :next-slot        next-slot})
                                                        ctx (merge ctx body-input-context)
                                                        ctx (cond-> ctx expected-completion-input-type
                                                              (assoc ::expected-completion-input-type
@@ -7101,13 +7125,13 @@
                                                                                                           (not= tag 'Object)
                                                                                                           (not (typed-interface? tag))))})))
                                                                {} (map vector params param-infos tags))
-                                                       ctx {:class-desc class-desc
+                                                       ctx (merge (ordinary-evaluation-base source-ns)
+                                                           {:class-desc class-desc
                                                             :prepare-static-source prepare-source!
                                                             :literal-owner literal-owner
                                                             :object-result? (= :ref (:stack-type return-info))
                                                             :next-slot  next-slot
-                                                            :source-ns  source-ns
-                                                            :typed-sibling-methods typed-sibling-methods}
+                                                            :typed-sibling-methods typed-sibling-methods})
                                                        expanded-body (binding [*ns* source-ns]
                                                                        (mapv (comp pre-expand-par-forms materialize-form macroexpand-all-preserving desugar-invk pre-expand-par-forms) walked-body))
                                                        ret-type (emit-body code expanded-body locals ctx)

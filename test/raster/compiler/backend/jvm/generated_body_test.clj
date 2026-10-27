@@ -485,6 +485,85 @@
                                          {:raster.op/original operation})]
                          'result)]}))
 
+(deftest helper-application-refuses-a-valid-but-foreign-selected-capture
+  (entry/call-with-definition-inputs
+   (fn []
+     (let [program (helper-program #'ordered-body-helper)
+           foreign (helper-program #'unused-argument-helper)
+           foreign-call (second (second (first (:walked-body foreign))))
+           {:keys [semantic-op implementation-op]} (descriptor/call-description foreign-call)
+           captures (atom 0)]
+       (is (nil?
+            (generated/normalize-program
+             program (interface-method (:tags program))
+             (fn [_ _ arity method]
+               (swap! captures inc)
+               ;; Both helpers have the same physical interface. Matching a
+               ;; Method signature does not authorize substituting its source.
+               (capture! semantic-op implementation-op arity method)))))
+       (is (pos? @captures))))))
+
+(deftest helper-application-validation-retains-construction-and-original-capture-guard
+  (entry/call-with-definition-inputs
+   (fn []
+     (let [program (helper-program #'ordered-body-helper)
+           expression (second (second (first (:walked-body program))))
+           locals (bytecode/resolved-parameter-locals
+                   (interface-method (:tags program)) (:params program))
+           context (bytecode/binding-initializer-context {:source-ns *ns* :object-result? true})
+           current? (atom true)
+           application
+           (source-import/instantiate-emitted-helper
+            expression locals context
+            (fn [& arguments]
+              (let [owner (apply capture! arguments)
+                    original (:guard owner)]
+                (assoc owner :guard
+                       #(do (when-not @current?
+                              (throw (ex-info "original capture is no longer current"
+                                              {:reason ::stale-application-capture})))
+                            (original))))) nil false)]
+       (is (some? application))
+       (is (nil? (source-import/instantiate-emitted-helper
+                  (with-meta (cons 'not-an-invocation (rest expression)) (meta expression))
+                  locals context
+                  (fn [& _] (throw (AssertionError. "non-call reached helper capture"))) nil false)))
+       (is (identical? application (source-import/validate-helper-application! application)))
+       (doseq [altered [(assoc application :result-form 7.0)
+                        (update application :application assoc :selected-method nil)
+                        (dissoc application :receipt)]]
+         (is (= :helper-application-correspondence
+                (try (source-import/validate-helper-application! altered) nil
+                     (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))
+       (reset! current? false)
+       (try
+         (is (= ::stale-application-capture
+                (try (source-import/validate-helper-application! application) nil
+                     (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))
+         ;; The enclosing compiler owner independently validates on exit too.
+         ;; Restore this test-only guard so that boundary can close normally.
+         (finally (reset! current? true)))))))
+
+(deftest helper-applications-do-not-capture-prior-sibling-receipts
+  (entry/call-with-definition-inputs
+   (fn []
+     (let [program (helper-program #'ordered-body-helper)
+           expression (second (second (first (:walked-body program))))
+           locals (bytecode/resolved-parameter-locals
+                   (interface-method (:tags program)) (:params program))
+           context (bytecode/binding-initializer-context {:source-ns *ns* :object-result? true})
+           applications (mapv (fn [_]
+                                (source-import/instantiate-emitted-helper
+                                 expression locals context capture! nil false))
+                              (range 4))]
+       (is (every? some? applications))
+       (doseq [[index application] (map-indexed vector applications)]
+         (is (identical? application (source-import/validate-helper-application! application)))
+         (doseq [earlier (take index applications)]
+           (is (not-any? #(identical? (:receipt earlier) %)
+                         (get-in application [:application :dependencies :producer-inputs]))
+               "a sibling receipt is not part of this application's own construction history")))))))
+
 (defn- terminal-helper-program [generic]
   (let [operation (symbol (str (ns-name (.ns generic))) (str (:name (meta generic))))
         source (core/resolve-deftm-var generic)
