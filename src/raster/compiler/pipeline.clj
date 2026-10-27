@@ -2210,6 +2210,54 @@
      form)
     @found))
 
+(defn- reject-resident-host-only!
+  [candidate device-id dtype specialized?]
+  (when (dispatch/host-only? candidate)
+    (throw (ex-info (if specialized?
+                      "GPU specialization resolved to an explicitly host-only deftm method"
+                      "GPU compilation was requested for an explicitly host-only deftm")
+                    (cond-> {:reason :gpu-compiler-host-only
+                             :function (if (var? candidate)
+                                         (symbol (str (ns-name (:ns (meta candidate))))
+                                                 (str (:name (meta candidate))))
+                                         candidate)
+                             :device device-id}
+                      specialized? (assoc :dtype dtype))))))
+
+(defn- resident-compilation-preflight!
+  "Reject source-independent resident requests before selecting or preparing source.
+   Returns the one normalized schedule consumed by the later specialized compiler."
+  [f-var device-id dtype schedule gemm-precision]
+  (reject-resident-host-only! f-var device-id dtype false)
+  ;; S6 schedule: derive the descriptor-default schedule, deep-merge the user :schedule override
+  ;; (:gemm-precision is deprecated sugar -> the precision policy), and run the register-budget
+  ;; feasibility gate before source selection or emission.
+  (let [resolved-schedule ((requiring-resolve 'raster.gpu.schedule/compilation-schedule)
+                           (core-hw/descriptor-for device-id)
+                           {:schedule schedule :gemm-precision gemm-precision})]
+    (when (= :dispatch-reassociated
+             (get-in resolved-schedule [:segmented-weighted-reduction :strategy]))
+      (throw (ex-info
+              "reassociated equation dispatch requires the equation-first compiler"
+              {:reason :reassociated-equation-dispatch-requires-equation-first
+               :device device-id})))
+    (when (= :f32-storage-f64-arithmetic-rte-f32 (:precision resolved-schedule))
+      (throw (ex-info "widened contraction arithmetic requires the equation-first compiler"
+                      {:reason :widened-contraction-requires-equation-first
+                       :device device-id :fallback :none})))
+    (when (= :dispatch-register-tiled
+             (get-in resolved-schedule [:typed-contraction :strategy]))
+      (throw (ex-info
+              "contraction equation dispatch requires the equation-first compiler"
+              {:reason :contraction-equation-dispatch-requires-equation-first
+               :device device-id})))
+    ;; Retain the old cheap dtype-selection admission without asking the shared
+    ;; frontend for parameter/source facts. Schedule policy is checked first so
+    ;; an equation-first-only request cannot trigger parametric specialization.
+    (reject-resident-host-only! (or (resolve-deftm-var f-var dtype) f-var)
+                                device-id dtype true)
+    resolved-schedule))
+
 (defn compile-gpu-program
   "Compile f-var through the SAME fused GPU pipeline as compile-aot :target-device, but return a
    RESIDENT program descriptor for the session bound-dispatch path instead of make-gpu-fn's
@@ -2271,52 +2319,16 @@
   [f-var device-id & {:keys [dtype on-non-resident gemm-precision schedule compiler-report?
                             preserve-declared-array-storage?]
                       :or {on-non-resident :throw gemm-precision :mixed-f16-f32}}]
-  (call-with-deftm-source-inputs
-   f-var dtype
-   (fn [{:keys [resolved-var parameters param-env effective-dtype source-ns]
-         :as frontend}]
-    (call-with-gpu-source-construction device-id
-   (fn []
-  (when (dispatch/host-only? f-var)
-    (throw (ex-info "GPU compilation was requested for an explicitly host-only deftm"
-                    {:reason :gpu-compiler-host-only
-                     :function (if (var? f-var)
-                                 (symbol (str (ns-name (:ns (meta f-var))))
-                                         (str (:name (meta f-var))))
-                                 f-var)
-                     :device device-id})))
-  ;; S6 schedule: derive the descriptor-default schedule, deep-merge the user :schedule override
-  ;; (:gemm-precision is deprecated sugar → the precision policy), and run the register-budget
-  ;; FEASIBILITY GATE before any emission — an infeasible schedule (e.g. register double-buffering
-  ;; that would spill the GRF file) is a loud compile error, not a measurement-time regression.
-  (let [resolved-schedule ((requiring-resolve 'raster.gpu.schedule/compilation-schedule)
-                           (core-hw/descriptor-for device-id)
-                           {:schedule schedule :gemm-precision gemm-precision})
-        _ (when (= :dispatch-reassociated
-                   (get-in resolved-schedule [:segmented-weighted-reduction :strategy]))
-            (throw (ex-info
-                    "reassociated equation dispatch requires the equation-first compiler"
-                    {:reason :reassociated-equation-dispatch-requires-equation-first
-                     :device device-id})))
-        _ (when (= :f32-storage-f64-arithmetic-rte-f32 (:precision resolved-schedule))
-            (throw (ex-info "widened contraction arithmetic requires the equation-first compiler"
-                            {:reason :widened-contraction-requires-equation-first
-                             :device device-id :fallback :none})))
-        _ (when (= :dispatch-register-tiled
-                   (get-in resolved-schedule [:typed-contraction :strategy]))
-            (throw (ex-info
-                    "contraction equation dispatch requires the equation-first compiler"
-                    {:reason :contraction-equation-dispatch-requires-equation-first
-                     :device device-id})))
-        gemm-precision (:precision resolved-schedule)
-        _ (when (dispatch/host-only? resolved-var)
-            (throw (ex-info "GPU specialization resolved to an explicitly host-only deftm method"
-                            {:reason :gpu-compiler-host-only
-                             :function (if (var? resolved-var)
-                                         (symbol (str (ns-name (:ns (meta resolved-var))))
-                                                 (str (:name (meta resolved-var))))
-                                         resolved-var)
-                             :device device-id :dtype dtype})))
+  (let [resolved-schedule
+        (resident-compilation-preflight! f-var device-id dtype schedule gemm-precision)]
+    (call-with-deftm-source-inputs
+     f-var dtype
+     (fn [{:keys [resolved-var parameters param-env effective-dtype source-ns]
+           :as frontend}]
+      (call-with-gpu-source-construction device-id
+     (fn []
+  (let [gemm-precision (:precision resolved-schedule)
+        _ (reject-resident-host-only! resolved-var device-id dtype true)
         walked-body  (get-walked-body resolved-var dtype)
         active-params parameters
         ;; --- soa-lower (resident GPU value-type explosion) ----------------------------------
@@ -2706,7 +2718,7 @@
          (report/with-residency
            (report/from-pipeline
             (diagnostic->pipeline-map raw-form :opencl compiler-diagnostic))
-           (count (:allocs prog))))})))))))
+           (count (:allocs prog))))}))))))))
 
 (defn- realize-identity-tail
   "Expose an uncoerced final initializer at the source projection's tail.

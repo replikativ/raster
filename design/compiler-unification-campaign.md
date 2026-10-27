@@ -4,7 +4,25 @@
 
 ### Current boundary ledger
 
-Latest completed exact-head CI is `1c077fb6b`: all sixteen unit shards
+Latest completed exact-head CI is `87aea1e78`: all sixteen unit shards
+(35302) finish with 7,740 tests / 95,060 pass / 48 failures / 118 errors across
+137 failing Vars. The three prior cold-root Vars recover, but two allocation
+cases still expose cold helper readiness, and two resident preflight tests now
+fail because source preparation precedes cheap admission. All previous outcome
+Vars remain; shared assertions 95,215→95,216, five new Vars add 23 assertions.
+CPU-OpenCL 35301 completes all four shards unchanged at 678 tests / 7,456 pass /
+12 failures / 76 errors across 78 failing Vars. Emission 35303 still fails.
+
+The preflight-order repair now rejects generic host-only and equation-first-only
+schedule policies before semantic preparation, using one schedule result and
+retaining the later specialized host-only check. An independent full
+frontend-facts plus precision-rejection gate passes 8 / 49; the wider nonfailing
+frontend/schedule gate passes 17 / 150. The actual Arc T4 training schedule test
+still errors in paired-helper AD return completion; CI's single pass there is a
+device skip, not a hardware baseline qualification. This training route remains
+required work and is not waived by the preflight gate.
+
+Previous completed exact-head CI, `1c077fb6b`: all sixteen unit shards
 (35294) finish with 7,735 tests / 95,038 pass / 46 failures / 118 errors across
 136 failing Vars. The replay regression is fixed, but cold semantic readiness
 fails in two scalar-helper tests and cold physical allocator readiness fails in
