@@ -8,6 +8,7 @@
             [raster.compiler.ir.invocation-source :as source]
             [raster.compiler.ir.parallel-program :as parallel-program]
             [raster.compiler.ir.semantic-fingerprint :as semantic]
+            [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.core.value-completion :as completion]
             [raster.compiler.core.method-entry :as method-entry]
             [clojure.walk :as walk]
@@ -167,13 +168,23 @@
            (reason #(invocation/source-order plan (assoc program :source (list 'let* ['y changed] 'y))))))
     (is (= :semantic-fingerprint-unsupported (reason #(semantic/fingerprint plan)))
         "local source comparison cannot make a Class-bearing plan persistable")
-    (is (= :invocation-scalar-effect
-           (reason #(invocation/from-prefix
-                     {:id :unclosed-entry-check :parameters '[x]
-                      :parameter-values (select-keys values '[x])
-                      :bindings [['y checked-input]] :binding-values (select-keys values '[y])
-                      :program-values values :program-inputs '[y] :program-outputs '[y]})))
-        "equal completion source does not discharge its checked-conversion effects")))
+    (let [checked-plan (invocation/from-prefix
+                        {:id :unclosed-entry-check :parameters '[x]
+                         :parameter-values (select-keys values '[x])
+                         :bindings [['y checked-input]] :binding-values (select-keys values '[y])
+                         :program-values values :program-inputs '[y] :program-outputs '[y]})
+          step (first (:steps checked-plan))]
+      (is (invocation/source-completion? step)
+          "checked evaluation uses its explicit invocation operation, not a pure scalar step")
+      (is (= checked-input (:expression step))
+          "source comparison cannot erase the checked conversion")
+      (is (= :invocation-scalar-effect
+             (reason #(invocation/validate!
+                       (assoc checked-plan :steps
+                              [(invocation/->ScalarCompute
+                                (:id step) (:symbol step) (:operands step)
+                                (soac/lambda-form '[x] [checked-input]) (:value step))]))))
+          "relabeling checked evaluation as pure scalar work is still refused"))))
 
 (deftest structured-allocation-cannot-erase-changed-constructor-arguments
   (let [[program plan] (allocation-boundary)]

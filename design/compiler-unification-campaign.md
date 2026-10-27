@@ -4,10 +4,10 @@
 
 ### Current boundary ledger
 
-Latest exact-head accounting, `c86461642` (October 26): unit job 35129 and
-CPU-OpenCL job 35126 fail; this branch is not merge-ready. All sixteen unit
-shards complete: 7,636 tests, 94,966 passing assertions, 36 failures and 28
-errors across 45 failing Vars. CPU-OpenCL has all four completed shards: 676
+Latest exact-head accounting, `97ee525e7` (October 26): unit job 35142 and
+CPU-OpenCL job 35143 fail; this branch is not merge-ready. All sixteen unit
+shards complete: 7,648 tests, 95,069 passing assertions, 23 failures and 28
+errors across 40 failing Vars. CPU-OpenCL has all four completed shards: 676
 tests, 8,617 passing assertions, 6 failures and 27 errors across 31 failing Vars.
 Setup, build, emitted-source, CUDA and HIP compiler checks pass. Compiler-only
 vendor checks do not establish native execution or waive the failed unit/device
@@ -33,6 +33,13 @@ Raw observation additionally preserves the original execution state/readiness;
 it does not manufacture completion. The six affected namespaces pass 57 tests /
 702 assertions with the existing ownership, poisoning, synchronous-scope and
 cleanup controls retained. Full exact-head CI remains required.
+
+The retained-source ordering fixture now follows the explicit `SourceCompletion`
+operation rather than expecting all checked scalar evaluation to be refused.
+It requires the original checked expression to remain and still refuses that
+same expression if forged into a pure `ScalarCompute`. The affected namespace
+passes 14 tests / 82 assertions; this updates an obsolete test expectation,
+not the runtime effect or completion contract.
 
 The in-progress correction distinguishes an attached InvocationPlan from actual
 scalar-proof demand: strict source correspondence is necessary when a leaf uses
@@ -231,8 +238,30 @@ the new pass's performance. The reload/probe now refreshes and verifies registry
 identity, and a public `run-passes` regression checks actual analysis activation.
 With the registry current, the small optimizer probe admits 285 queries and
 retains strict fallback for 76 (previously all 361 were fallback). Its capacity
-refusal remains unchanged. A corrected whole-GSDM timing is still required;
-further source-normalization scope expansion is held pending that measurement.
+refusal remains unchanged.
+
+The registry-verified warm run at `97ee525e7` now reaches that same refusal after
+184.4 seconds of fused compilation; fixpoint takes 92.0 seconds. Its 157,157
+freshness checks account for 22.6 seconds inclusively, and 15,620 original
+frontend queries for 12.8 seconds. This is useful measured prefix progress, not
+successful training or a controlled speedup: the earlier warm run had different
+preparation/code-generation work and shared-machine load. The new final-window
+profile instead highlights effect-descriptor analysis and free-symbol discovery
+(about 17% and 15% of selected-thread samples respectively, inclusive), with
+substantial sampled temporary allocation. Those analyses and the causal field
+capacity failure are next; additional query-owner scope expansion remains held
+until it addresses measured work rather than speculative coverage.
+
+Free-symbol discovery now accumulates one result set per call rather than
+constructing and unioning a set at every child. Lexical scope still comes only
+from `form/scope-info`; explicit bounds, dynamic shadowing, quoting and callable
+heads keep their existing rules. There is no memoization or new invalidation
+authority. Utility, form and inlining suites pass 94 tests / 750 assertions,
+including comparison with the former traversal as a differential oracle.
+A warmed alternating-order probe on the captured small optimizer
+source measures about 301 KB per call for the old traversal versus 107 KB for
+the accumulator (65% less thread allocation). This is a local analysis result,
+not an end-to-end compile-time speedup; full-model measurements remain separate.
 
 One independent convergence-domain defect is corrected: compiler fixpoints now
 use pair-local retained-source equality, allowing exact immutable Class identity,

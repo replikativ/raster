@@ -58,6 +58,70 @@
            (not (when-let [v (try (ns-resolve 'clojure.core e) (catch Exception _ nil))]
                   (var? v))))))
 
+(declare ^:private collect-free-syms!)
+
+(defn- collect-free-syms-all!
+  [accumulator expressions bound]
+  (reduce #(collect-free-syms! %1 %2 bound) accumulator expressions))
+
+(defn- collect-free-syms!
+  "Accumulate free symbols into one transient set owned by the outer free-syms
+   call. Scope traversal deliberately mirrors the former recursive set/union
+   implementation; only the result construction strategy differs."
+  [accumulator e bound]
+  (cond
+    (symbol? e)
+    (if (free-leaf? e bound) (conj! accumulator e) accumulator)
+
+    ;; quote is opaque — its contents are data, not code
+    (and (seq? e) (contains? #{'quote 'clojure.core/quote} (first e)))
+    accumulator
+
+    (seq? e)
+    (if-let [{:keys [scopes outer sequential? rec?]} (form/scope-info e)]
+      (reduce
+       (fn [accumulator {:keys [binders inits body]}]
+         (if sequential?
+           ;; let*/loop*: init_k sees bound + prior binders
+           (let [[accumulator bound']
+                 (reduce (fn [[accumulator current-bound] [sym init]]
+                           [(collect-free-syms! accumulator init current-bound)
+                            (conj current-bound sym)])
+                         [accumulator bound]
+                         (map vector binders inits))]
+             (collect-free-syms-all! accumulator body bound'))
+           ;; fn*/letfn*/par/catch/dotimes: inits see bound (or
+           ;; bound+binders if :rec?), body sees bound+binders
+           (let [bset (set (filter symbol? binders))
+                 init-bound (if rec? (into bound bset) bound)
+                 accumulator (collect-free-syms-all! accumulator inits init-bound)
+                 body-bound (into bound bset)]
+             (collect-free-syms-all! accumulator body body-bound))))
+       (collect-free-syms-all! accumulator outer bound)
+       scopes)
+      ;; non-binder seq: :call head is a value ref (local fn); else head is
+      ;; syntax (.invk/if/do/special/par-without-scope) — skip it
+      (collect-free-syms-all! accumulator
+                              (if (= :call (:kind (form/form-info e))) e (rest e))
+                              bound))
+
+    (vector? e)
+    (collect-free-syms-all! accumulator e bound)
+
+    (map? e)
+    ;; Traverse map entries instead of requiring IKVReduce: map? also admits
+    ;; persistent sorted maps and record implementations whose only common
+    ;; iteration contract is their entry sequence.
+    (reduce (fn [accumulator entry]
+              (collect-free-syms! (collect-free-syms! accumulator (key entry) bound)
+                                  (val entry) bound))
+            accumulator e)
+
+    (set? e)
+    (collect-free-syms-all! accumulator e bound)
+
+    :else accumulator))
+
 (defn free-syms
   "Collect unqualified free symbols from a (possibly nested) S-expression,
    correctly respecting lexical scoping from EVERY closed-core binding form.
@@ -69,45 +133,7 @@
    code-as-data, never scanned)."
   ([e] (free-syms e #{}))
   ([e bound]
-   (cond
-     (symbol? e) (if (free-leaf? e bound) #{e} #{})
-
-     ;; quote is opaque — its contents are data, not code
-     (and (seq? e) (contains? #{'quote 'clojure.core/quote} (first e))) #{}
-
-     (seq? e)
-     (if-let [{:keys [scopes outer sequential? rec?]} (form/scope-info e)]
-       (let [outer-free (apply set/union #{} (map #(free-syms % bound) outer))
-             scope-free
-             (apply set/union #{}
-                    (for [{:keys [binders inits body]} scopes]
-                      (let [bset (set (filter symbol? binders))]
-                        (if sequential?
-                          ;; let*/loop*: init_k sees bound + prior binders
-                          (let [[bound' ifree]
-                                (reduce (fn [[b fr] [sym init]]
-                                          [(conj b sym) (set/union fr (free-syms init b))])
-                                        [bound #{}] (map vector binders inits))
-                                bfree (apply set/union #{} (map #(free-syms % bound') body))]
-                            (set/union ifree bfree))
-                          ;; fn*/letfn*/par/catch/dotimes: inits see bound (or
-                          ;; bound+binders if :rec?), body sees bound+binders
-                          (let [init-bound (if rec? (into bound bset) bound)
-                                ifree (apply set/union #{} (map #(free-syms % init-bound) inits))
-                                body-bound (into bound bset)
-                                bfree (apply set/union #{} (map #(free-syms % body-bound) body))]
-                            (set/union ifree bfree))))))]
-         (set/union outer-free scope-free))
-       ;; non-binder seq: :call head is a value ref (local fn); else head is
-       ;; syntax (.invk/if/do/special/par-without-scope) — skip it
-       (if (= :call (:kind (form/form-info e)))
-         (apply set/union #{} (map #(free-syms % bound) e))
-         (apply set/union #{} (map #(free-syms % bound) (rest e)))))
-
-     (vector? e) (apply set/union #{} (map #(free-syms % bound) e))
-     (map? e)    (apply set/union #{} (map #(free-syms % bound) (apply concat e)))
-     (set? e)    (apply set/union #{} (map #(free-syms % bound) e))
-     :else #{})))
+   (persistent! (collect-free-syms! (transient #{}) e bound))))
 
 (defn free-syms-excluding
   "Collect unqualified free symbols, excluding a set of operator symbols.
