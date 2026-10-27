@@ -4,15 +4,36 @@
 
 ### Current boundary ledger
 
-Latest completed unit accounting, `ae8300076` (October 27): unit job 35256
-fails; this branch is not merge-ready. All sixteen unit shards complete: 7,717
-tests, 94,716 passing assertions, 53 failures and 125 errors across 144 failing
-Vars. All 7,709 previously reported outcome Vars and their 94,679 assertions
-are retained; nine new outcome Vars add 228 assertions. Emission job 35253 fails
-at the same public mixed-scale boundary. CPU-OpenCL job 35252 also fails with
-all four completed shards: 677
-tests, 7,404 passing assertions, 12 failures and 81 errors across 83 failing Vars.
-Setup and build pass; emitted-source fails on `mixed-storage/mixed-scale`, so
+The next shared observation prerequisite is pushed as `56669777f`:
+actual primitive conversion facts (with the existing floating query domain
+preserved), root Object boxing/literal facts, and actual `ARRAYLENGTH` facts.
+Fresh-emission focused checks pass 3 tests / 73 assertions; the combined Object
+and input-completion gate passes 44 / 1,331. These observations grant neither
+purity, totality, bounds safety nor permission to move computation. Exact-head
+CI remains required. Closed-prefix helper composition and delegated allocation
+ownership are still under implementation/qualification, not completed by this
+prerequisite.
+
+Delegated allocation projection now composes exact identity-forwarding helper
+edges using their original input occurrences, selected Methods, physical
+carriers, return bridges and definition history. The executable constructor's
+initialization stays separate from the public allocator promise: only equality
+or zero-to-unspecified weakening is permitted. Both source ownership and
+InvocationPlan consume the checked public facet. The allocation/source-order
+gate passes 39 tests / 360 assertions, repeated independently in the shared REPL.
+This does not yet qualify the later preservation of escaping allocation owners
+through numerical realization and component splitting, nor the 26-Var CI family.
+
+Latest completed accounting, `125438f30` (October 27): unit job 35270
+fails; this branch is not merge-ready. All sixteen unit shards complete: 7,727
+tests, 94,784 passing assertions, 46 failures and 123 errors across 141 failing
+Vars. Shared outcome Vars retain 94,913→94,915 assertions. One fabricated
+mock-bare Var (three assertions) is replaced by genuine owned-function coverage;
+ten new outcome Vars add 51 assertions. Emission job 35267 passes mixed-scale
+and fails the next energy-gradient fixture. CPU-OpenCL job 35266 also fails with
+all four completed shards: 678
+tests, 7,421 passing assertions, 12 failures and 81 errors across 83 failing Vars.
+Setup and build pass; emitted-source fails on `mixed-storage/mixed-scale-energy-gradient`, so
 dependent vendor compiler gates have not qualified this head. The stricter
 whole-call migration exposes substantial additional source/projection coverage
 regressions; focused green gates below do not qualify that migration globally.
@@ -31,7 +52,7 @@ the older nested-MMM test expecting the now-owned helper cases to refuse. Those
 including default/selected gradients, empty reductions and unchanged inputs.
 The five affected AD namespaces pass 43 tests / 718 assertions with the
 committed inliner. Unknown Object/compound-array and active-discrete refusals
-remain independently tested. The 144 unit and 83 CPU failing Vars are
+remain independently tested. The 141 unit and 83 CPU failing Vars are
 still unqualified; this test migration does not waive them.
 Between the earlier `32ff5587a` and `280a9a3a7` reports, all 7,679 shared unit outcome Vars and
 95,417 shared assertions are retained; eleven new Vars add 363 assertions. CPU

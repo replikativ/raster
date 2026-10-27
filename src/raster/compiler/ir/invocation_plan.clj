@@ -707,8 +707,14 @@
         operation (descriptor/semantic-op expression)
         projection (when (buffer-value? value)
                      (descriptor/direct-allocation-projection expression lexical-values))
-        initialization (descriptor/allocation-initialization
-                        (if projection (descriptor/semantic-op (:constructor projection)) operation))]
+        projected-initializations
+        (when projection (descriptor/allocation-projection-initializations projection))
+        _ (when (and projection (nil? projected-initializations))
+            (fail! :invocation-allocation-projection
+                   "allocation projection has inconsistent public and realized initialization"
+                   {:binding symbol :source expression}))
+        initialization (if projection (:public projected-initializations)
+                         (descriptor/allocation-initialization operation))]
     (cond
       result-import
       (do

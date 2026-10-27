@@ -1,10 +1,13 @@
 (ns raster.compiler.buffer-allocation-legality-test
   (:require [clojure.test :refer [deftest is]]
-            [raster.core]
+            [raster.core :as core]
+            [raster.arrays :as arrays]
+            [raster.compiler.backend.jvm.bytecode :as bytecode]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.method-entry :as method-entry]
             [raster.compiler.core.types :as types]
             [raster.compiler.core.hoist :as hoist]
+            [raster.compiler.ir.invocation-source :as invocation-source]
             [raster.compiler.passes.scalar.effects :as effects]
             [raster.compiler.passes.scalar.buffer-fuse :as buffer-fuse]))
 
@@ -138,12 +141,167 @@
                                       :constructor '(clojure.core/double-array n)}}]
         (with-redefs [descriptor/resolve-buffer-semantics (fn [_] [fake op])]
           (is (nil? (descriptor/direct-allocation-projection (list op 'cnt) {'cnt {:dtype :long :shape []}})))))
-      (is (= {:constructor '(clojure.core/double-array cnt)}
+      (is (= {:constructor '(clojure.core/double-array cnt)
+              :public-initialization :zero
+              :realized-initialization :zero}
              (descriptor/direct-allocation-projection '(clojure.core/double-array cnt) {})))
       (doseq [call ['(double-array cnt) '(clojure.core/double-array cnt)]
               :let [lexical (with-meta call {:raster.op/lexical-callee true})]]
         (is (nil? (descriptor/array-allocation-size lexical)))
         (is (nil? (descriptor/direct-allocation-projection lexical {})))))))
+
+(defn- compiled-allocation-call [generic dtype arguments]
+  (let [source (core/resolve-deftm-var generic {:dtype dtype})
+        implementation (symbol (str (:ns (meta source)))
+                               (str (:name (meta source)) "-impl"))
+        receiver (ns-resolve (:ns (meta source)) (symbol (name implementation)))]
+    (core/ensure-bytecode-implementation! receiver)
+    {:source source :receiver receiver
+     :call (with-meta (list* '.invk implementation arguments)
+             {:raster.op/original
+              (symbol (str (:ns (meta generic))) (str (:name (meta generic))))})}))
+
+(defn- compiled-source-call [source helper-name tags arguments]
+  (let [operation (operation source helper-name tags)
+        implementation (symbol (namespace operation) (str (name operation) "-impl"))
+        receiver (ns-resolve source (symbol (name implementation)))]
+    (core/ensure-bytecode-implementation! receiver)
+    (with-meta (list* '.invk implementation arguments)
+      {:raster.op/original (symbol (str (ns-name source)) (str helper-name))})))
+
+(deftest delegated-allocation-projection-retains-the-outer-public-contract
+  (doseq [[dtype array-value expected-constructor]
+          [[:float (float-array 0) 'clojure.core/float-array]
+           [:double (double-array 0) 'clojure.core/double-array]]]
+    (let [{:keys [source receiver call]}
+          (compiled-allocation-call #'arrays/alloc-like dtype '[reference count])
+          values {'reference {:dtype dtype :shape ['capacity]}
+                  'count {:dtype :long :shape []}}
+          [projection observations]
+          (method-entry/call-with-definition-inputs
+           (fn [] [(descriptor/direct-allocation-projection call values)
+                   @method-entry/*emission-inputs*]))
+          chain (take-while some?
+                            (iterate #(get-in % [:delegation :definition])
+                                     (get-in projection [:helper :definition])))]
+      (is (= (list expected-constructor 'count) (:constructor projection)))
+      (is (= :unspecified (:public-initialization projection)))
+      (is (= :zero (:realized-initialization projection)))
+      (is (= {:public :unspecified :realized :zero}
+             (descriptor/allocation-projection-initializations projection)))
+      (doseq [changed [(assoc projection :public-initialization :zero)
+                       (assoc projection :public-initialization :copy)
+                       (assoc projection :realized-initialization :unspecified)
+                       (assoc-in projection [:helper :operation] 'raster.arrays/zeros-like)
+                       (update projection :helper dissoc :definition)]]
+        (is (nil? (descriptor/allocation-projection-initializations changed))))
+      (is (= 2 (count chain)) "alloc-like delegates exactly through zeros-like")
+      (is (= :unspecified
+             (:initialization
+              (method-entry/call-with-definition-inputs
+               #(invocation-source/allocation-source call values)))))
+      (is (true?
+           (method-entry/call-with-definition-inputs
+            #(invocation-source/allocation-corresponds?
+              call {:dtype dtype :shape ['count]} :unspecified values))))
+      (is (false?
+           (method-entry/call-with-definition-inputs
+            #(invocation-source/allocation-corresponds?
+              call {:dtype dtype :shape ['count]} :zero values)))
+          "a zeroing leaf does not promote the public allocator's readiness")
+      (is (not-any? #(or (fn? %) (instance? java.lang.reflect.Method %)
+                         (instance? clojure.lang.Namespace %))
+                    (tree-seq coll? seq (:helper projection))))
+      (doseq [reference [nil array-value]
+              count [-1 0 3]]
+        (let [observe (fn [invoke]
+                        (try (let [array (invoke)] [(class array) (vec array)])
+                             (catch Throwable error {:error (class error)})))]
+          (is (= (observe #(source reference count))
+                 (observe #(eval (list 'let* ['count count] (:constructor projection))))))))
+      (is (contains? (:definition-proofs observations) source))
+      (is (contains? (:definition-proofs observations) receiver))
+      (with-redefs-fn {receiver (fn [& _] (if (= dtype :float)
+                                           (float-array 0) (double-array 0)))}
+        #(is (thrown? clojure.lang.ExceptionInfo
+                      (method-entry/assert-definition-inputs-current! observations)))))))
+
+(deftest delegated-allocation-projection-requires-its-exact-emitted-call-edge
+  (let [{:keys [call]} (compiled-allocation-call #'arrays/alloc-like :float '[reference count])
+        values {'reference {:dtype :float :shape ['capacity]}
+                'count {:dtype :long :shape []}}
+        observe bytecode/retained-input-invocation-context
+        project #(method-entry/call-with-definition-inputs
+                  (fn [] (descriptor/direct-allocation-projection call values)))]
+    (is (some? (project)))
+    (doseq [edit [(constantly nil)
+                  #(assoc % :invocation-mode :unproved)
+                  #(assoc % :receiver 'foreign/implementation)
+                  #(assoc % :method nil)
+                  #(assoc-in % [:receiver-input :ports] {'foreign {:type :ref}})
+                  #(assoc-in % [:inputs 0 :context] {:operand-context :forged})
+                  #(assoc-in % [:inputs 0 :unretained-sibling-calls?] true)
+                  #(assoc-in % [:input-completions 1 :adaptation] :coerce)
+                  #(assoc-in % [:input-completions 0 :parameter-carrier] Object)]]
+      (with-redefs [bytecode/retained-input-invocation-context
+                    (fn [& arguments] (some-> (apply observe arguments) edit))]
+        (is (nil? (project)))))))
+
+(deftest delegated-allocation-projection-refuses-nonidentity-forwarding
+  (with-source
+    (fn [source]
+      (define-allocator 'storage-helper '[ref :- (Array double) n :- Long]
+        '(double-array n))
+      (define-allocator 'forwarding-helper '[ref :- (Array double) n :- Long]
+        '(storage-helper ref n))
+      (define-allocator 'two-hop-helper '[ref :- (Array double) n :- Long]
+        '(forwarding-helper ref n))
+      (let [values {'reference {:dtype :double :shape ['capacity]}
+                    'other {:dtype :double :shape ['other-capacity]}
+                    'count {:dtype :long :shape []}
+                    'extra {:dtype :long :shape []}}
+            project (fn [name tags arguments]
+                      (let [call (compiled-source-call source name tags arguments)]
+                        (method-entry/call-with-definition-inputs
+                         #(descriptor/direct-allocation-projection call values))))
+            ;; A projection query observes already emitted forwarding edges; it
+            ;; never compiles a hidden intermediate merely to complete proof.
+            _leaf (compiled-source-call source "storage-helper" "doubles_long"
+                                        '[reference count])
+            _middle (compiled-source-call source "forwarding-helper" "doubles_long"
+                                          '[reference count])
+            projection (project "two-hop-helper" "doubles_long" '[reference count])
+            chain (take-while some?
+                              (iterate #(get-in % [:delegation :definition])
+                                       (get-in projection [:helper :definition])))]
+        (is (= '(clojure.core/double-array count) (:constructor projection)))
+        (is (= 3 (count chain)))
+        ;; Define and check each refusal before another namespace mutation can
+        ;; invalidate the exact source lookup history it is meant to test.
+        (define-allocator 'computed-forward '[ref :- (Array double) n :- Long]
+          '(storage-helper ref (inc n)))
+        (is (nil? (project "computed-forward" "doubles_long" '[reference count])))
+        (define-allocator 'constant-forward '[ref :- (Array double) n :- Long]
+          '(storage-helper ref 1))
+        (is (nil? (project "constant-forward" "doubles_long" '[reference count])))
+        (define-allocator 'dropped-forward
+          '[ref :- (Array double) n :- Long unused :- Long]
+          '(storage-helper ref n))
+        (is (nil? (project "dropped-forward" "doubles_long_long"
+                           '[reference count extra])))
+        (eval '(raster.core/deftm two-array-helper
+                 [left :- (Array double) right :- (Array double) n :- Long] :- (Array double)
+                 (double-array n)))
+        (eval '(raster.core/deftm duplicate-forward
+                 [left :- (Array double) right :- (Array double) n :- Long] :- (Array double)
+                 (two-array-helper left left n)))
+        (is (nil? (project "duplicate-forward" "doubles_doubles_long"
+                           '[reference other count])))
+        (eval '(raster.core/deftm permuted-forward
+                 [left :- (Array double) right :- (Array double) n :- Long] :- (Array double)
+                 (two-array-helper right left n)))
+        (is (nil? (project "permuted-forward" "doubles_doubles_long"
+                           '[reference other count])))))))
 
 (deftest specialization-carrier-admission-is-not-removed
   (with-source

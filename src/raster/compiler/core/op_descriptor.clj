@@ -854,6 +854,254 @@
                           (types/numeric-literal-carrier expression))]
         (assoc constant :dtype (dtype/canon carrier))))))
 
+(declare direct-allocation-projection-in-context)
+
+(defn- public-allocation-initialization-valid?
+  "The executable constructor may satisfy a weaker public fresh-storage claim.
+   No other change of initialization semantics is inferred from forwarding."
+  [public realized]
+  (or (= public realized)
+      (and (= :unspecified public) (= :zero realized))))
+
+(defn- identity-forwarding-shape?
+  "Cheap refusal before acquiring a physical helper module. This is not proof:
+   the exact frontend/emission checks below rederive every accepted field."
+  [source-var]
+  (let [metadata (meta source-var)
+        parameters (:raster.core/deftm-params metadata)
+        body (:raster.core/deftm-walked-body metadata)
+        call (when (= 1 (count body)) (first body))
+        {:keys [dispatch? lexical-callee implementation-op arguments]} (call-description call)]
+    (and dispatch? (not lexical-callee)
+         (symbol? implementation-op) (namespace implementation-op)
+         (vector? parameters) (= parameters arguments)
+         (= (count parameters) (count (distinct parameters))))))
+
+(defn- formal-allocation-values
+  "Physical typed-entry facts used only to check an exact forwarding edge.
+   These are not caller shapes or exemplar values; a reference formal remains a
+   nullable one-dimensional storage reference and a scalar formal stays scalar."
+  [parameters tags carriers]
+  (when (and (= (count parameters) (count tags) (count carriers))
+             (every? class? carriers))
+    (into {}
+          (map (fn [parameter tag ^Class carrier]
+                 (let [array? (types/array-tag? tag)
+                       expected (if array? (dtype/dtype-for-array-tag tag)
+                                    (dtype/dtype-for-scalar-tag tag))]
+                   [parameter
+                    (when (and expected
+                               (= (.isArray carrier) array?)
+                               (if array?
+                                 (and (.isPrimitive (.getComponentType carrier))
+                                      (identical? carrier (get types/primitive-array-info tag)))
+                                 (.isPrimitive carrier)))
+                      {:dtype (dtype/canon expected)
+                       :shape (if array? [(keyword "raster.compiler" "forwarded-capacity")] [])})]))
+               parameters tags carriers))))
+
+(defn- forwarding-allocation-definition
+  "Compose one exact identity-forwarding typed helper with an allocation proof.
+
+   The helper must return one observed global typed invocation and forward every
+   distinct formal once, in source order. Actual body-entry carriers, emitted
+   argument completions, invocation Method and reference return bridge all have
+   to agree. This is constructor correspondence only: it grants neither
+   callback-free prefix motion nor initialized-storage credit."
+  [frontend selected visited]
+  (let [body (:body frontend)
+        parameters (get-in frontend [:source-entry :params])
+        tags (get-in frontend [:source-entry :tags])
+        call (when (= 1 (count body)) (first body))
+        {:keys [dispatch? lexical-callee semantic-op implementation-op arguments]}
+        (call-description call)]
+    (when (and method-entry/*emission-inputs*
+               dispatch? (not lexical-callee)
+               (symbol? implementation-op) (namespace implementation-op)
+               (vector? parameters) (= parameters arguments)
+               (= (count parameters) (count (distinct parameters))))
+      (let [source-var (get-in frontend [:source-entry :source-var])
+            physical (method-entry/frontend-body-entry-carriers frontend source-var)
+            emission (method-entry/observed-frontend-emission frontend)
+            observed (when emission
+                       ((requiring-resolve
+                         'raster.compiler.backend.jvm.bytecode/retained-input-invocation-context)
+                        emission body call))
+            bridge (method-entry/frontend-reference-return-bridge frontend)
+            operation (or semantic-op (mangled/impl->op implementation-op))
+            inner (when operation
+                    (method-entry/selected-parameter-carriers
+                     operation implementation-op (count arguments)))
+            carriers (:parameter-carriers selected)
+            inner-carriers (:parameter-carriers inner)
+            method (:method observed)
+            compute (:compute-method bridge)
+            locals (get-in bridge [:body-context :locals])
+            formal-values (formal-allocation-values parameters tags carriers)]
+        (when (and physical emission observed bridge inner formal-values
+                   (= parameters (:parameters physical) (:parameters selected))
+                   (= carriers (:parameter-carriers physical))
+                   (= carriers
+                      (mapv #(get-in physical [:parameter-facts % :carrier]) parameters))
+                   (identical? emission (:emission physical))
+                   (identical? (:implementation frontend) (:implementation bridge))
+                   (identical? (get-in selected [:definition :entry :typed-impl])
+                               (:implementation frontend))
+                   (= :known (:status observed))
+                   (identical? call (:source-input observed))
+                   (= :global-typed-indy (:invocation-mode observed))
+                   (= implementation-op (:receiver observed)
+                      (get-in observed [:receiver-input :operand]))
+                   (empty? (get-in observed [:receiver-input :ports]))
+                   (instance? java.lang.reflect.Method method)
+                   (not (.isVarArgs ^java.lang.reflect.Method method))
+                   (= method (:invocation-method inner))
+                   (= inner-carriers (vec (.getParameterTypes ^java.lang.reflect.Method method)))
+                   (identical? Object (:return-carrier observed))
+                   (identical? Object (:result-carrier inner))
+                   (instance? java.lang.reflect.Method compute)
+                   (= carriers (vec (.getParameterTypes ^java.lang.reflect.Method compute)))
+                   (= (count parameters) (count (:inputs observed))
+                      (count (:input-completions observed)))
+                   (every?
+                    true?
+                    (map (fn [parameter carrier inner-carrier input completed]
+                           (let [port (get locals parameter)]
+                             (and port
+                                  (= parameter (:operand input))
+                                  (identical? (:operand input) (:operand completed))
+                                  (= {parameter port} (:ports input))
+                                  (false? (:unretained-sibling-calls? input))
+                                  ((requiring-resolve
+                                    'raster.compiler.core.value-completion/bytecode-operand-context?)
+                                   (:context input))
+                                  (identical? inner-carrier (:parameter-carrier completed))
+                                  (= (:type port) (:emitted-type completed))
+                                  (if (.isPrimitive ^Class inner-carrier)
+                                    (and (identical? carrier inner-carrier)
+                                         (= :identity (:adaptation completed)))
+                                    (and (= :ref (:type port))
+                                         (= :checkcast (:adaptation completed))
+                                         (identical? carrier inner-carrier)
+                                         (identical? carrier (:reference-class port)))))))
+                         parameters carriers inner-carriers
+                         (:inputs observed) (:input-completions observed))))
+          (let [projection (direct-allocation-projection-in-context
+                            call formal-values (conj visited [source-var (:implementation frontend)]))
+                constructor (:constructor projection)
+                result-class
+                (some (fn [[_ row]]
+                        (when (= (first constructor) (:jvm-array-constructor row))
+                          (Class/forName (:jvm-array-class-name row))))
+                      dtype/dtype-info)]
+            (when (and (:helper projection) result-class
+                       (identical? result-class (:body-return-carrier bridge)))
+              {:parameters parameters :parameter-tags tags
+               :constructor constructor :delegation (:helper projection)})))))))
+
+(defn- direct-allocation-projection-in-context
+  [expression values visited]
+  (if (array-allocation-size expression)
+    (let [realized (allocation-initialization (semantic-op expression))]
+      {:constructor expression
+       :public-initialization realized
+       :realized-initialization realized})
+    (let [{:keys [implementation-op arguments lexical-callee dispatch?]
+           source-operation :semantic-op}
+          (call-description expression)
+          operation (if dispatch? (or source-operation (mangled/impl->op implementation-op))
+                      (or (mangled/impl->op implementation-op) source-operation))
+          select! #(if dispatch?
+                     (method-entry/selected-definition operation implementation-op (count arguments))
+                     (method-entry/direct-selected-definition operation implementation-op (count arguments)))]
+      (when (and (not lexical-callee) (symbol? implementation-op) (namespace implementation-op)
+                 (every? #(or (and (symbol? %) (contains? values %))
+                              (allocation-literal-argument %)) arguments))
+        (when-let [{v :source-var {implementation :typed-impl} :entry} (select!)]
+          (when (and (var? v) (:raster.core/deftm (meta v))
+                     (not-any? (fn [[source previous]]
+                                 (and (identical? v source)
+                                      (identical? implementation previous)))
+                               visited))
+            ;; Lazy walking/source preparation may publish compiler-owned facts.
+            ;; Complete that work before snapshotting the definition; never use a
+            ;; prepared replacement to refresh an older observation.
+            (when-not (:raster.core/deftm-walked-body (meta v))
+              ((requiring-resolve 'raster.core/ensure-walked-body!) v))
+            (let [direct (:direct-allocation (detect-auto-buffer-semantics v))
+                  forwarding? (and (nil? direct) (identity-forwarding-shape? v))]
+              ;; Existing direct-constructor proofs do not acquire a physical
+              ;; module merely because forwarding support is available.
+              (when forwarding?
+                ((requiring-resolve 'raster.core/prepare-deftm-frontend!) v))
+              (let [root (.getRawRoot ^clojure.lang.Var v)
+                  metadata (meta v)
+                  selected (select!)
+                  current-implementation (get-in selected [:entry :typed-impl])
+                  observations (mapv method-entry/var-snapshot
+                                     (distinct (keep #(get selected %)
+                                                     [:source-var :generic-var :receiver-var])))
+                  frontend (when method-entry/*emission-inputs*
+                             (when forwarding? (method-entry/original-source-frontend v)))
+                  definition (or direct
+                                 (when (and frontend
+                                            (identical? implementation current-implementation)
+                                            (identical? current-implementation
+                                                        (:implementation frontend)))
+                                   (forwarding-allocation-definition
+                                    frontend
+                                    (method-entry/selected-parameter-carriers
+                                     operation implementation-op (count arguments))
+                                    (conj visited [v current-implementation]))))
+                  {:keys [parameters parameter-tags constructor]} definition
+                  signature (delay (when dispatch?
+                                     (method-entry/live-selected-parameter-carriers
+                                      operation implementation-op (count arguments))))
+                  argument-plan
+                  (fn [index argument tag]
+                    (let [array? (types/array-tag? tag)
+                          expected (if array? (dtype/dtype-for-array-tag tag)
+                                     (dtype/dtype-for-scalar-tag tag))
+                          actual (if (symbol? argument) (get values argument)
+                                     (allocation-literal-argument argument))]
+                      (when (and expected
+                                 (= array? (boolean (seq (:shape actual)))))
+                        (cond
+                          (= (dtype/canon expected) (:dtype actual))
+                          {:expression argument}
+
+                          (and (symbol? argument) (not array?)
+                               (= :int (:dtype actual)) (= :long (dtype/canon expected))
+                               (= Long/TYPE (get (:parameter-carriers @signature) index))
+                               (identical? v (get-in @signature [:definition :source-var]))
+                               (= [:exact :exact]
+                                  ((requiring-resolve
+                                    'raster.compiler.core.scalar-conversion/policy)
+                                   :int :long)))
+                          {:expression (list 'clojure.core/long argument)}))))
+                  plans (mapv argument-plan (range) arguments parameter-tags)]
+              (when (and definition (= (count parameters) (count arguments) (count parameter-tags))
+                         (every? some? plans)
+                         (identical? root (.getRawRoot ^clojure.lang.Var v))
+                         (identical? v (:source-var (select!)))
+                         (identical? current-implementation
+                                     (get-in (select!) [:entry :typed-impl]))
+                         (every? method-entry/var-snapshot-current? observations)
+                         (identical? metadata (meta v)))
+                (let [substitute (requiring-resolve 'raster.compiler.core.util/subst-syms)
+                      projected (substitute (zipmap parameters (map :expression plans)) constructor)
+                      realized (allocation-initialization (semantic-op projected))
+                      public (or (allocation-initialization operation) realized)]
+                  (when (and (array-allocation-size projected) realized
+                             (public-allocation-initialization-valid? public realized))
+                    {:constructor projected
+                     ;; Keep the actual JVM constructor observation separate from
+                     ;; the outer source allocator's deliberately weaker contract.
+                     :public-initialization public
+                     :realized-initialization realized
+                     :helper {:operation operation :implementation implementation-op
+                              :definition definition :arguments arguments}})))))))))))
+
 (defn direct-allocation-projection
   "Project an exact constructor or a definition-derived direct allocation helper.
 
@@ -865,72 +1113,37 @@
    or reorder call-argument effects. Returned helper data
    is correspondence material, not a frozen-definition/completion certificate."
   [expression values]
-  (if (array-allocation-size expression)
-    {:constructor expression}
-    (let [{:keys [implementation-op arguments lexical-callee dispatch? semantic-op]} (call-description expression)
-          operation (if dispatch? (or semantic-op (mangled/impl->op implementation-op))
-                        (or (mangled/impl->op implementation-op) semantic-op))
-          select! #(if dispatch?
-                     (method-entry/selected-definition operation implementation-op (count arguments))
-                     (method-entry/direct-selected-definition operation implementation-op (count arguments)))]
-      (when (and (not lexical-callee) (symbol? implementation-op) (namespace implementation-op)
-                 (every? #(or (and (symbol? %) (contains? values %))
-                              (allocation-literal-argument %)) arguments))
-        ;; Mangling is only a lookup address. The existing registered MethodEntry must prove
-        ;; the exact executable receiver and delegated source; no overload is inferred here.
-        (when-let [{v :source-var} (select!)]
-          (when (and (var? v) (:raster.core/deftm (meta v)))
-            ;; Lazy walking may publish metadata. Complete that compiler-owned analysis before
-            ;; snapshotting the definition rather than making admission depend on REPL warmth.
-            (when-not (:raster.core/deftm-walked-body (meta v))
-              ((requiring-resolve 'raster.core/ensure-walked-body!) v))
-            (let [root (.getRawRoot ^clojure.lang.Var v)
-                  metadata (meta v)
-                  selected (select!)
-                  observations (mapv method-entry/var-snapshot
-                                     (distinct (keep #(get selected %) [:source-var :generic-var :receiver-var])))
-                  definition (:direct-allocation (detect-auto-buffer-semantics v))
-                  {:keys [parameters parameter-tags constructor]} definition
-                  signature (delay (when dispatch?
-                                     (method-entry/live-selected-parameter-carriers
-                                      operation implementation-op (count arguments))))
-                  argument-plan (fn [index argument tag]
-                                (let [array? (types/array-tag? tag)
-                                      expected (if array? (dtype/dtype-for-array-tag tag)
-                                                   (dtype/dtype-for-scalar-tag tag))
-                                      actual (if (symbol? argument) (get values argument)
-                                                 (allocation-literal-argument argument))]
-                                  (when (and expected
-                                             (= array? (boolean (seq (:shape actual)))))
-                                    (cond
-                                      (= (dtype/canon expected) (:dtype actual))
-                                      {:expression argument}
+  (let [project #(direct-allocation-projection-in-context expression values [])]
+    ;; A retained forwarding proof needs a complete request-local definition
+    ;; owner. Enclosing compiler owners keep its history; standalone validation
+    ;; rederives and checks a fresh owner on every call rather than caching proof.
+    (if method-entry/*emission-inputs*
+      (project)
+      (method-entry/call-with-definition-inputs project))))
 
-                                      ;; A bound Int may enter an already selected primitive
-                                      ;; Long invk. Preserve its exact widening in the projected
-                                      ;; constructor, without retagging the Int or adapting IFn,
-                                      ;; literal, Object, floating or narrowing entry contexts.
-                                      (and (symbol? argument) (not array?)
-                                           (= :int (:dtype actual)) (= :long (dtype/canon expected))
-                                           (= Long/TYPE (get (:parameter-carriers @signature) index))
-                                           (identical? v (get-in @signature [:definition :source-var]))
-                                           (= [:exact :exact]
-                                              ((requiring-resolve 'raster.compiler.core.scalar-conversion/policy)
-                                               :int :long)))
-                                      {:expression (list 'clojure.core/long argument)}))))
-                  plans (mapv argument-plan (range) arguments parameter-tags)]
-              (when (and definition (= (count parameters) (count arguments) (count parameter-tags))
-                         (every? some? plans)
-                         (identical? root (.getRawRoot ^clojure.lang.Var v))
-                         (identical? v (:source-var (select!)))
-                         (every? method-entry/var-snapshot-current? observations)
-                         (identical? metadata (meta v)))
-                (let [substitute (requiring-resolve 'raster.compiler.core.util/subst-syms)
-                      projected (substitute (zipmap parameters (map :expression plans)) constructor)]
-                  (when (array-allocation-size projected)
-                    {:constructor projected
-                     :helper {:operation operation :implementation implementation-op :definition definition
-                              :arguments arguments}}))))))))))
+(defn ^:no-doc allocation-projection-initializations
+  "Validate the two initialization facets of one freshly rederived allocation
+   projection. The concrete constructor owns execution behavior; an exact helper
+   selection may expose a deliberately weaker public allocation contract. This
+   validates correspondence data only and never grants initialized readiness by
+   itself. Retained callers must still rederive the whole source projection and
+   check its original definition history."
+  [{:keys [constructor helper public-initialization realized-initialization]}]
+  (let [realized (allocation-initialization (semantic-op constructor))
+        public-operation (or (:operation helper) (semantic-op constructor))
+        ;; A named allocator may deliberately weaken its concrete constructor.
+        ;; Otherwise preserve the historical exact-constructor behavior for an
+        ;; authenticated custom direct helper.
+        public (or (allocation-initialization public-operation) realized)]
+    (when (and (array-allocation-size constructor) realized public
+               (public-allocation-initialization-valid? public realized)
+               (= realized realized-initialization)
+               (= public public-initialization)
+               (or (nil? helper)
+                   (and (map? helper) (map? (:definition helper))
+                        (symbol? (:implementation helper))
+                        (vector? (:arguments helper)))))
+      {:public public :realized realized})))
 
 (defn- unwrap-array-arg
   "Unwrap a cast wrapper around an array argument — (double arr) → arr,

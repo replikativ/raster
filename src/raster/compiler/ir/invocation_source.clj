@@ -439,11 +439,17 @@
   (when-let [{:keys [constructor] :as projection}
              (descriptor/direct-allocation-projection expression values)]
     (let [operation (descriptor/semantic-op constructor)
-          tag (get descriptor/alloc-sym->array-tag operation)]
-      (when tag
+          tag (get descriptor/alloc-sym->array-tag operation)
+          initializations (descriptor/allocation-projection-initializations projection)]
+      (when (and tag initializations)
         (assoc projection :extent (descriptor/array-allocation-size constructor)
                           :dtype (some-> tag dtype/dtype-for-array-tag dtype/canon)
-                          :initialization (descriptor/allocation-initialization operation))))))
+                          ;; The executable leaf may be a zeroing JVM constructor
+                          ;; while its authenticated outer allocator deliberately
+                          ;; promises only fresh unspecified storage. Keep both;
+                          ;; readiness follows the public source contract.
+                          :initialization (:public initializations)
+                          :realized-initialization (:realized initializations))))))
 
 (defn- same-integral-extent? [source dimension values]
   (or (semantic/retained-source-equivalent? source dimension)

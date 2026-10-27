@@ -39,6 +39,13 @@
         result (par/map! out i 1 float (+ (aget out i) 1.0))]
     result))
 
+(deftm helper-source-unspecified-observed
+  [x :- (Array double), early :- (Array double), n :- Long] :- (Array double)
+  (let [written (par/map! early i 1 double (+ (aget x i) 1.0))
+        out (arrays/alloc-like x n)
+        result (par/map! out i n double (+ (aget x i) 1.0))]
+    result))
+
 (deftm preserved-scalar-between-writes
   [x :- (Array double), out :- (Array double), n :- Long] :- (Array double)
   (let [written (par/map! out i 1 double (+ (aget x i) 1.0))
@@ -88,6 +95,22 @@
     (is (= :float (:dtype projection)))
     (is (= 1 (last (get-in projection [:helper :arguments]))))
     (is (= 'clojure.core/float-array (first (:constructor projection))))))
+
+(deftest delegated-allocation-keeps-the-public-unspecified-initialization
+  (let [[program plan] (compilation #'helper-source-unspecified-observed :double)
+        order (invocation/source-order plan program)
+        step (first (filter #(= 'out (:symbol %)) (:steps plan)))
+        allocation (first (filter #(= 'out (:storage %)) order))
+        expression (:source-expression
+                    (first (filter #(= 'out (:destination %))
+                                   (get-in program [:attributes :allocations]))))
+        projection (source/allocation-source expression (:values program))]
+    (is (= :unspecified (:initialization step)))
+    (is (= :unspecified (:initialization projection)))
+    (is (= :zero (:realized-initialization projection)))
+    (is (= 'out (:storage allocation)))
+    (is (= 'raster.arrays/alloc-like (get-in projection [:helper :operation])))
+    (is (= 'clojure.core/double-array (first (:constructor projection))))))
 
 (deftest source-position-is-not-the-dependency-pruned-prefix-ordinal
   (let [[program plan] (compilation #'write-before-shape :double)
