@@ -2699,18 +2699,20 @@
   type)
 
 (defn- emit-arith-op
-  "Emit ordinary arithmetic for the given type and op string. Plain long add/subtract/multiply
-   preserve Clojure's checked semantics; explicit unchecked forms have separate emitters below."
+  "Realize the shared actual-carrier arithmetic policy using JVM instructions.
+   Explicit unchecked forms have separate emitters below."
   [code op type]
-  (case type
-    (:int :bool) (case op "+" (.iadd code) "-" (.isub code) "*" (.imul code) "/" (.idiv code))
-    :long   (if (= op "/")
-              (.ldiv code)
-              (.invokestatic code math-cd
-                             (case op "+" "addExact" "-" "subtractExact" "*" "multiplyExact")
-                             (MethodTypeDesc/of J-cd (into-array ClassDesc [J-cd J-cd]))))
-    :float  (case op "+" (.fadd code) "-" (.fsub code) "*" (.fmul code) "/" (.fdiv code))
-    :double (case op "+" (.dadd code) "-" (.dsub code) "*" (.dmul code) "/" (.ddiv code))))
+  (let [{:keys [carrier overflow]} (source-arithmetic/primitive-operation-policy op type)]
+    (case overflow
+      :trap (.invokestatic code math-cd
+                           (case op "+" "addExact" "-" "subtractExact" "*" "multiplyExact")
+                           (MethodTypeDesc/of J-cd (into-array ClassDesc [J-cd J-cd])))
+      :wrap (case carrier
+              :int (case op "+" (.iadd code) "-" (.isub code) "*" (.imul code) "/" (.idiv code))
+              :long (.ldiv code))
+      :ieee-754 (case carrier
+                  :float (case op "+" (.fadd code) "-" (.fsub code) "*" (.fmul code) "/" (.fdiv code))
+                  :double (case op "+" (.dadd code) "-" (.dsub code) "*" (.dmul code) "/" (.ddiv code))))))
 
 (defn- emit-arithmetic
   "Emit arithmetic from actual operand carriers, never logical result hints.

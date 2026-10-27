@@ -65,6 +65,29 @@
           :let [result (if (= [:float :float] [left right]) :float :double)]]
     (is (= result (:result-carrier (arithmetic/binary-plan "/" left right))))))
 
+(deftest primitive-operation-policy-is-width-specific-not-a-source-call-proof
+  (doseq [operator ["+" "-" "*"]
+          carrier [:int :bool :long]]
+    (is (= {:carrier (if (= carrier :bool) :int carrier)
+            :overflow (if (= carrier :long) :trap :wrap)}
+           (arithmetic/primitive-operation-policy operator carrier))))
+  (doseq [carrier [:int :bool :long]]
+    (is (= {:carrier (if (= carrier :bool) :int carrier) :overflow :wrap
+            :rounding :toward-zero :divide-by-zero :trap}
+           (arithmetic/primitive-operation-policy "/" carrier))
+        "MIN/-1 wraps; divide-by-zero is a separate trapping obligation"))
+  (doseq [operator ["+" "-" "*" "/"] carrier [:float :double]]
+    (is (= (cond-> {:carrier carrier :overflow :ieee-754 :rounding :nearest-even}
+             (= operator "/") (assoc :divide-by-zero :ieee-754))
+           (arithmetic/primitive-operation-policy operator carrier))))
+  (is (= :double (:result-carrier (arithmetic/binary-plan "/" :long :long)))
+      "an integral instruction policy does not change source division promotion")
+  (doseq [[operator carrier] [["negate" :long] ["unchecked-add" :long]
+                             ["+" :ref] ["+" nil] ["*" :Long] ["quot" :long]]]
+    (is (= :unsupported-primitive-source-arithmetic
+           (try (arithmetic/primitive-operation-policy operator carrier) nil
+                (catch clojure.lang.ExceptionInfo failure (:reason (ex-data failure))))))))
+
 (deftest generic-recipes-name-real-numbers-overloads
   (let [classes {:long Long/TYPE :double Double/TYPE :ref Object}
         normalize {:int :long :long :long :float :double :double :double

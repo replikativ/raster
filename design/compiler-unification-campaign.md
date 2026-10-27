@@ -107,6 +107,14 @@ allocation under buffer reuse; no Class/presence fact waives them. The new
 bounded adapter explicitly refuses unsupported null/reuse cases before native
 allocation, rather than silently inventing nonnull/fresh storage.
 
+The primitive arithmetic policy is now shared by the source planner and JVM
+instruction emitter: Int wrapping, checked Long arithmetic, primitive division
+and IEEE behavior are selected from actual completed carriers. Source-call
+selection and operand completion remain separate obligations. The two affected
+namespaces pass 22 tests / 1,532 assertions, including actual emitted behavior.
+This refactor does not provide arithmetic occurrence evidence or native failure
+propagation; those remain the next producer/consumer prerequisites.
+
 The shared hardware-free output fixture now constructs a valid effect-checked
 plan, exact buffer/view geometry, and an initially uncompleted owner. Storage and
 resident-state tests acquire receipts only after public `link/run!`; no replay
