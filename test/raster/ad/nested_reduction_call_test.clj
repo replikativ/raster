@@ -1,6 +1,6 @@
 (ns raster.ad.nested-reduction-call-test
-  "External MMM boundary: retain analytic oracles for future helper composition
-   and refuse an unowned derived pullback before runtime execution."
+  "External MMM boundary: analytic and finite-difference oracles for helper
+   composition over retained array roots and completed scalar inputs."
   (:require [clojure.test :refer [deftest is]]
             [raster.core :refer [deftm]]
             [raster.numeric :as n]
@@ -47,15 +47,36 @@
         (is (= theta (vec th)))
         (is (= values (vec xs)))))))
 
-(deftest unowned-helper-pullback-refuses-during-derivation-not-at-invocation
-  ;; This is a safety regression, NOT nested-helper AD acceptance. Keep the
-  ;; numerical oracle above for the future forward-owned residual implementation.
-  (doseq [v [#'vector-pair #'compound-vector-pair]
-          options [[] [:wrt [0]]]]
-    (let [error (try (apply reverse/value+grad v options)
-                     (catch clojure.lang.ExceptionInfo e e))]
-      (is (instance? clojure.lang.ExceptionInfo error))
-      (is (= :ad-unowned-derived-pullback (:reason (ex-data error))))
-      (is (= :bytecode-input-completion (:scope (ex-data error))))
-      (is (seq (:active (ex-data error))))
-      (is (seq (:form (ex-data error)))))))
+(deftest owned-helper-pullbacks-match-analytic-and-finite-difference-oracles
+  ;; Stable retained array ports now discharge their redundant CHECKCASTs.
+  ;; This replaces the former refusal expectation with numerical acceptance;
+  ;; unverified/compound reference refusals remain in owned-inactive-input-test.
+  (doseq [[source compound?] [[#'vector-pair false] [#'compound-vector-pair true]]
+          selected? [false true]]
+    (let [gradient (if selected? (reverse/value+grad source :wrt [0])
+                       (reverse/value+grad source))]
+      (doseq [[theta values] [[[2.0 3.0] [1.0 2.0]]
+                              [[-1.5 0.25] [4.0 -2.0 3.0]]
+                              [[4.0 -3.0] []]]]
+        (let [[a b] theta
+              th (double-array theta) xs (double-array values) cnt (count values)
+              total (reduce + 0.0 (map #(+ (if compound? 0.5 b) %) values))
+              scale (if compound? (* a a) a)
+              expected (* scale total)
+              expected-gradient (if compound? [(* 2.0 a total) 0.0] [total (* a cnt)])
+              [value actual-gradient data-gradient count-gradient] (gradient th xs cnt)]
+          (is (= expected (source th xs cnt) value))
+          (is (= expected-gradient (vec actual-gradient)))
+          (is (nil? count-gradient))
+          (if selected?
+            (is (nil? data-gradient))
+            (is (= (vec (repeat cnt scale)) (vec data-gradient))))
+          (doseq [coordinate (range 2)]
+            (let [plus (aclone th) minus (aclone th) h 1.0e-5]
+              (aset plus coordinate (+ (aget th coordinate) h))
+              (aset minus coordinate (- (aget th coordinate) h))
+              (is (< (Math/abs (- (aget actual-gradient coordinate)
+                                  (/ (- (source plus xs cnt) (source minus xs cnt)) (* 2.0 h))))
+                     1.0e-7))))
+          (is (= theta (vec th)))
+          (is (= values (vec xs))))))))

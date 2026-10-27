@@ -4,23 +4,29 @@
 
 ### Current boundary ledger
 
-Latest completed unit/CPU accounting, `9fa741b79` (October 27): unit job 35165
-and CPU-OpenCL job 35161 fail; this branch is not merge-ready. The newer pushed
-array-identity checkpoint `406740f2f` also has red unit/CPU checks; its detailed
-failure inventory is not yet reconciled here.
-All sixteen unit shards complete: 7,659 tests, 95,156 passing assertions, 22 failures and 28
-errors across 39 failing Vars. CPU-OpenCL has all four completed shards: 676
+Latest completed unit/CPU accounting, `406740f2f` (October 27): unit job 35168
+and CPU-OpenCL job 35172 fail; this branch is not merge-ready. Later checkpoints
+require their own exact-head qualification.
+All sixteen unit shards complete: 7,660 tests, 95,142 passing assertions, 42 failures and 28
+errors across 40 failing Vars. CPU-OpenCL has all four completed shards: 676
 tests, 8,617 passing assertions, 6 failures and 27 errors across 31 failing Vars.
-Setup, build and emitted-source checks pass at this checkpoint; the last
-completed CUDA/HIP gates passed at `be3adbe0a`. Compiler-only
+Setup, build, emitted-source, CUDA and HIP compiler checks pass at this checkpoint. Compiler-only
 vendor checks do not establish native execution or waive the failed unit/device
 gates. These complete reports supersede the older incomplete checkpoint counts
 below; failure-count changes against incomplete shards are not regression or
 test-removal measurements. The source-capacity alias refusals remain under
 investigation; completed-boundary fixture repairs are locally qualified below.
-The constructor/inactive-input checkpoint adds nine tests and 53 passing
-assertions without losing any previously observed Var or assertion; the same
-39 unit and 31 CPU failing Vars remain. This is not a failure waiver.
+The preceding constructor/inactive-input checkpoint adds nine tests and 53
+passing assertions without losing any previously observed Var or assertion.
+The array-identity checkpoint replaces one narrower refusal test and adds a
+positive array-root test. Its additional 20 failures all come from the older
+nested-MMM test still expecting the now-owned helper cases to refuse. That
+expectation is now replaced by analytic and finite-difference acceptance,
+including default/selected gradients, empty reductions and unchanged inputs.
+The five affected AD namespaces pass 43 tests / 718 assertions with the
+committed inliner. Unknown Object/compound-array and active-discrete refusals
+remain independently tested. The other 39 unit and 31 CPU failing Vars are
+still unqualified; this test migration does not waive them.
 
 The shared hardware-free output fixture now constructs a valid effect-checked
 plan, exact buffer/view geometry, and an initially uncompleted owner. Storage and
