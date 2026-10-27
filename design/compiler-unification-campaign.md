@@ -13,6 +13,15 @@ repairs, not accepted performance regressions or waived tests. CPU35357 complete
 all4 shards:682 tests /7,635 pass /20 failures /73 errors across79 failing Vars.
 Emission remains red; missing vendor checks are not passes. No merge/release.
 
+Protected numerical source is not JVM-executable source evidence. Optional input
+frame projection now abstains before physical preparation when an executable
+protected operation is present (quoted data stays inert). It leaves the source
+and semantic validation unchanged; required final adapter validation is not
+suppressed. The boundary/owner controls pass2tests/13assertions, and the real
+attention/projection fixture compiles again. General completions spanning such
+protected operations still require an explicit owned region witness; moving a
+projection earlier alone cannot establish final-source correspondence.
+
 The integral-count follow-up preserves actual JVM Int narrowing separately from
 checked source arithmetic and mathematical capacity. Focused bytecode/source
 tests pass41/686; existing completion/plan regressions pass17/337, with existing

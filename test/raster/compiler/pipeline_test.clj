@@ -8,6 +8,8 @@
             [raster.compiler.passes.scalar.inline :as inline]
             [raster.compiler.passes.scalar.soa-lower :as soa-lower]
             [raster.compiler.passes.scalar.local-products :as local-products]
+            [raster.compiler.passes.scalar.source-import :as source-import]
+            [raster.compiler.ir.segmented-weighted-reduction :as swr]
             [raster.compiler.passes.parallel.structured-control-route :as structured-route]
             [raster.compiler.passes.parallel.typed-soac-route :as typed-route]
             [raster.compiler.ir.semantic-fingerprint :as semantic-fingerprint]
@@ -29,6 +31,32 @@
      #'pipeline/carry-void-binding-contracts identity
      #'pipeline/record-fixpoint-census! (fn [& _])}
     #(run! input))))
+
+(deftest optional-input-frames-do-not-emit-protected-numerical-source
+  (let [plain '(let* [scratch (clojure.core/float-array (clojure.core/* width width))] scratch)
+        marker '(raster.compiler/segmented-weighted-reduction! scratch [] [])
+        protected (list 'let* (into (second plain) ['result marker]) 'result)
+        preparations (atom 0)
+        stopped (Exception. "reached physical source preparation")
+        construct (#'pipeline/contextual-reduction-constructor {:source-var #'identity})]
+    (is (source-import/contextual-invocation-argument-candidate? plain))
+    (is (source-import/contextual-invocation-argument-candidate? protected))
+    (with-redefs [method-entry/demand-original-source-frontend! (fn [_] {})
+                  source-import/prepare-contextual-source-witness
+                  (fn [& _] (swap! preparations inc) (throw stopped))]
+      (is (nil? (construct {:kind :ordered-invocation-arguments :source protected})))
+      (is (zero? @preparations))
+      (is (identical? stopped
+                      (try (construct {:kind :ordered-invocation-arguments :source plain})
+                           nil (catch Exception failure failure))))
+      (is (= 1 @preparations)))
+    (is (not (#'pipeline/protected-semantic-source? (list 'quote marker))))
+    (is (not (#'pipeline/protected-semantic-source? (list 'clojure.core/quote marker))))
+    ;; Abstaining cannot certify even this correctly shaped but proof-free
+    ;; marker. The unchanged semantic validator still refuses it.
+    (is (= :segmented-reduction-marker-missing-plan
+           (try (swr/protected-marker-plan marker :float) nil
+                (catch clojure.lang.ExceptionInfo failure (:reason (ex-data failure))))))))
 
 (deftest gpu-target-metadata-does-not-authorize-source-construction
   (let [constructed (atom 0)

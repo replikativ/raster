@@ -944,6 +944,17 @@
 
 (def ^:private ^:dynamic *gpu-source-construction* false)
 
+(defn- protected-semantic-source?
+  "A protected numerical operation is not an executable JVM source witness.
+   Quoted data is inert. This is only an abstention boundary for optional source
+   normalization, never validation or permission to execute a protected plan."
+  [source]
+  (cond
+    (and (seq? source) (contains? '#{quote clojure.core/quote} (first source))) false
+    (swr-fuse/marker? source) true
+    (coll? source) (boolean (some protected-semantic-source? source))
+    :else false))
+
 (defn- contextual-reduction-constructor
   "One attempt-local owner service shared by map projection and reductions.
    Each exact current source candidate has at most one witness, not one per call."
@@ -978,7 +989,12 @@
           (source-import/project-contextual-reference-helpers (owner! source)))
 
         (= kind :ordered-invocation-arguments)
-        (when (source-import/contextual-invocation-argument-candidate? source)
+        (when (and (source-import/contextual-invocation-argument-candidate? source)
+                   (not (protected-semantic-source? source)))
+          ;; The current source may already contain schedule-neutral protected
+          ;; operations. Keep it unchanged rather than physically emitting a
+          ;; compiler marker to invent a JVM observation. Required final source
+          ;; adapters still need their own exact executable witness.
           (source-import/project-contextual-invocation-arguments (owner! source) {:required? true}))
 
         (= kind :checked-array-length-source)
