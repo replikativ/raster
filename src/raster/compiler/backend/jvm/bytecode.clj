@@ -1521,6 +1521,35 @@
     (when-let [observed (retained-floating-conversion emission owned)]
       (assoc observed :source-input original))))
 
+(defn ^:no-doc retained-arithmetic
+  "Observe one actual binary primitive core-inline emission. The caller must
+   FIRST authenticate the module at its original emitter/receiver boundary:
+   occurrence identity and historical freshness do not seal an editable map.
+   Operand evaluation, conversions and operation policy are distinct. This
+   grants no purity, totality, motion, numerical projection or execution rights.
+   Generic Numbers, unary, n-ary and unchecked operations have no observation."
+  [emission original]
+  (retained-call-observation emission original :arithmetic-contexts))
+
+(defn ^:no-doc retained-input-arithmetic
+  "Follow the existing exact input-origin edge of an authenticated module.
+   Equal/copied source is not an original arithmetic occurrence."
+  [emission input-body original]
+  (when-let [owned (input-origin emission input-body original :invocation)]
+    (when-let [observed (retained-arithmetic emission owned)]
+      (assoc observed :source-input original))))
+
+(defn ^:no-doc observed-frontend-arithmetic
+  "Authenticate the original receiver-owned module before observing arithmetic.
+   The source body comes only from that frontend; successful queries retain the
+   module's original dependency history in the enclosing definition owner.
+   Never prepares/emits code and never accepts a standalone policy as evidence."
+  [frontend original]
+  (me/call-with-optional-definition-inputs
+   (fn []
+     (when-let [emission (me/observed-frontend-emission frontend)]
+       (retained-input-arithmetic emission (:body frontend) original)))))
+
 (defn- comparison-form?
   "True if form is a comparison call: (< a b), (>= a b), (== a b), etc."
   [form]
@@ -2702,7 +2731,7 @@
   "Realize the shared actual-carrier arithmetic policy using JVM instructions.
    Explicit unchecked forms have separate emitters below."
   [code op type]
-  (let [{:keys [carrier overflow]} (source-arithmetic/primitive-operation-policy op type)]
+  (let [{:keys [carrier overflow] :as policy} (source-arithmetic/primitive-operation-policy op type)]
     (case overflow
       :trap (.invokestatic code math-cd
                            (case op "+" "addExact" "-" "subtractExact" "*" "multiplyExact")
@@ -2712,7 +2741,31 @@
               :long (.ldiv code))
       :ieee-754 (case carrier
                   :float (case op "+" (.fadd code) "-" (.fsub code) "*" (.fmul code) "/" (.fdiv code))
-                  :double (case op "+" (.dadd code) "-" (.dsub code) "*" (.dmul code) "/" (.ddiv code))))))
+                  :double (case op "+" (.dadd code) "-" (.dsub code) "*" (.dmul code) "/" (.ddiv code))))
+    policy))
+
+(defn- retain-binary-arithmetic!
+  "Record decisions already consumed by this actual emission, not a second
+   inference pass. Both operands were evaluated before right-then-left primitive
+   coercions; identity completions issue no conversion instruction."
+  [ctx operator arguments raw-carriers plan policy locals]
+  (when (and (= 2 (count arguments)) me/*emission-inputs* (::call-occurrence ctx))
+    (let [completed (:input-carriers plan)
+          inputs (mapv #(physical-operand-input % locals ctx) arguments)
+          completions (mapv (fn [operand raw target]
+                              {:operand operand :emitted-type raw :completed-type target
+                               :adaptation (if (= raw target) :identity :jvm-primitive-coercion)})
+                            arguments raw-carriers completed)]
+      (retain-call-observation!
+       ctx :arithmetic-contexts
+       {:status :known :operator operator :inputs inputs
+        :input-completions completions
+        :evaluation-order [0 1]
+        :completion-order (filterv #(not= (nth raw-carriers %) (nth completed %)) [1 0])
+        :result-carrier (:result-carrier plan) :policy policy
+        :context (completion/bytecode-operand-context ctx)
+        :source-policy (source-policy/capture)}
+       :repeated-emitted-arithmetic-context))))
 
 (defn- emit-arithmetic
   "Emit arithmetic from actual operand carriers, never logical result hints.
@@ -2799,7 +2852,8 @@
                     (case target
                       :double (.dload code tmp) :long (.lload code tmp)
                       :float (.fload code tmp) (:int :bool) (.iload code tmp))))
-                (emit-arith-op code op target)
+                (let [policy (emit-arith-op code op target)]
+                  (retain-binary-arithmetic! ctx op args [cur t2] plan policy locals))
                 (recur (rest remaining) target)))))))))
 
 (defn- emit-comparison

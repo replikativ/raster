@@ -410,6 +410,7 @@
                     :completion-catalog completion-catalog
                     :completion-contexts (:completion-contexts @inputs)
                     :floating-conversion-contexts (:floating-conversion-contexts @inputs)
+                    :arithmetic-contexts (:arithmetic-contexts @inputs)
                     :array-read-contexts (:array-read-contexts @inputs)
                     :array-allocation-contexts (:array-allocation-contexts @inputs)
                     :reduction-catalog reduction-catalog

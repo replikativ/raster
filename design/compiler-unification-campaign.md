@@ -112,8 +112,16 @@ instruction emitter: Int wrapping, checked Long arithmetic, primitive division
 and IEEE behavior are selected from actual completed carriers. Source-call
 selection and operand completion remain separate obligations. The two affected
 namespaces pass 22 tests / 1,532 assertions, including actual emitted behavior.
-This refactor does not provide arithmetic occurrence evidence or native failure
-propagation; those remain the next producer/consumer prerequisites.
+Actual binary primitive emission now retains its original operand regions,
+evaluation/conversion order, completed carriers and consumed arithmetic policy.
+The frontend query authenticates the original receiver-owned module before
+following exact occurrence provenance and dependency history. Copied modules,
+foreign occurrences, repeated emission and stale dependencies grant no facts.
+Generic, unary, n-ary and unchecked paths deliberately abstain. The new observer
+and shared-policy suites pass 28 tests / 1,677 assertions; four affected return,
+array-index and input-completion namespaces pass 52 / 1,247. These observations
+are not purity, totality, bounds, motion or native-execution permission. Native
+checked failure propagation and array-store observations remain open.
 
 The shared hardware-free output fixture now constructs a valid effect-checked
 plan, exact buffer/view geometry, and an initially uncompleted owner. Storage and
