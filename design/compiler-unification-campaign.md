@@ -99,9 +99,25 @@ inventory rejects any invocation identity shared with another site, including
 an otherwise skipped scope. Four focused tests pass 50 assertions. The history
 gate passes 34 / 300 with all two/sixteen independent calls expanded exactly once
 and a constant inherited-history fence count; arithmetic, gather, reference and
-AD gates also remain green. Independent review found no blocker. Heat now has
-both sequential call plans but still lacks a complete owned numerical projection
-of its helper bodies: a plan alone is not successful GPU compilation.
+AD gates also remain green. Independent review found no blocker in the context
+factor, but follow-up review found that a Method/result alone cannot justify
+exposing subsequent call targets across an earlier helper's unknown effects.
+Heat still lacks a complete owned numerical projection and prefix-stability
+proof for its helper bodies: a plan alone is not successful GPU compilation.
+
+Substitution now retains unknown reference→primitive calls, whose Number
+conversion can execute user code before runtime invokedynamic selects its target.
+Independently selected suffix calls also require a current owned body in a tiny
+callback-free leaf/identity/literal/empty-let/do domain and a closed return bridge.
+Neither nominal purity nor owning executable bytecode grants this capability.
+Opaque effects and unknown helper bodies stop the suffix; primitive array writes
+need their checked numerical/effect closure before broader continuation is legal.
+Real cold/warm callback and two-helper mutation controls reproduce sixteen wrong
+value/event assertions with the old collector; the fix passes 5 tests / 50
+assertions. Safe sequential planning still passes 4 / 50 with genuine source-body
+readiness, and the inherited-history gate passes 34 / 300. Primitive Float
+rounding, boxed identity and nullable/unused array checks remain covered. No new
+function-purity registry or runtime target restamping is introduced.
 
 The next source closure must combine request-local cold readiness with a verified
 projection of complete result-context regions. Queries must remain non-preparing;

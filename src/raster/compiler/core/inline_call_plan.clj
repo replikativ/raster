@@ -65,6 +65,19 @@
       (visit source))
     counts))
 
+(defn- substitution-inputs? [inputs]
+  ;; A global typed invocation selects its runtime target AFTER completing
+  ;; arguments. Number.xxxValue on an unknown reference can run user code
+  ;; which changes that target; substituting the previously selected body
+  ;; would freeze it too early. Keep those calls intact. This restriction is
+  ;; for substitution only, not for the faithful bytecode input planner.
+  (not-any? (fn [{:keys [raw-carrier parameter-class]}]
+              (and (= :ref raw-carrier)
+                   (.isPrimitive ^Class parameter-class)))
+            inputs))
+
+(declare stable-call-prefix?)
+
 (defn call-plans [scope source]
   (let [plans (java.util.IdentityHashMap.)
         occurrences (when scope (invocation-occurrence-counts source))
@@ -85,11 +98,15 @@
                                      (nil? (:primitive-result-class plan)))
                             (when-let [inputs ((get-in scope [:functions 'plan-resolved-invocation-inputs])
                                               (:method plan) arguments locals context)]
-                              (.put plans expression
-                                    (assoc call :inputs inputs :caller-policy (:policy scope)
-                                           :caller-context context :candidate source
-                                           :source-options (:source-options scope)))
-                              :ref)))))))
+                              (when (substitution-inputs? inputs)
+                                (let [planned (assoc call :inputs inputs :caller-policy (:policy scope)
+                                                     :caller-context context :candidate source
+                                                     :source-options (:source-options scope))]
+                                  (.put plans expression planned)
+                                  ;; Method/result knowledge does not close the
+                                  ;; callee's effects. It may change a later call's
+                                  ;; target before that later invocation executes.
+                                  (when (stable-call-prefix? scope planned) :ref))))))))))
               (initializer! [expression locals lexical context]
                 (or (raw-leaf scope expression locals context)
                     (call! expression locals lexical context)))
@@ -210,3 +227,54 @@
                      (or (not= :ref (:stack-type result-info)) (= :ref raw)))
             {:inputs (:inputs planned) :body-context (completion/bytecode-operand-context context)
              :body-raw raw :return-class return-class :return-stack (:stack-type result-info)}))))))
+
+(defn- closed-prefix-carrier
+  "A deliberately small callback-free source domain, not an effect registry.
+   Every evaluated prefix must close; global leaves, calls and nonempty lexical
+   bindings (whose inferred hints may initialize Classes) abstain. No macro/source execution."
+  [scope expression locals context]
+  (cond
+    (or (and (symbol? expression) (contains? locals expression))
+        (and (number? expression) (types/numeric-literal-carrier expression))
+        (nil? expression) (string? expression) (keyword? expression)
+        (boolean? expression) (char? expression))
+    (raw-leaf scope expression locals context)
+
+    (and (seq? expression) (= 'do (first expression)))
+    (let [forms (rest expression)]
+      (when (seq forms)
+        (loop [remaining forms]
+          (when-let [raw (closed-prefix-carrier scope (first remaining) locals context)]
+            (if (next remaining) (recur (next remaining)) raw)))))
+
+    (and (seq? expression) (contains? '#{let let*} (first expression))
+         (= [] (second expression))
+         (= 3 (count expression)))
+    (closed-prefix-carrier scope (nth expression 2) locals context)
+    :else nil))
+
+(defn- stable-call-prefix? [scope planned]
+  ;; Re-select the actual original owner; a Method alone never authorizes
+  ;; suffix planning. The ordinary whole-call proof also closes parameter and
+  ;; return bridges. Unknown code may still inline as the FIRST call, but cannot
+  ;; lend stability to later independently selected callees.
+  (when-let [source (get-in planned [:physical :definition :source-var])]
+    (when-let [frontend (entry/original-source-frontend source)]
+      (entry/assert-frontend-source! frontend source)
+      (let [lineage (:source-entry frontend)
+            parameters (:params lineage)
+            forms (:body frontend)
+            body (if (= 1 (count forms)) (first forms) (list* 'do forms))
+            locals ((get-in scope [:functions 'resolved-parameter-locals])
+                    (get-in planned [:physical :invocation-method]) parameters)
+            builtin (get-in scope [:functions 'builtin-jvm-info])
+            result (builtin (:return-tag lineage))
+            context (when result ((get-in scope [:functions 'source-evaluation-context])
+                                  ((get-in scope [:functions 'ordinary-evaluation-base]) (:source-ns lineage))
+                                  :method (:stack-type result)))]
+        (when (and context locals (closed-prefix-carrier scope body locals context))
+          (when-let [whole (whole-call scope planned
+                                      {:source-var source :original-frontend frontend :params parameters}
+                                      (:arguments planned) body)]
+            (not (and (= :ref (:body-raw whole))
+                      (.isPrimitive ^Class (:return-class whole))))))))))

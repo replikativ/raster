@@ -34,6 +34,10 @@
       {:raster.op/original operation})))
 
 (deftest sequential-sites-use-actual-emitter-contexts
+  ;; A Method closes one call's ABI, not the code effects of its body. Publish
+  ;; the real frozen source before asking whether this identity helper also
+  ;; permits independently selected calls in the suffix. No numerical execution.
+  (core/prepare-emission-source-walk! (core/resolve-deftm-var #'sequential-array-helper))
   (entry/call-with-definition-inputs
    (fn []
      (let [scope (plan/source-context (options #'sequential-array-owner))
@@ -61,6 +65,7 @@
          (is (= 'alias (get-in tail-plan [:inputs 0 :operand]))))))))
 
 (deftest sequential-sites-do-not-cross-unknown-or-ambiguous-boundaries
+  (core/prepare-emission-source-walk! (core/resolve-deftm-var #'sequential-array-helper))
   (entry/call-with-definition-inputs
    (fn []
      (let [scope (plan/source-context (options #'sequential-array-owner))
