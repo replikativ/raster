@@ -540,3 +540,22 @@
           (finally
             (when (instance? java.lang.AutoCloseable compiled)
               (.close ^java.lang.AutoCloseable compiled))))))))
+
+(deftest owned-boxed-entry-adapters-preserve-conversions-without-running-the-body
+  (binding [method-entry/*emission-inputs* nil]
+    (method-entry/call-with-definition-inputs
+     (fn []
+       (let [frontend (core/prepare-owned-source-frontend! (core/resolve-deftm-var #'effectful-allocation))
+             emission (method-entry/observed-frontend-emission frontend)
+             compile! (requiring-resolve 'raster.compiler.backend.jvm.bytecode/compile-boxed-entry-parameter-region)
+             array-input (compile! emission 0)
+             count-input (compile! emission 1)
+             counter (long-array [0])]
+         (is (identical? counter ((:invoke array-input) counter)))
+         (is (nil? ((:invoke array-input) nil)))
+         (is (= 7 ((:invoke count-input) (double 7.75))))
+         (is (= 0 (aget counter 0)))
+         (is (thrown? ClassCastException ((:invoke array-input) (double-array 0))))
+         (is (thrown? ClassCastException ((:invoke count-input) "wrong")))
+         (is (thrown? NullPointerException ((:invoke count-input) nil)))
+         (is (thrown? clojure.lang.ExceptionInfo (compile! emission 2))))))))

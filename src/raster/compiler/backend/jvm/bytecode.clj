@@ -7506,6 +7506,44 @@
     (guard)
     region))
 
+(defn ^:no-doc compile-boxed-entry-parameter-region
+  "Outline one actual generated IFn entry conversion, without its method body.
+   The original boxed-entry bridge supplies the parameter Class and conversion
+   recipe. Consumers must invoke these regions in parameter order BEFORE body
+   work. Reference results preserve identity and null; this grants no native
+   pointer, presence, storage or allocation permission."
+  [emission ordinal]
+  (let [bridge (retained-boxed-entry-bridge emission)
+        carriers (:parameter-carriers bridge)]
+    (when-not (and bridge (integer? ordinal) (<= 0 ordinal) (< ordinal (count carriers)))
+      (throw (ex-info "Entry outlining requires the original boxed parameter bridge"
+                      {:reason :unowned-boxed-entry-parameter :ordinal ordinal})))
+    (let [carrier (nth carriers ordinal)
+          contract (completion/bytecode-boxed-parameter-contract carrier)
+          operand (gensym "boxed_entry_input__")
+          token (Object.)
+          context (completion/bytecode-operand-context {})
+          recipe (vary-meta (completion/complete-value contract operand)
+                            assoc ::completion-occurrence token)
+          input {:ports {operand {:slot 0 :type :ref :reference-class Object :verified false}}
+                 :unretained-sibling-calls? false}
+          owner-guard (me/prepare-emission-input-guard! emission)
+          region (compile-planned-recipe-region
+                  emission input carrier recipe
+                  {:return-tag carrier :source-policy (get-in emission [:source-entry :source-policy])
+                   ::body-input-context context}
+                  owner-guard
+                  (fn [observations]
+                    (let [actual (get-in observations [:completion-contexts token])]
+                      (when-not (and (= :known (:status actual))
+                                     (= contract (:contract actual))
+                                     (= :ref (:input-carrier actual))
+                                     (= (class-type->stack carrier) (:completion-carrier actual)))
+                        (throw (ex-info "Entry region changed its actual parameter conversion"
+                                        {:reason :boxed-entry-parameter-carrier :ordinal ordinal}))))))]
+      (assoc region :entry-ordinal ordinal :entry-carrier carrier
+             :completion-contract contract))))
+
 (defn ^:no-doc compile-planned-completion-region
   "Compile a NEW bounded lexical or zero-port numeric Object completion under its owner.
    The trusted caller authenticates the actual operand port and observed carrier/
