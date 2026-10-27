@@ -414,6 +414,7 @@
                     :floating-conversion-contexts (:floating-conversion-contexts @inputs)
                     :arithmetic-contexts (:arithmetic-contexts @inputs)
                     :array-read-contexts (:array-read-contexts @inputs)
+                    :array-length-contexts (:array-length-contexts @inputs)
                     :array-allocation-contexts (:array-allocation-contexts @inputs)
                     :reduction-catalog reduction-catalog
                     :pmap-catalog pmap-catalog :pmap-expansions (:pmap-expansions @inputs)

@@ -3,7 +3,7 @@
             [raster.compiler.backend.jvm.bytecode :as bytecode]
             [raster.compiler.core.method-entry :as method-entry]
             [raster.tooling.inspect :as inspect]
-            [raster.core :refer [deftm]]
+            [raster.core :as core :refer [deftm]]
             [raster.compiler.core.types :as types]
             [raster.compiler.core.value-completion :as completion])
   (:import [java.lang.reflect InvocationTargetException Proxy InvocationHandler]))
@@ -24,6 +24,109 @@
            (fn [& arguments]
              (try (.invoke ^java.lang.reflect.Method method nil (object-array arguments))
                   (catch InvocationTargetException failure (throw (.getCause failure)))))))))
+
+(defn- emit-observed-value [tags expression]
+  (let [parameters (vec (take (count tags) '[x y]))
+        body [expression]
+        interface (types/ensure-fn-interface! tags)]
+    (assoc (core/emit-owned-bytecode!
+            bytecode/compile-typed-impl! "raster.compiled.ObjectObservation"
+            parameters tags 'Object body *ns* (:iface-name interface)
+            'object-observation)
+           :original-body body)))
+
+(deftest object-completion-observes-only-its-own-builtin-box-or-literal
+  (doseq [[tag value builtin raw] [['float (float 0.25) Float :float]
+                                 ['double 0.25 Double :double]]]
+    (let [expression (completion/complete-value completion/object-input-contract 'x)
+          {:keys [emission original-body implementation]} (emit-observed-value [tag] expression)
+          record (bytecode/retained-input-completion-context emission original-body expression)]
+      (is (= raw (:operand-before-box-carrier record)))
+      (is (= :ref (:input-carrier record) (:completion-carrier record)))
+      (is (= :builtin-box (:object-adaptation record)))
+      (is (= {:carrier Object :presence :present :builtin-class builtin} (:result-fact record)))
+      (is (= raw (get-in record [:operand-input :ports 'x :type])))
+      (is (= builtin (class (implementation value))))))
+  (doseq [literal [(Float. (float 0.125)) (Double. 0.125)]]
+    (let [expression (completion/complete-value completion/object-input-contract literal)
+          {:keys [emission original-body implementation]} (emit-observed-value [] expression)
+          record (bytecode/retained-input-completion-context emission original-body expression)]
+      (is (= :literal-reference (:object-adaptation record)))
+      (is (= :ref (:operand-before-box-carrier record)))
+      (is (= (class literal) (get-in record [:result-fact :builtin-class])))
+      (is (identical? literal (implementation)))
+      (is (identical? literal (implementation)))))
+  (doseq [[tags operand] [[['Object] 'x]
+                        [['float] '(do x)]
+                        [['double 'double] '(clojure.core/+ x y)]]]
+    (let [expression (completion/complete-value completion/object-input-contract operand)
+          {:keys [emission original-body]} (emit-observed-value tags expression)
+          record (bytecode/retained-input-completion-context emission original-body expression)]
+      (is (some? record))
+      (is (nil? (:result-fact record)) "an inner box or arbitrary reference supplies no root fact")
+      (is (nil? (:operand-before-box-carrier record)))))
+  (let [expression (completion/complete-value completion/object-input-contract 'x)
+        {:keys [emission original-body]} (emit-observed-value ['float] expression)]
+    (is (nil? (bytecode/retained-input-completion-context emission (mapv identity original-body) expression)))
+    (is (nil? (bytecode/retained-input-completion-context emission original-body (apply list expression))))))
+
+(deftest array-length-observation-requires-an-actual-opcode-not-reflective-dispatch
+  (let [operand (with-meta 'x {:tag 'doubles})
+        expression (list 'clojure.core/alength operand)
+        {:keys [emission original-body implementation]} (emit-observed-value ['Object] expression)
+        record (bytecode/retained-input-array-length emission original-body expression)]
+    (is (= :jvm-arraylength (:operation record)))
+    (is (= (class (double-array 0)) (:array-class record)))
+    (is (identical? (:array record) (get-in record [:input :operand])))
+    (is (= :ref (:input-carrier record) (:completed-carrier record)))
+    (is (= :checkcast (:adaptation record)))
+    (is (= :int (:result-carrier record)))
+    (is (= :ref (get-in record [:input :ports 'x :type])))
+    (is (= 0 (implementation (double-array 0))))
+    (is (= 3 (implementation (double-array 3))))
+    (is (thrown? NullPointerException (implementation nil)))
+    (is (thrown? ClassCastException (implementation "not an array")))
+    (is (not-any? #(contains? record %) [:pure? :nonnull? :total? :synchronization-free?]))
+    (is (nil? (bytecode/retained-input-array-length emission (mapv identity original-body) expression)))
+    (is (nil? (bytecode/retained-input-array-length emission original-body (apply list expression)))))
+  (let [expression '(clojure.core/alength x)
+        {:keys [emission original-body implementation]} (emit-observed-value ['Object] expression)]
+    (is (= 2 (implementation (long-array 2))))
+    (is (nil? (bytecode/retained-input-array-length emission original-body expression)))))
+
+(deftest integral-conversion-observations-keep-floating-query-domain-unchanged
+  (let [length-call (list 'clojure.core/alength (with-meta 'x {:tag 'doubles}))
+        expression (list 'clojure.core/long length-call)
+        {:keys [emission original-body implementation]} (emit-observed-value ['Object] expression)
+        record (bytecode/retained-input-scalar-conversion emission original-body expression)]
+    (is (= :int (:input-type record)))
+    (is (identical? Long/TYPE (:target-carrier record)))
+    (is (= :long (:result-carrier record)))
+    (is (= :source-cast (:conversion-kind record)))
+    (is (= 'clojure.core/long (:source-operation record)))
+    (is (= :ref (get-in record [:ports 'x :type])))
+    (is (= 3 (implementation (double-array 3))))
+    (is (some? (bytecode/retained-input-array-length emission original-body length-call)))
+    (is (nil? (bytecode/retained-input-floating-conversion emission original-body expression)))
+    (is (nil? (bytecode/retained-input-scalar-conversion emission (mapv identity original-body) expression)))
+    (is (nil? (bytecode/retained-input-scalar-conversion emission original-body (apply list expression)))))
+  (doseq [unchecked? [false true]]
+    (let [expression '(clojure.core/int x)
+          {:keys [emission original-body implementation]}
+          (binding [*unchecked-math* unchecked?] (emit-observed-value ['long] expression))
+          record (bytecode/retained-input-scalar-conversion emission original-body expression)]
+      (is (= :long (:input-type record)))
+      (is (identical? Integer/TYPE (:target-carrier record)))
+      (is (= :int (:result-carrier record)))
+      (is (= {:unchecked-math unchecked?} (:source-policy record)))
+      (is (nil? (bytecode/retained-input-floating-conversion emission original-body expression)))
+      (if unchecked?
+        (is (= -1 (implementation Long/MAX_VALUE)))
+        (is (thrown? ArithmeticException (implementation Long/MAX_VALUE))))))
+  (let [expression '(clojure.core/double x)
+        {:keys [emission original-body]} (emit-observed-value ['float] expression)]
+    (is (= (bytecode/retained-input-scalar-conversion emission original-body expression)
+           (bytecode/retained-input-floating-conversion emission original-body expression)))))
 
 (deftest quoted-cons-bodies-remain-owned-data-not-executable-code
   (let [body (cons 'let* (list ['x 1.0] '(throw (Exception. "quoted only"))))

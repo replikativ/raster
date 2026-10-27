@@ -1613,24 +1613,43 @@
                     (and reduction (identical? actual (get-in reduction [:bound :expression]))))
             (assoc input :source-original source)))))))
 
-(defn- retain-floating-conversion! [ctx operand input-type target-carrier locals & [source-operation]]
+(defn- retain-scalar-conversion! [ctx operand input-type target-carrier locals & [source-operation]]
   (when-let [token (::call-occurrence ctx)]
     (when me/*emission-inputs*
       (let [free (binding [util/*shadowing-locals* (set (keys locals))] (util/free-syms operand))
             record {:status :known :expression (::call-expression ctx)
                     :operand operand :input-type input-type :target-carrier target-carrier
+                    :result-carrier (class-type->stack target-carrier)
+                    :source-policy (source-policy/capture)
                     :conversion-kind (if source-operation :source-cast :jvm-coerce)
                     :context (completion/bytecode-operand-context ctx)
                     :ports (select-keys locals free)}
             record (cond-> record source-operation (assoc :source-operation source-operation))]
         (retain-call-observation! ctx :floating-conversion-contexts record nil)))))
 
+(defn- retain-floating-conversion! [ctx operand input-type target-carrier locals & [source-operation]]
+  (retain-scalar-conversion! ctx operand input-type target-carrier locals source-operation))
+
+(defn ^:no-doc retained-scalar-conversion
+  "One actual emitted primitive scalar conversion, not a source-name inference.
+   The historical :floating-conversion-contexts family also stores integral
+   conversions. Caller authenticates module/operand correspondence separately;
+   a reference operand may execute user callbacks or fail during conversion."
+  [emission original]
+  (retained-call-observation emission original :floating-conversion-contexts))
+
+(defn ^:no-doc retained-input-scalar-conversion [emission input-body original]
+  (when-let [owned (input-origin emission input-body original :invocation)]
+    (when-let [observed (retained-scalar-conversion emission owned)]
+      (assoc observed :source-input original))))
+
 (defn ^:no-doc retained-floating-conversion
   "Actual emitted FP conversion of an exact original source occurrence.
    Consumers separately prove their admitted operand domain; the source name
    or logical result tag alone cannot establish this evidence."
   [emission original]
-  (retained-call-observation emission original :floating-conversion-contexts))
+  (when-let [observed (retained-scalar-conversion emission original)]
+    (when (contains? #{Float/TYPE Double/TYPE} (:target-carrier observed)) observed)))
 
 (defn ^:no-doc retained-input-floating-conversion
   "Follow an exact emitter-input call to its owned floating conversion.
@@ -3444,6 +3463,28 @@
                 ;; aastore pops [arr, idx, val], leaving [val] as result
                 (do (.dup_x2 code) (.aastore code) :ref))))))))))
 
+(defn- retain-array-length! [ctx array array-class input-type locals]
+  (when me/*emission-inputs*
+    (retain-call-observation!
+     ctx :array-length-contexts
+     {:status :known :array array :array-class array-class
+      :input (physical-operand-input array locals ctx)
+      :input-carrier input-type :completed-carrier :ref
+      :adaptation :checkcast :result-carrier :int
+      :operation :jvm-arraylength} :repeated-emitted-array-length-context)))
+
+(defn ^:no-doc retained-array-length
+  "An actual ARRAYLENGTH opcode and its original operand/checkcast. Caller must
+   authenticate the module. No presence, totality, purity, synchronization or
+   code-stability authority follows; reflective Array.getLength has no record."
+  [emission original]
+  (retained-call-observation emission original :array-length-contexts))
+
+(defn ^:no-doc retained-input-array-length [emission input-body original]
+  (when-let [owned (input-origin emission input-body original :invocation)]
+    (when-let [record (retained-array-length emission owned)]
+      (assoc record :source-input original))))
+
 (defn- emit-alength-intrinsic
   "Emit bytecode for alength. Uses arraylength when the array type is known,
    falls back to Array.getLength for untyped references."
@@ -3460,7 +3501,9 @@
                           :else nil)]
         (if arr-cls
           (do (.checkcast code (class-desc-of arr-cls))
-              (.arraylength code) :int)
+              (.arraylength code)
+              (retain-array-length! ctx arg arr-cls t locals)
+              :int)
           ;; Unknown hint, use Array.getLength
           (do (.invokestatic code
                              (ClassDesc/ofDescriptor "Ljava/lang/reflect/Array;")
@@ -3497,6 +3540,9 @@
       (if (= :diverge input)
         :diverge
         (do
+          (retain-scalar-conversion! (dissoc ctx :void-context) (first args) input
+                                     (primitive-carrier-class result) locals
+                                     (symbol "clojure.core" head-name))
           (when (contains? #{:int :long} input)
             (retain-primitive-index-route! ctx :integer-cast result))
           result)))))
@@ -6482,12 +6528,14 @@
         completed
         (case (:source-context contract)
           :jvm-object-input
-          (let [actual (emit-object-value code operand locals ctx)]
+          (let [object-observation (when observation (volatile! nil))
+                actual (emit-object-value code operand locals ctx object-observation)]
             (when observation
-              (vreset! observation {:input-carrier actual
-                                    :adaptation (if (= :diverge actual) :diverge :identity)
-                                    :operand-context (completion/bytecode-operand-context
-                                                      (object-input-context ctx))}))
+              (vreset! observation (merge @object-observation
+                                         {:input-carrier actual
+                                          :adaptation (if (= :diverge actual) :diverge :identity)
+                                          :operand-context (completion/bytecode-operand-context
+                                                            (object-input-context ctx))})))
             actual)
           :jvm-checkcast (emit-reference-check-completion code parts locals ctx observation)
           (:source-integral-cast :source-floating-cast)
@@ -6526,7 +6574,8 @@
                            :site-context (completion/bytecode-operand-context ctx)
                            :locals-before locals :object-parent? object-parent?
                            :completion-carrier completed :returned-carrier returned
-                           :result-fact (completed-primitive-result-fact completed returned)})]
+                           :result-fact (or (:result-fact @observation)
+                                            (completed-primitive-result-fact completed returned))})]
         (swap! me/*emission-inputs* update :completion-contexts
                (fn [contexts]
                  (assoc contexts token (if (contains? contexts token)
@@ -6537,7 +6586,8 @@
   "Consume the ORIGINAL operand in Object context. Result-position regions
    retain that context; their tests, initializers and call arguments do not.
    Logical scalar tags do not authorize primitive-return substitution here."
-  [code expression locals ctx]
+  ([code expression locals ctx] (emit-object-value code expression locals ctx nil))
+  ([code expression locals ctx root-observation]
   (let [;; Intermediate Object-return calls can escape through lexical aliases,
         ;; not only at the last expression. Keep their physical source ABI
         ;; throughout this region; logical scalar tags alone do not prove
@@ -6558,12 +6608,26 @@
             (emit-form code expression locals (source-evaluation-context ctx :object-region))
             (seq? expression)
             (emit-form code expression locals (source-evaluation-context ctx :object-call))
-            :else (emit-form code expression locals ctx))]
+            :else (emit-form code expression locals ctx))
+        ;; This result belongs to THIS Object consumer only. Recursive operand
+        ;; emissions receive no observer, so an inner box cannot certify a
+        ;; surrounding call, branch, callback or arbitrary compound expression.
+        local (when (symbol? expression) (get locals expression))
+        boxed-local (when (and (= t (:type local)) (contains? #{:float :double} t))
+                      (case t :float Float :double Double))
+        literal-class (when (contains? #{Float Double} (class expression)) (class expression))
+        builtin (or boxed-local literal-class)]
+    (when (and root-observation builtin)
+      (vreset! root-observation
+               {:operand-before-box-carrier t
+                :operand-input (physical-operand-input expression locals ctx)
+                :object-adaptation (if boxed-local :builtin-box :literal-reference)
+                :result-fact {:carrier Object :presence :present :builtin-class builtin}}))
     (cond
       (= :diverge t) :diverge
       (= :void t) (do (.aconst_null code) :ref)
       (primitive? t) (do (emit-box-to-ref code t) :ref)
-      :else t)))
+      :else t))))
 
 (defn- emit-form
   "Emit bytecode for a macroexpanded, walked Clojure form.
