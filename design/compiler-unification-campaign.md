@@ -27,6 +27,13 @@ negatives. Independent review found no remaining blocker. This is scoped
 qualification of the 11 completion-fixture errors and dtype fixture correction,
 not a claim that the full unit or CPU-OpenCL gates are green.
 
+Downstream distributed-evidence and raw-observation fixtures now assert exact
+preservation of their pre-existing owner buffers rather than an empty session.
+Raw observation additionally preserves the original execution state/readiness;
+it does not manufacture completion. The six affected namespaces pass 57 tests /
+702 assertions with the existing ownership, poisoning, synchronous-scope and
+cleanup controls retained. Full exact-head CI remains required.
+
 The in-progress correction distinguishes an attached InvocationPlan from actual
 scalar-proof demand: strict source correspondence is necessary when a leaf uses
 producer relationships, not merely because a plan exists. Independently callable

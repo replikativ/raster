@@ -21,6 +21,7 @@
     (#'fixture/simulated c {}
       (fn [trace session]
         (let [executable (owner session :complete {:capacity-bytes 64 :resident-bytes 16})
+              original-buffers (:buffers @session)
               fact (runtime/measure-storage-representation! executable :unit :f32)]
           (is (runtime/original-executable? executable))
           (is (runtime/representation-evidence? fact))
@@ -50,7 +51,7 @@
                (is (= :distributed-representation-mismatch
                       (reason #(runtime/storage-representation-description executable target dtype f)))))))
           (is (= [:allocate :bind :run :download :classify :release-graph :free] @trace))
-          (is (empty? (:buffers @session)))
+          (is (= original-buffers (:buffers @session)))
           (is (empty? (:kernel-graphs @session))))))))
 
 (deftest admission-declines-never-run-the-probe-or-consume-completed-outputs
@@ -84,13 +85,14 @@
     (let [c (#'fixture/owner) failure (ex-info "probe failed" {:stage stage})]
       (#'fixture/simulated c {stage failure}
         (fn [_ session]
-          (let [executable (owner session :complete {:capacity-bytes 64 :resident-bytes 16})]
+          (let [executable (owner session :complete {:capacity-bytes 64 :resident-bytes 16})
+                original-buffers (:buffers @session)]
             (is (identical? failure
                             (error-of #(runtime/measure-storage-representation! executable :unit :float))))
             (is (= :failed @(:state executable)))
             (is (= :distributed-runtime-state
                    (reason #(runtime/with-output-values! executable identity))))
-            (is (empty? (:buffers @session)))
+            (is (= original-buffers (:buffers @session)))
             (is (empty? (:kernel-graphs @session)))))))))
 
 (deftest facts-cannot-cross-owner-or-live-session-identity-boundaries
