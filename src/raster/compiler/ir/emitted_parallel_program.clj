@@ -533,6 +533,25 @@
   ([parallel-program evidence caller-options]
    (checked-retained-validation-for-request! parallel-program evidence caller-options)))
 
+(defn ^:no-doc checked-equation-fragment-validation!
+  "Consume one fragment's own sealed validation after authenticating its exact parent/equation.
+
+   The fragment validation is independently sealed to the complete immutable fragment. This
+   accessor neither reconstructs that fragment nor lends the parent's validation authority."
+  [parent-program equation-id evidence caller-options]
+  (let [fragment (:program evidence)
+        evidence (if (nil? caller-options)
+                   (checked-retained-validation! fragment evidence)
+                   (checked-retained-validation! fragment evidence caller-options))
+        origin (get-in fragment [:attributes ::equation-origin])]
+    (when-not (and (map? origin)
+                   (identical? parent-program (:program origin))
+                   (= equation-id (:equation-id origin)))
+      (throw (ex-info "retained fragment validation does not belong to this parent equation"
+                      {:reason :emitted-parallel-program-fragment-validation
+                       :equation equation-id :ir :emitted-parallel-program})))
+    evidence))
+
 (defn- physical-validation-for-request!
   "Independently validate a program and retain read-only exact-operation projections.
    Evidence is sealed to this exact immutable program and evidence object; retained-validation?

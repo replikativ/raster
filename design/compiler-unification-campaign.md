@@ -4,14 +4,20 @@
 
 ### Current boundary ledger
 
-October 27 continuation: exact head `153b29946` is **draft, not merge-ready**.
-Unit job35358 completes all16 shards:7,774 tests /95,541 pass /101 failures /
-122 errors across138 failing Vars. Compared with061, seven new failing Vars
-expose graph scalar-interface and product-consumer fusion regressions in common
-component routing; one prior allocation-order Var recovers. These are required
-repairs, not accepted performance regressions or waived tests. CPU35357 completes
-all4 shards:682 tests /7,635 pass /20 failures /73 errors across79 failing Vars.
-Emission remains red; missing vendor checks are not passes. No merge/release.
+October 27 continuation: exact head `cf317e9a5` is **draft, not merge-ready**.
+Unit job35382 completes all16 shards:7,784 tests /95,719 pass /52 failures /
+111 errors across131 failing Vars. All seven routing regressions from153 recover;
+no newly failing Vars or removed outcomes. The7,775 shared outcome Vars retain
+exactly95,777 assertions; ten new Vars add118. CPU35381 completes all4 shards:
+683 tests /7,712 pass /17 failures /73 errors across78 failing Vars. The compound
+replay regression recovers, with no new failing Vars or removed outcomes.
+Emission35378 remains red; missing vendor checks are not passes. No merge/release.
+
+For comparison,153b29946 unit35358 completed all16 shards with7,774 tests /
+95,541 pass /101 failures /122 errors across138 failing Vars. Its seven newly
+failing Vars exposed graph scalar-interface and extra-initialization regressions;
+one prior allocation-order Var recovered. CPU35357 had682 /7,635 pass /20 fail /
+73 errors across79 failing Vars. None of those failures was waived.
 
 The predecessor bridge now runs uniform/resident realization before assembling
 the initialization context. Initialization consumes only its identical current
@@ -33,6 +39,19 @@ replay tests pass432 assertions: groupnorm, compound argument frames, zero
 initialization order, and existing planned completions. These include changed
 inputs and changed extents on both OpenCL and Level Zero; GPU skips are not used
 as numerical qualification.
+
+The next reviewed runtime slice retains each equation fragment's own independently
+sealed structural validation inside its executable owner. Every hit authenticates
+the exact parent/equation/math request; dynamic bindings, source history, cursor,
+storage, leases and completion checks remain fresh. No calls or readiness facts
+are cached, and close drops proof references. Focused ownership/cleanup10/235,
+broader ordered/host-binding/math-request40/516 and real OCL+ZE5/464 pass.
+In the eight-element groupnorm microcase, two warm replays reduce full emitted
+validation calls36→4 while the measured source-history count stays212. Warm
+uninstrumented host samples were2019–2292ms before and749–938ms after, under
+varying background load; this is not a controlled workload speedup claim.
+Compilation remains multi-second, with whole target-attempt restart visible in
+the pass trace. Static proof reuse and binding/epoch readiness remain separate.
 
 Coverage reconciliation: the seven-assertion
 `generated-storage-actions-do-not-partition-fusible-maps` test was replaced by

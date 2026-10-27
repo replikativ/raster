@@ -1297,12 +1297,18 @@
                                                             (get-in initial [:program :equations]))))
                                                 (get-in initial [:program :outputs])))
                                          :execution-id (random-uuid) :roots {} :node-views {}
+                                         :fragment-validations {}
                                          :prepared {} :ledger (volatile! []) :timings (volatile! {})}})
         session (gpu/make-session (:target compilation))
         owner (cleanup/owner
                [{:id :programs
-                 :release #(doseq [[position prepared] (get-in @execution-state [:ordered :prepared])]
-                             (release-ordered-program! execution-state position prepared))}
+                 :release #(try
+                             (doseq [[position prepared]
+                                     (get-in @execution-state [:ordered :prepared])]
+                               (release-ordered-program! execution-state position prepared))
+                             (finally
+                               (swap! execution-state update :ordered
+                                      dissoc :fragment-validations)))}
                 {:id :session :after #{:programs} :release #(gpu/close-session! session)}])]
     (cleanup/build!
      owner
@@ -1514,10 +1520,17 @@
         epoch (:value-epoch @execution-state)
         replay (get-in @execution-state [:ordered :import-replay])
         plan (:stage-plan ready)
+        equation-id (get-in ready [:state :pending :equation])
+        fragment-validation (:fragment-validation ready)
         fragment (prepare-ordered-program-fragment!
                   executable plan (:effect-evidence ready) (:entry-contract ready)
                   (get-in ready [:state :source-cursor]))]
     (run-ordered-program-fragment! executable fragment)
+    ;; The immutable fragment proof is owner-local and has no readiness content. Retain it only
+    ;; after the GPU stage succeeds; a failed submission cannot populate the replay cache.
+    (when fragment-validation
+      (swap! execution-state assoc-in
+             [:ordered :fragment-validations equation-id] fragment-validation))
     (retain-ordered-result-completions! executable ready source-state epoch replay)
     ;; run-prepared! is synchronous. Only now may the source cursor and initialized postcondition
     ;; advance; having bound a graph or acquired its storage never supplies this evidence.
@@ -1756,9 +1769,13 @@
                   (= :storage-alias (get-in state [:source-realizations (:source-cursor state) :kind]))
                   (invocation-link/advance-source-alias state caller-options)
                   (and equation (not (true? (get-in equation [:attributes :host-only]))))
-                  (run-ordered-stage! executable
-                                      (invocation-link/realize-ready-equation state (:id equation)
-                                                                            caller-options))
+                  (let [fragment-validation
+                        (get-in @execution-state
+                                [:ordered :fragment-validations (:id equation)])]
+                    (run-ordered-stage!
+                     executable
+                     (invocation-link/realize-ready-equation
+                      state (:id equation) fragment-validation caller-options)))
                   (or (:invocation-step entry) equation)
                   (invocation-link/advance-host-source
                    state {:scalar (partial scalar/evaluate-invocation-step (:source-ns compilation))

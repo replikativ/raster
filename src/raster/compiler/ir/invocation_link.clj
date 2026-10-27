@@ -1563,7 +1563,9 @@
   "Realize only the next numerical source entry into a checked program-stage LinkPlan.
    This neither executes nor advances the cursor. Its conditional entry contract must be
    satisfied by the enclosing owner, and produced views become ready only after completion."
-  [state equation-id caller-options]
+  ([state equation-id caller-options]
+   (realize-ready-equation state equation-id nil caller-options))
+  ([state equation-id retained-fragment-validation caller-options]
   (when-not (= caller-options (:caller-options state))
     (fail! :invocation-ordered-request "ordered realization cannot change its caller math request" {}))
   (when (:pending state)
@@ -1629,7 +1631,7 @@
            program equation-id {:buffers (:buffers realized) :scalar-values call-scalars
                                 :loop-scratch (:loop-scratch realized) :result-views result-views
                                 :host-steps (:host-steps state)}
-           (checked-ordered-validation state) caller-options)
+           (checked-ordered-validation state) retained-fragment-validation caller-options)
           ;; Preserve logical prefix tokens beside their physical destinations. The ordinary
           ;; LinkPlan proof below authenticates prefix aliasing and derives child-only write
           ;; coverage; relative entry contracts and runtime completion never credit the tail.
@@ -1679,8 +1681,9 @@
                            :pending {:equation equation-id :source-cursor (:source-cursor state)
                                      :source-end (:end span)})
        :call call :stage-plan plan :effect-evidence effect-evidence :entry-contract contract
+       :fragment-validation fragment-validation
        :new-storage (select-keys (:storage realized)
-                                 (remove #(contains? acquired %) tokens))})))
+                                 (remove #(contains? acquired %) tokens))}))))
 
 (defn ^:no-doc ordered-stage-source-end
   "Derive a stage's completion cursor from its owner's original source entries.

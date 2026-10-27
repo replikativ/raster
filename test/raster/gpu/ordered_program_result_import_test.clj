@@ -175,6 +175,94 @@
             (is (= initialized (get-in @state [:ordered :initialized])))
             (is (identical? source (get-in @state [:ordered :current])))))))))
 
+(deftest fragment-validation-is-cached-only-after-a-successful-stage
+  ;; This is a lifecycle test for immutable proof only. It grants no prepared-program,
+  ;; storage, completion or readiness authority and performs no driver work.
+  (doseq [mode [:success :stage-failure]]
+    (let [source-state (Object.)
+          replay (Object.)
+          validation (Object.)
+          state (atom {:value-epoch 3
+                       :ordered {:current source-state :import-replay replay
+                                 :initialized [] :fragment-validations {}}})
+          executable {:execution-state state}
+          ready {:state {:source-cursor 4 :pending {:equation :numerical}
+                         :acquired-storage #{}}
+                 :stage-plan {:nodes {}}
+                 :effect-evidence :effects
+                 :entry-contract {:full-produces #{} :writes #{} :requires #{}}
+                 :fragment-validation validation}
+          packet (Object.)
+          failure (ex-info "stage failed" {:reason :test-stage-failure})
+          retained (atom 0)]
+      (with-redefs-fn
+        {#'invocation-link/ordered-stage-source-end
+         (fn [actual-source actual-ready]
+           (is (identical? source-state actual-source))
+           (is (identical? (:state ready) actual-ready))
+           5)
+         #'link/prepare-ordered-program-fragment!
+         (fn [actual-executable plan effects contract position]
+           (is (identical? executable actual-executable))
+           (is (identical? (:stage-plan ready) plan))
+           (is (= :effects effects))
+           (is (identical? (:entry-contract ready) contract))
+           (is (= 4 position))
+           packet)
+         #'link/run-ordered-program-fragment!
+         (fn [actual-executable actual-packet]
+           (is (identical? executable actual-executable))
+           (is (identical? packet actual-packet))
+           (when (= mode :stage-failure) (throw failure)))
+         #'link/retain-ordered-result-completions!
+         (fn [actual-executable actual-ready actual-source epoch actual-replay]
+           (is (identical? executable actual-executable))
+           (is (identical? ready actual-ready))
+           (is (identical? source-state actual-source))
+           (is (= 3 epoch))
+           (is (identical? replay actual-replay))
+           (swap! retained inc))}
+        (fn []
+          (let [result (try (#'link/run-ordered-stage! executable ready)
+                            (catch Throwable error error))]
+            (if (= mode :success)
+              (do
+                (is (= 5 (:source-cursor result)))
+                (is (identical? validation
+                                (get-in @state [:ordered :fragment-validations :numerical])))
+                (is (= 1 @retained)))
+              (do
+                (is (identical? failure result))
+                (is (empty? (get-in @state [:ordered :fragment-validations])))
+                (is (zero? @retained)))))))))
+  (let [initial {:materialization {:plan {:steps []}}
+                 :program {:outputs [] :equations []}}
+        closed (atom 0)]
+    (with-redefs-fn
+      {#'invocation-link/validate-ordered-source-actions! identity
+       #'link/validate-ordered-source-completions! (fn [& _] nil)
+       #'link/validate-ordered-program-result-imports! (fn [& _] nil)
+       #'materialization/initial-parameter-arguments (fn [_] [])
+       #'invocation-link/ordered-entry-roles (fn [& _] {})
+       #'invocation-link/ordered-entry-layout
+       (fn [& _] {:entry-refresh {} :nodes {}})
+       #'link/capture-ordered-entries! (fn [& _] nil)
+       #'gpu/make-session (fn [_] (atom {:closed? false}))
+       #'gpu/close-session! (fn [_] (swap! closed inc))}
+      (fn []
+        (let [executable (#'link/instantiate-ordered-invocation-with!
+                          {:target :ocl:0} [] {} (fn [_] initial))
+              state (:execution-state executable)
+              validation (Object.)]
+          (swap! state assoc-in [:ordered :fragment-validations :numerical] validation)
+          (is (identical? validation
+                          (get-in @state [:ordered :fragment-validations :numerical])))
+          (link/close! executable)
+          (is (nil? (get-in @state [:ordered :fragment-validations])))
+          (is (= 1 @closed))
+          (link/close! executable)
+          (is (= 1 @closed) "close remains idempotent after dropping proof references"))))))
+
 (deftest import-table-preflight-requires-exact-keys-and-delegates-owner-validation
   ;; This tests dispatch/preflight only: the stand-in validator grants no actual
   ;; import permission, and no session or numerical program is constructed.

@@ -511,6 +511,50 @@
             equation-id (:id (first (:equations (:program state))))
             ready (invocation-link/realize-ready-equation state equation-id nil)]
         (is (= 2 @checks) "parent and fresh fragment each validate once, not once per consumer")
+        (let [fragment-validation (:fragment-validation ready)
+              repeated (invocation-link/realize-ready-equation
+                        state equation-id fragment-validation nil)
+              fragment (:program fragment-validation)]
+          (is (identical? fragment-validation (:fragment-validation repeated)))
+          (is (= 2 @checks)
+              "an exact owner-local fragment proof avoids only repeated fragment validation")
+          (is (= 0 (get-in repeated [:state :source-cursor])))
+          (is (= equation-id (get-in repeated [:state :pending :equation])))
+          (is (empty? (get-in repeated [:state :acquired-storage]))
+              "reusing immutable proof still grants neither acquisition nor readiness")
+          (let [foreign-parent (with-meta (:program state) {:copy true})]
+            (is (= foreign-parent (:program state)))
+            (is (= :emitted-parallel-program-fragment-validation
+                   (reason #(emitted-program/checked-equation-fragment-validation!
+                             foreign-parent equation-id fragment-validation nil)))))
+          (is (= :emitted-parallel-program-fragment-validation
+                 (reason #(emitted-program/checked-equation-fragment-validation!
+                           (:program state) :wrong-equation fragment-validation nil))))
+          (is (= :emitted-parallel-program-fragment-validation
+                 (reason #(emitted-program/checked-equation-fragment-validation!
+                           nil nil (:retained-validation state) nil))))
+          (is (= :emitted-parallel-program-retained-validation
+                 (reason #(invocation-link/realize-ready-equation
+                           state equation-id (assoc fragment-validation :copy true) nil))))
+          (is (= :emitted-parallel-program-retained-validation
+                 (reason #(invocation-link/realize-ready-equation
+                           state equation-id
+                           (assoc fragment-validation :program
+                                  (with-meta fragment {:copy true})) nil))))
+          (let [options {:scalar-math {:overrides {[:tanh :float]
+                                                   :f64-target-library-rte-f32}}}]
+            (is (= :emitted-parallel-program-retained-validation
+                   (reason #(invocation-link/realize-ready-equation
+                             (assoc state :caller-options options) equation-id
+                             fragment-validation options)))))
+          (is (= 2 @checks) "foreign or copied evidence is refused without revalidation"))
+        (let [other-state (invocation-link/begin-ordered-realization
+                           compilation [(double-array [8.0]) (double-array 1) Long/MAX_VALUE] nil)
+              other-ready (invocation-link/realize-ready-equation
+                           other-state equation-id nil)]
+          (is (= 4 @checks) "a separate ordered owner independently validates its fragment")
+          (is (not (identical? (:fragment-validation ready)
+                               (:fragment-validation other-ready)))))
         (is (identical? (:program state) (get-in state [:retained-validation :program])))
         (is (identical? (:projections state) (get-in state [:retained-validation :projections])))
         (is (= 0 (get-in ready [:state :source-cursor])))
@@ -528,7 +572,7 @@
           (is (= :emitted-parallel-program-retained-validation
                  (reason #(invocation-link/realize-ready-equation
                            (assoc state :caller-options options) equation-id options)))))
-        (is (= 2 @checks) "forged reports are refused without whole-program reconstruction")))))
+        (is (= 4 @checks) "forged reports are refused without whole-program reconstruction")))))
 
 (deftest ready-storage-is-conditional-not-completed-invocation-storage
   (let [compilation (equation-first/compile #'fixture/write-before-shape

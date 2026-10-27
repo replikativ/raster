@@ -978,10 +978,16 @@
   "Bind a retained numerical equation as an independently checked program fragment.
    This evaluates no host equation and acquires no resources. The fragment has no source-entry
    completion authority and never borrows the enclosing program's validation seal. Required
-   preceding host equations retain their already-evaluated steps, not an evaluator callback."
-  [parallel-program equation-id {:keys [buffers scalar-values loop-scratch result-views host-steps]
-                                :or {buffers {} scalar-values {} loop-scratch {} result-views {} host-steps {}}}
-   retained-validation caller-options]
+   preceding host equations retain their already-evaluated steps, not an evaluator callback.
+   The optional fragment evidence is its OWN previously sealed validation; parent bindings and
+   host-prefix receipts are still checked freshly before that evidence is considered."
+  ([parallel-program equation-id inputs retained-validation caller-options]
+   (make-equation-program-call parallel-program equation-id inputs retained-validation nil
+                               caller-options))
+  ([parallel-program equation-id
+    {:keys [buffers scalar-values loop-scratch result-views host-steps]
+     :or {buffers {} scalar-values {} loop-scratch {} result-views {} host-steps {}}}
+    retained-validation fragment-validation caller-options]
   (let [{:keys [program buffers scalars]}
         (checked-stage-inputs parallel-program buffers scalar-values loop-scratch result-views
                               retained-validation caller-options)
@@ -999,17 +1005,22 @@
                 (fail! :emitted-program-ready-host-prefix
                        "a numerical fragment requires its exact completed host prefix"
                        {:equation equation-id :host-equation (:id host)})))
-          ;; Keep only an exact, independently revalidatable view relation. The fragment
-          ;; still has no source/InvocationPlan/completion authority of its own.
-          fragment (emitted-program/equation-fragment program equation-id)
-          validation (if (nil? caller-options)
-                       (emitted-program/validate-with-physical-results! fragment)
-                       (emitted-program/validate-with-physical-results! fragment caller-options))
+          ;; Reused evidence owns this exact fragment. On a miss, construct and independently
+          ;; validate the fragment as before. Neither path borrows the parent seal.
+          validation
+          (if fragment-validation
+            (emitted-program/checked-equation-fragment-validation!
+             program equation-id fragment-validation caller-options)
+            (let [fragment (emitted-program/equation-fragment program equation-id)]
+              (if (nil? caller-options)
+                (emitted-program/validate-with-physical-results! fragment)
+                (emitted-program/validate-with-physical-results! fragment caller-options))))
+          fragment (:program validation)
           inputs (checked-stage-inputs fragment buffers scalars
                                        (select-keys loop-scratch (:results equation))
                                        (select-keys result-views (:results equation)) validation caller-options)
           call (construct-staged-call (assoc inputs :host-steps (select-keys host-steps (map :id host-prefix))))]
-      {:call call :buffers (:buffers call) :retained-validation validation})))
+      {:call call :buffers (:buffers call) :retained-validation validation}))))
 
 (defn make
   "Prepare a source-independent, target-neutral call of an emitted parallel program.
