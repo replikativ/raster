@@ -6,6 +6,7 @@
    is structured-loop functionalization: a mutating arraycopy becomes a loop carry only after this
    analysis proves a complete same-dtype state copy."
   (:require [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.checked-inputs :as checked-inputs]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.types :as types]
             [raster.compiler.core.value-completion :as completion]
@@ -379,7 +380,10 @@
          (and (symbol? reference)
               (or (buffer-value? (get-in analysis [:values reference]))
                   (buffer-value? (get-in analysis [:values symbol]))))
-         source (binding-buffer-alias-source (assoc context :ineligible ineligible) symbol expression)
+         checked (when lexical?
+                   (checked-inputs/array-refinements expression (:available analysis) ineligible (:values analysis)))
+         analysis (update analysis :values merge checked)
+         source (binding-buffer-alias-source (assoc context :ineligible ineligible :analysis analysis) symbol expression)
          analysis (infer-value analysis symbol (or source expression) dtype source)]
      (assoc context :ineligible ineligible
             :analysis (cond-> analysis

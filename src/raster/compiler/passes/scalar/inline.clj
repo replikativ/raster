@@ -21,6 +21,7 @@
             [raster.compiler.ir.form :as form]
             [raster.compiler.ir.par :as par]
             [raster.compiler.passes.scalar.effects :as effects]
+            [raster.compiler.passes.scalar.source-import :as source-import]
             [raster.core :as rcore]
             [raster.compiler.core.dispatch :as dispatch]))
 
@@ -234,59 +235,6 @@
 (defn- effective-inline-body [body]
   (if (> (count body) 1) [(apply list 'do body)] body))
 
-(defn- hygienic-inline-body [body parameters]
-  (let [used (volatile! (into (set parameters) (mapcat util/free-syms) body))
-        allocate util/*fresh-binder*]
-    (binding [util/*fresh-binder*
-              (fn [original]
-                (let [fresh (allocate original)]
-                  (when-not (and (symbol? fresh) (nil? (namespace fresh))
-                                 (not (contains? @used fresh))
-                                 (identical? (meta original) (meta fresh)))
-                    (throw (ex-info "source transformation requires fresh metadata-preserving binders"
-                                    {:reason :nonfresh-source-import-binder})))
-                  (vswap! used conj fresh)
-                  fresh))]
-      (mapv util/alpha-convert body))))
-
-(defn- prepare-inline-source [frontend body parameters tags source-ns]
-  (let [construct
-        (fn []
-          (when frontend
-            (method-entry/assert-frontend-source! frontend (get-in frontend [:source-entry :source-var]))
-            (when-not (and (identical? body (:body frontend))
-                           (= parameters (get-in frontend [:source-entry :params]))
-                           (= tags (get-in frontend [:source-entry :tags]))
-                           (identical? source-ns (get-in frontend [:source-entry :source-ns])))
-              (throw (ex-info "helper transformation differs from its original input"
-                              {:reason :source-import-input-mismatch})))
-            (method-entry/observe-frontend-source-identity! frontend))
-          (let [qualified-tags
-                (when tags
-                  (mapv (fn [tag]
-                          (if (or (nil? source-ns) (nil? tag)
-                                  (contains? '#{double long float int Double Long Float Integer
-                                                doubles floats longs ints objects} tag)
-                                  (.contains (str tag) "."))
-                            tag
-                            (let [lookup (symbol (str tag))
-                                  result (try (ns-resolve source-ns lookup) (catch Exception _ nil))]
-                              (method-entry/observe-source-resolution!
-                               {:kind :symbol-resolution :source-ns source-ns :symbol lookup :result result})
-                              (if (class? result) (symbol (.getName ^Class result)) tag)))) tags))
-                hygienic (hygienic-inline-body (effective-inline-body body) parameters)
-                parameter-set (set (map #(if (symbol? %) % (symbol (name %))) parameters))
-                qualified (if source-ns
-                            (mapv #(inf/qualify-body-symbols % source-ns parameter-set
-                                                           method-entry/observe-source-reference!) hygienic)
-                            hygienic)]
-            (when frontend
-              (method-entry/assert-frontend-source! frontend (get-in frontend [:source-entry :source-var])))
-            {:walked-body qualified :tags qualified-tags}))]
-    (if (and frontend method-entry/*emission-inputs*)
-      (method-entry/call-with-independent-definition-inputs construct)
-      (construct))))
-
 (defn- resolve-walked-body-input
   "Try to extract walked body from a var. Returns {:params :walked-body :tags} or nil.
   Checks both var metadata (normal deftm) and the deref'd value's metadata
@@ -357,21 +305,14 @@
                              (let [callee (symbol (str (:ns metadata)) (str (:name metadata)))]
                                (not (canonical-callee callee))))]
                 (inlinable-body? (first effective-wb)))
-          (let [
-                source-ns-sym (symbol (str (.name (.ns v))))
-                source-ns (try (the-ns source-ns-sym) (catch Exception _ nil))
-            ;; Alpha-rename the callee body's INTERNAL binders (let/loop/par
-            ;; induction vars, accumulators) to fresh names on EVERY resolve, so a
-            ;; splice into a caller cannot capture — or be captured by — a same-named
-            ;; caller variable. Without this, e.g. rms-norm!'s `(par/map-void! r ...)`
-            ;; row-index collides with a caller param `r` (LoRA rank) → the lowered
-            ;; loop binder becomes the captured `r` → malformed `(dotimes [(long r) …])`
-            ;; → the index never advances → infinite hang. util/alpha-convert renames
-            ;; only bound vars (params stay free for subst); fresh-like preserves the
-            ;; name prefix + tags, so name-based heuristics and dtype tags survive.
-                imported (prepare-inline-source retained-frontend walked-body params tags source-ns)]
-            (merge {:params params :return-tag return-tag}
-                   imported))))))))
+          ;; Resolution supplies a candidate, not a copied executable body.
+          ;; The owned application constructor alone qualifies and alpha-renames
+          ;; the original source after exact caller/input planning. Body/exit
+          ;; certification follows that import in its disposable local owner.
+          ;; Importing here duplicates work even for unplanned candidates.
+          {:params params :return-tag return-tag :source-var v
+           :original-frontend retained-frontend :walked-body walked-body
+           :tags tags}))))))
 
 (defn- try-resolve-walked-body [v]
   ;; Rejected inlining candidates do not become executable dependencies.
@@ -426,6 +367,23 @@
       (when-not (some some? (:promotion-casts signature))
         (try (resolve (:mangled-sym signature)) (catch Exception _ nil))))))
 
+(defn- resolve-selected-inline-input
+  "Check the selected header before requesting a body. Ordinary calls with no
+   exact caller input plan cannot expand; prepared AD uses its separate owner."
+  [v caller]
+  (let [metadata (meta v)
+        value-metadata (when (and (var? v) (bound? v)) (meta @v))
+        parameters (or (:raster.core/deftm-params metadata)
+                       (:raster.core/deftm-params value-metadata))]
+    ;; Diagnostics do not require source import or successful inline admission.
+    (when (and caller parameters)
+      (check-inline-arity! (call-head caller) parameters (call-args caller) caller))
+    (when (or (nil? caller)
+              (contains? value-metadata :raster.ad.reverse/prepared-program)
+              (and *source-call-plans*
+                   (.containsKey ^java.util.IdentityHashMap *source-call-plans* caller)))
+      (try-resolve-walked-body v))))
+
 (defn- try-resolve-deftm
   "Try to resolve a symbol to a deftm var with an inlinable walked body.
    Generic calls require a complete argument tuple and shared dispatch selection.
@@ -433,6 +391,8 @@
    Already-selected implementation Vars remain a separate resolution boundary."
   ([sym] (try-resolve-deftm sym nil))
   ([sym arg-tags]
+   (try-resolve-deftm sym arg-tags nil))
+  ([sym arg-tags caller]
    (method-entry/call-with-optional-definition-inputs
     (fn []
       (when (qualified-symbol? sym)
@@ -451,8 +411,8 @@
               (when-not (:no-inline (meta v))
                 (if-let [table (:raster.core/dispatch-table (meta v))]
                   (when-let [selected (selected-inline-var base-sym table arg-tags)]
-                    (try-resolve-walked-body selected))
-                  (try-resolve-walked-body v)))))))))))
+                    (resolve-selected-inline-input selected caller))
+                  (resolve-selected-inline-input v caller)))))))))))
 
 (def ^:private alloc-sym->array-tag op/alloc-sym->array-tag)
 
@@ -490,7 +450,7 @@
    A result binder requests the binding inliner's existing flat placement;
    otherwise retain the nested body's lexical scopes for recursive expansion.
    This construction is NOT a completion, correspondence or execution proof."
-  [{:keys [params tags walked-body prepared-program projection-mode]}
+  [{:keys [params walked-body prepared-program projection-mode] :as info}
    args source-env subst-fn result-sym caller]
   (if prepared-program
     (let [projection
@@ -501,48 +461,18 @@
       (if result-sym
         {:argument-bindings [] :bindings (conj bindings [result-sym result-form])}
         {:argument-bindings [] :body (list 'let* (vec (mapcat identity bindings)) result-form)}))
-    (do
-  (let [body-form (first (effective-inline-body walked-body))
-        callee-params (mapv #(with-meta (if (symbol? %) % (symbol (name %))) nil) params)
-        arguments (atom [])
-        slots nil
-        substitutions (argument-substitution callee-params args tags source-env
-                                            #(swap! arguments conj %) false
-                                            (when slots #(swap! slots conj %)))
-        expansion
-    (if-not result-sym
-      (cond-> {:argument-bindings @arguments :body (subst-fn substitutions body-form)}
-        slots (assoc :argument-slots @slots))
-      (let [pairs (atom @arguments)
-            emit-tail! (fn [expressions]
-                         (doseq [effect (butlast expressions)]
-                           (swap! pairs conj
-                                  [(with-meta (gensym "effect_") {:raster.effect/effectful true}) effect]))
-                         (swap! pairs conj [result-sym (last expressions)]))]
-        (cond
-          (form/binding-form? body-form)
-          (let [[_ bindings & body] body-form
-                current (atom substitutions)]
-            (doseq [[id init] (partition 2 bindings)]
-              (let [fresh (gensym (str (name id) "_"))
-                    value (subst-fn @current init)
-                    renamed (source-declaration/retain-hint
-                             (if (and (seq? value) (symbol? (first value))
-                                     (op/alloc-op? (first value)))
-                              (vary-meta fresh merge (meta id)
-                                         {:raster.buffer/hoistable true
-                                          :tag (or (get alloc-sym->array-tag (first value)) (:tag (meta id)))})
-                              (if (meta id) (vary-meta fresh merge (meta id)) fresh)))]
-                (swap! pairs conj [renamed value])
-                (swap! current assoc id renamed)))
-            (emit-tail! (mapv #(subst-fn @current %) body)))
+    (let [planned (when *source-call-plans* (.get ^java.util.IdentityHashMap *source-call-plans* caller))]
+      (when (and planned (= (count args) (count (:inputs planned)))
+                 (every? true? (map identical? args (map :operand (:inputs planned)))))
+        (when-let [application (source-import/instantiate-static-helper
+                               (:candidate planned) caller (:source-options planned))]
+          (source-import/validate-helper-application! application)
+          (let [arguments (:argument-bindings application)
+                returned (:result-form application)]
+            (if result-sym
+              {:argument-bindings arguments :bindings (conj arguments [result-sym returned])}
+              {:argument-bindings arguments :body returned})))))))
 
-          (and (seq? body-form) (= 'do (first body-form)))
-          (emit-tail! (mapv #(subst-fn substitutions %) (rest body-form)))
-
-          :else (swap! pairs conj [result-sym (subst-fn substitutions body-form)]))
-        {:argument-bindings @arguments :bindings @pairs}))]
-    expansion))))
 
 ;; ================================================================
 ;; value+grad / grad inlining
@@ -1128,6 +1058,7 @@
   ([form subst-fn skip-ad-rule-check?]
    (inline-one-pass form subst-fn skip-ad-rule-check? false))
   ([form subst-fn skip-ad-rule-check? ad-only?]
+   (binding [*source-call-plans* (call-plan/call-plans *source-call-context* form)]
    (let [[_ bindings-vec0 & body-exprs-raw0] form
          ;; F1: hoist nested value+grad/grad applications out of any init/body
          ;; sub-position into their own preceding binding, so the binding-level AD
@@ -1280,7 +1211,7 @@
                                         (let [tags (mapv #(inf/infer-arg-tag % @type-env) (call-args init))]
                                           (when (every? some? tags) tags)))
                              deftm-info (when (and (not ad-only?) head (not has-ad-rule?))
-                                          (try-resolve-deftm head arg-tags))]
+                                          (try-resolve-deftm head arg-tags init))]
                          (if (and deftm-info (safe-to-inline? deftm-info))
                            (let [{:keys [params]} deftm-info
                                  args (call-args init)
@@ -1297,12 +1228,15 @@
                  ;; number of args is always a bug — say so, at the call.
                                  _ (check-inline-arity! head params args init)
                                  expansion (build-inline-expansion deftm-info args @type-env subst-fn sym init)]
+                             (if-not expansion
+                               (swap! result-pairs conj [sym init])
+                               (do
                              (swap! result-pairs into (:bindings expansion))
                              (reset! any-inlined? true)
             ;; Record the inlined function's return type so subsequent
             ;; backward calls can infer arg-tags through the binding chain
                              (when-let [ret-tag (:return-tag deftm-info)]
-                               (swap! type-env assoc sym ret-tag)))
+                               (swap! type-env assoc sym ret-tag)))))
                            (do (swap! result-pairs conj [sym init])
                ;; Track ftm-valued bindings for beta reduction.
                ;; ^:inline on the sym or the ftm form enables multi-use inlining.
@@ -1354,7 +1288,7 @@
                          (into (vec resolved-pairs) @extra-bindings)
                          resolved-pairs)]
          {:form (list* 'let* (vec (mapcat identity all-pairs)) resolved-body)
-          :inlined? @any-inlined?})))))
+          :inlined? @any-inlined?}))))))
 
 (defn normalize-direct-ad-projections
   "Stage only a whole constant nth of a direct value+grad application at its
@@ -1483,6 +1417,7 @@
    - :preserve-templates? false -> inline everything (for post-AD backend expansion)"
   ([form] (inline-invk form {}))
   ([form {:keys [preserve-templates?] :as policy}]
+   (binding [*source-call-plans* (or *source-call-plans* (call-plan/call-plans *source-call-context* form))]
    (cond
      ;; Re-emitting these operands/bodies belongs to their retained producer.
      ;; Ordinary helper expansion cannot erase saved argument/return semantics.
@@ -1507,7 +1442,7 @@
                                  ;; into an implementation body and lose its algebraic identity.
                                  (not (and *preserve-canonical-intrinsics?*
                                            (canonical-callee impl-sym))))
-                        (try-resolve-deftm impl-sym))]
+                        (try-resolve-deftm impl-sym nil form))]
        (if deftm-info
          (let [{:keys [params walked-body]} deftm-info
                _ (check-inline-arity! impl-sym params (drop 2 form) form)
@@ -1527,15 +1462,18 @@
              ;; Simple body -- safe to inline
              (let [args (mapv #(inline-invk % policy) (drop 2 form))
                    expansion (build-inline-expansion deftm-info args *param-env* subst-syms nil form)
-                   inlined (:body expansion)
+                   inlined (when expansion (:body expansion))
                    ;; mark this callee as on the inline stack while re-processing its
                    ;; body, so a recursive self-call inside stays a call (terminates)
-                   result (binding [*inlining* (conj *inlining* rkey)]
-                            (inline-invk inlined policy))]
+                   result (when expansion
+                            (binding [*inlining* (conj *inlining* rkey)]
+                              (inline-invk inlined policy)))]
                ;; Wrap in let* with lifted bindings if any were emitted
-               (if (seq (:argument-bindings expansion))
+               (if-not expansion
+                 (util/remake-invk-if-changed form impl-sym args)
+                 (if (seq (:argument-bindings expansion))
                  (list 'let* (vec (mapcat identity (:argument-bindings expansion))) result)
-                 result))))
+                 result)))))
          ;; Has template or can't resolve: keep call, recurse into arguments
          (let [args (drop 2 form)
                new-args (map #(inline-invk % policy) args)]
@@ -1568,7 +1506,7 @@
      (util/remake-if-changed form (mapv #(inline-invk % policy) form))
 
      (vector? form) (util/remake-if-changed form (mapv #(inline-invk % policy) form))
-     :else form)))
+     :else form))))
 
 (defn- anf-lift
   "Expose whole sequential let/do wrappers at their original evaluation position.
@@ -2018,7 +1956,12 @@
   ([form] (expand-for-backends form 3 nil))
   ([form max-depth] (expand-for-backends form max-depth nil))
   ([form max-depth param-env]
+   (expand-for-backends form max-depth param-env nil))
+  ([form max-depth param-env source-options]
    (method-entry/call-with-independent-definition-inputs
-    #(-> (inline-deftm-calls form max-depth false true)
-         inline-invk
-         flatten-nested-lets))))
+    #(call-with-source-input-completions
+      form source-options
+      (fn []
+        (-> (inline-deftm-calls form max-depth false true)
+            inline-invk
+            flatten-nested-lets))))))

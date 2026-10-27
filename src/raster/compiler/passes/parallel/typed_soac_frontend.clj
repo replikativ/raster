@@ -9,6 +9,7 @@
   (:require [clojure.set :as set]
             [clojure.walk :as walk]
             [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.checked-inputs :as checked-inputs]
             [raster.compiler.core.inference :as inference]
             [raster.compiler.core.numeric-constant :as numeric-constant]
             [raster.compiler.core.op-descriptor :as descriptor]
@@ -6340,12 +6341,20 @@
   "Use indexed captures in maps, reductions and scans when element-shape equality is not established.
    Retain source-ordered producer storage shapes; a different symbolic traversal extent is not
    permission to retype that storage. Existing indexed access/range validation remains mandatory."
-  [descriptions values]
+  ([descriptions values] (preserve-map-storage-inputs descriptions values nil))
+  ([descriptions values preceding]
   (let [context (storage-selection-context descriptions values)]
     (:descriptions
-     (reduce (partial advance-storage-selection context)
+     (reduce (fn [state description]
+               (let [overlay (get preceding (:id description))
+                     shapes (into {} (map (juxt key (comp :shape val))) overlay)]
+                 (advance-storage-selection
+                  context
+                  (-> state
+                      (update :shapes #(merge (apply dissoc % (:checked-shapes state)) shapes))
+                      (assoc :checked-shapes (set (keys shapes)))) description)))
              (initial-storage-selection-state values)
-             descriptions))))
+             descriptions)))))
 
 (defn form->program
   "Construct and validate TypedSOAC islands directly from a let form.
@@ -6539,7 +6548,8 @@
                           (merge-value known sym capacity shape-equalities)
                           known)
                         known)) values descriptions))]
-    (cond-> {:descriptions (preserve-map-storage-inputs descriptions values)
+    (cond-> {:descriptions (preserve-map-storage-inputs descriptions values
+                                                     (get-in source-analysis [:source-value-analysis :checked-boundaries]))
              :values values :allocations allocations}
       source-value-options
       (assoc :source-value-analysis (:source-value-analysis source-analysis))))))
@@ -6833,6 +6843,7 @@
                                             (dissoc index reference))))))
                             state references)
                     (update :values dissoc id)
+                    (update :checked-values dissoc id)
                     (update :references dissoc id)
                     (update :dependents dissoc id))))
             state invalid)))
@@ -6862,7 +6873,10 @@
   (let [inputs (set lexical-inputs)
         source-bindings (into inputs (map first pairs))]
     (retain-produced-value-facts
-     {:values {} :boundaries {} :references {} :dependents {} :available inputs
+     {:values {} :boundaries {} :checked-values {} :checked-boundaries {}
+      :references {} :dependents {} :available inputs
+      :ineligible (into (set/intersection inputs (set (map first pairs)))
+                        (keep (fn [[id n]] (when (< 1 n) id))) (frequencies (map first pairs)))
       :source-bindings source-bindings :equation-projections {}}
      (source-available-contracts (select-keys input-values inputs) source-bindings inputs))))
 
@@ -6896,8 +6910,11 @@
    not global input/access inference or a second result-type switch. A projection
    unavailable before storage classification is optional; final admission still
    reconstructs and validates its ordinary equation."
-  [{:keys [values available source-bindings] :as state} description default-dtype array-types]
-  (let [projection
+  [{:keys [values available source-bindings ineligible] :as state} description default-dtype array-types]
+  (let [checked (checked-inputs/array-refinements (:expr description) available ineligible values)
+        preceding values
+        values (merge values checked)
+        projection
         (when (soac-description? description)
           (optional-source-equation
            (fn []
@@ -6917,12 +6934,15 @@
         results (source-available-contracts
                  (causal-producer-results description (:results projection) values)
                  source-bindings available)
-        state (assoc-in state [:boundaries (:id description)] values)
+        state (-> state
+                  (assoc-in [:boundaries (:id description)] preceding)
+                  (assoc-in [:checked-boundaries (:id description)] (:checked-values state)))
         ;; Source-only bindings also invalidate their predecessor and dependent
         ;; extents/layout facts. Persistent earlier snapshots stay unchanged.
         state (reduce forget-dependent-value-facts state
-                      (conj (set (keys results)) (:sym description)))]
-    (cond-> (-> (retain-produced-value-facts state results)
+                      (conj (into (set (keys results)) (keys checked)) (:sym description)))]
+    (cond-> (-> (retain-produced-value-facts state (merge checked results))
+                (update :checked-values merge checked)
                 (assoc :available (into available (keys (:results projection)))))
       projection (assoc-in [:equation-projections (:id description)] projection))))
 
@@ -7112,16 +7132,18 @@
                   (if (= expanded needed) (select-keys storage-values needed)
                       (recur expanded))))
               inferred-values
-              (reduce (fn [values equation]
+              (reduce (fn [values [equation description]]
                         (let [{:keys [inputs results]}
                               (equation-value-projection equation dtype array-types'
-                                                         source-scalar-types values)]
+                                                         source-scalar-types
+                                                         (merge values (get-in source-value-analysis
+                                                                               [:checked-boundaries (:id description)])))]
                           (reduce-kv #(merge-value %1 %2 %3 shape-equalities)
                                      values (merge inputs results))))
                       (merge destination-values
                              (contraction-storage-values equations dtype array-types' values)
                              published-storage-values)
-                      equations)
+                      (map vector equations equation-descriptions))
               extent-environments (when (seq swr-descriptions)
                                     (source-extent-environments descriptions equations
                                                                 inferred-values source-scalar-types))

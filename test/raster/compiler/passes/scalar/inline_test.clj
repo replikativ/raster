@@ -25,6 +25,7 @@
             [raster.arrays]
             [raster.compiler.passes.scalar.inline :as inline]
             [raster.compiler.passes.scalar.effects :as effects]
+            [raster.compiler.passes.scalar.source-import :as source-import]
             [raster.compiler.core.method-entry :as entry]
             [raster.compiler.core.source-policy :as source-policy]
             [raster.compiler.core.types :as types]
@@ -33,28 +34,78 @@
             [raster.compiler.pipeline :as pipeline]
             [raster.ad.reverse :as rev]))
 
-(defn- owned-inline-function [parameters construct!]
-  (let [policy (source-policy/capture)]
-    (entry/call-with-definition-inputs
-     #(source-policy/call-with-policy
-       policy
-       (fn []
-         (let [{:keys [projection body]} (construct!)
-               tags (vec (repeat (count parameters) 'Object))
-               interface (types/ensure-fn-interface! tags)
-               {:keys [implementation emission]}
-               (core/emit-owned-bytecode!
-                bytecode/compile-typed-impl! "raster.compiled.InlineBodyTest"
-                parameters tags 'Object [body]
-                (the-ns 'raster.compiler.passes.scalar.inline-test)
-                (:iface-name interface) 'inline-body @entry/*emission-inputs*)
-               emission (bytecode/prepare-emitted-global-invocations! emission)
-               guard (entry/prepare-emission-input-guard! emission)]
-           [projection (fn [& arguments]
-                         (guard)
-                         (let [result (apply implementation arguments)]
-                           (guard)
-                           result))]))))))
+(defn- owned-inline-function
+  ([parameters construct!]
+   (owned-inline-function parameters {} construct!))
+  ([parameters {:keys [tags return-tag source-ns policy]} construct!]
+   (let [policy (or policy (source-policy/capture))
+         tags (or tags (vec (repeat (count parameters) 'Object)))
+         return-tag (or return-tag 'Object)
+         source-ns (or source-ns (the-ns 'raster.compiler.passes.scalar.inline-test))]
+     (entry/call-with-definition-inputs
+      #(source-policy/call-with-policy
+        policy
+        (fn []
+          (let [{:keys [projection body]} (construct!)
+                interface (types/ensure-fn-interface! tags)
+                {:keys [implementation emission]}
+                (core/emit-owned-bytecode!
+                 bytecode/compile-typed-impl!
+                 (str "raster.compiled.InlineBodyTest_" (clojure.lang.RT/nextID))
+                 parameters tags return-tag [body] source-ns
+                 (:iface-name interface) 'inline-body @entry/*emission-inputs*)
+                emission (bytecode/prepare-emitted-global-invocations! emission)
+                guard (entry/prepare-emission-input-guard! emission)]
+            [projection (fn [& arguments]
+                          (guard)
+                          (let [result (apply implementation arguments)]
+                            (guard)
+                            result))])))))))
+
+(deftm history-constant-seven [input :- (Array double)] :- Long 7)
+
+(defmacro define-history-caller [name n]
+  (let [ids (mapv #(symbol (str "answer" %)) (range n))
+        bindings
+        (vec (mapcat (fn [id]
+                       [id (list 'raster.compiler.passes.scalar.inline-test/history-constant-seven
+                                 'input)])
+                     ids))]
+    (list 'raster.core/deftm name '[input :- (Array double)] ':- 'Long
+          (list 'let* bindings (peek ids)))))
+
+(declare history-constant-two history-constant-sixteen)
+(define-history-caller history-constant-two 2)
+(define-history-caller history-constant-sixteen 16)
+
+(deftm owned-long-identity [x :- Long] :- Long x)
+
+(deftm nested-owned-long-identity [x :- Long] :- Long
+  (owned-long-identity (owned-long-identity x)))
+
+(deftm loop-initializer-owned-long-identity [offset :- Long] :- Long
+  (loop [i 0 acc (owned-long-identity (long (+ offset 2)))]
+    (if (< i 3) (recur (inc i) (+ acc i)) acc)))
+
+(defn- prepared-caller [caller]
+  (let [source-var (core/resolve-deftm-var caller)
+        facts (pipeline/deftm-frontend-facts source-var :double)
+        source (first (pipeline/get-walked-body source-var :double))
+        parameters (:parameters facts)]
+    {:source-var source-var
+     :facts facts
+     :source source
+     :options {:source-var source-var :source-ns (:source-ns facts)
+               :active-params parameters :public-parameters parameters}
+     :header {:tags (mapv (:param-env facts) parameters)
+              :return-tag (:return-tag facts)
+              :source-ns (:source-ns facts)
+              :policy (:source-policy facts)}}))
+
+(defn- prepared-history-helper []
+  (let [source (core/resolve-deftm-var #'history-constant-seven)]
+    (core/prepare-emission-source-walk! source)
+    (entry/call-with-definition-inputs #(entry/original-source-frontend source))))
 
 (defn- prepared-sum-source []
   (let [source (core/resolve-deftm-var #'raster.par/sum)]
@@ -69,28 +120,70 @@
                      (range n)))
         (symbol (str "answer" (dec n)))))
 
-(deftest complete-inline-expansion-does-not-multiply-unrelated-parent-history
-  (let [frontend (prepared-sum-source)
+(deftest owned-backend-expansion-does-not-multiply-unrelated-parent-history
+  ;; Close normal first-invocation publication before measuring retained history.
+  ;; This test measures expansion, not JIT preparation of the remaining calls.
+  (doseq [caller [history-constant-seven history-constant-two history-constant-sixteen]]
+    (is (= 7 (caller (double-array [1.0])))))
+  (let [frontend (prepared-history-helper)
+        helper (get-in frontend [:source-entry :source-var])
+        implementation (get-in frontend [:definition :implementation-op])
         measurements
-        (mapv (fn [n]
-                (let [visits (atom 0)
-                      guard (reify entry/RetainedProducerInput
-                              (assert-producer-current! [this] (swap! visits inc) this))
-                      parent (atom {:static [] :values [] :producer-inputs [guard]})
-                      source (repeated-sum-source frontend n)
-                      expanded (binding [entry/*emission-inputs* parent]
-                                 (inline/inline-deftm-calls source 3 false true))
-                      checks @visits]
-                  (is (not= source expanded))
-                  (is (= 6.0 (eval (list 'let* ['input '(double-array [1 2 3])] expanded))))
-                  (is (contains? (:definition-proofs @parent)
-                                 (get-in frontend [:source-entry :source-var])))
-                  (is (some #(identical? guard %) (:producer-inputs @parent)))
-                  (is (true? (entry/assert-definition-inputs-current! @parent)))
-                  checks)) [2 16])]
+        (mapv
+         (fn [caller]
+           (let [{:keys [source-var facts source options header]} (prepared-caller caller)
+                 parameters (:parameters facts)
+                 visits (atom 0)
+                 guard (reify entry/RetainedProducerInput
+                         (assert-producer-current! [this] (swap! visits inc) this))
+                 parent (atom {:static [] :values [] :producer-inputs [guard]})
+                 imports (atom 0)
+                 import-source source-import/prepare-original-helper-source
+                 expanded (binding [entry/*emission-inputs* parent]
+                            (with-redefs [source-import/prepare-original-helper-source
+                                          (fn [& args]
+                                            (swap! imports inc)
+                                            (apply import-source args))]
+                              (inline/expand-for-backends source 3 (:param-env facts) options)))
+                 checks @visits
+                 source-calls (count (filter #(and (seq? %) (= '.invk (first %))
+                                                   (= implementation (second %)))
+                                             (tree-seq coll? seq source)))
+                 expanded-calls (count (filter #(and (seq? %) (= '.invk (first %))
+                                                     (= implementation (second %)))
+                                               (tree-seq coll? seq expanded)))
+                 [_ compiled]
+                 (owned-inline-function
+                  parameters header #(hash-map :projection expanded :body expanded))
+                 input (double-array [1.0 2.0 3.0])]
+             (is (pos? source-calls))
+             (is (< expanded-calls source-calls) "a proved helper call actually expands")
+             (is (= 1 @imports) "only the admitted application imports the helper body")
+             (is (= 7 (@caller input) (compiled input)))
+             (is (= [1.0 2.0 3.0] (vec input)))
+             (is (contains? (:definition-proofs @parent) helper))
+             (is (some #(seq (:lookups %)) (:values @parent)))
+             (is (some #(identical? guard %) (:producer-inputs @parent)))
+             (is (true? (entry/assert-definition-inputs-current! @parent)))
+             (is (identical? source-var (:resolved-var facts)))
+             checks))
+         [#'history-constant-two #'history-constant-sixteen])]
     (is (= (first measurements) (second measurements)))
-    (is (<= 1 (first measurements) 6)
+    (is (<= 1 (first measurements) 8)
         "the inherited history is fenced once around the complete expansion")))
+
+(deftest unplanned-real-helper-does-not-import-a-body
+  (let [frontend (prepared-history-helper)
+        call (list '.invk (get-in frontend [:definition :implementation-op]) 'input)
+        owner (atom {:static [] :values []})]
+    (binding [entry/*emission-inputs* owner]
+      (with-redefs [source-import/prepare-original-helper-source
+                    (fn [& _] (throw (AssertionError. "unplanned body import")))
+                    core/prepare-emission-source-walk!
+                    (fn [& _] (throw (AssertionError. "unplanned source preparation")))]
+        (is (= call (#'inline/inline-invk call)))
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Arity mismatch"
+                             (#'inline/inline-invk (list '.invk (second call)))))))))
 
 (deftest no-op-inline-requests-do-not-open-a-new-history-boundary
   (let [visits (atom 0)
@@ -104,37 +197,10 @@
     (is (zero? @visits))
     (is (identical? before @parent))))
 
-(deftest backend-expansion-keeps-unrelated-history-out-of-recursive-invk-queries
-  (let [frontend (prepared-sum-source)
-        implementation (get-in frontend [:definition :implementation-op])
-        helper (get-in frontend [:source-entry :source-var])
-        measurements
-        (mapv (fn [n]
-                (let [visits (atom 0)
-                      guard (reify entry/RetainedProducerInput
-                              (assert-producer-current! [this] (swap! visits inc) this))
-                      parent (atom {:static [] :values [] :producer-inputs [guard]})
-                      ;; A top-level vector deliberately bypasses inline-deftm-calls;
-                      ;; these actual helper queries belong to recursive inline-invk.
-                      source (vec (repeat n (list '.invk implementation 'input)))
-                      expanded (binding [entry/*emission-inputs* parent]
-                                 (inline/expand-for-backends source))
-                      checks @visits]
-                  (is (not= source expanded))
-                  (is (= (vec (repeat n 6.0))
-                         (eval (list 'let* ['input '(double-array [1 2 3])] expanded))))
-                  (is (contains? (:definition-proofs @parent) helper))
-                  (is (some #(seq (:lookups %)) (:values @parent)))
-                  (is (some #(identical? guard %) (:producer-inputs @parent)))
-                  (is (entry/assert-definition-inputs-current! @parent))
-                  checks)) [2 16])]
-    (is (= (first measurements) (second measurements)))
-    (is (<= 1 (first measurements) 6))))
-
 (deftest backend-expansion-fences-the-complete-final-stage-before-adoption
-  (let [frontend (prepared-sum-source)
+  (let [frontend (prepared-history-helper)
         helper (get-in frontend [:source-entry :source-var])
-        source [(list '.invk (get-in frontend [:definition :implementation-op]) 'input)]
+        {:keys [source facts options]} (prepared-caller #'history-constant-two)
         flatten-original inline/flatten-nested-lets
         root (var-get helper)]
     (doseq [change [:already-stale :becomes-stale :replaced :used-helper :throws]]
@@ -165,7 +231,7 @@
                                         :throws (throw failure)
                                         nil))
                                     result))]
-                    (try (inline/expand-for-backends source) nil
+                    (try (inline/expand-for-backends source 3 (:param-env facts) options) nil
                          (catch Exception error error))))]
             (if (= change :throws)
               (is (identical? failure observed))
@@ -238,9 +304,9 @@
         (is (= (not= change :replaced) (identical? before @parent)))))))
 
 (deftest complete-inline-expansion-preserves-local-source-freshness-and-failure-identity
-  (let [frontend (prepared-sum-source)
+  (let [frontend (prepared-history-helper)
         helper (get-in frontend [:source-entry :source-var])
-        source (repeated-sum-source frontend 1)
+        {:keys [source options]} (prepared-caller #'history-constant-two)
         original-root @helper
         expand @#'inline/inline-one-pass]
     (doseq [change [:source-root :throws]]
@@ -258,7 +324,11 @@
                            (throw failure)
                            (alter-var-root helper (constantly (fn [_] -99.0))))
                          result))}
-                    #(try (inline/inline-deftm-calls source 1 false true) nil
+                    #(try (entry/call-with-independent-definition-inputs
+                           (fn []
+                             (inline/call-with-source-input-completions
+                              source options
+                              (fn [] (inline/inline-deftm-calls source 1 false true))))) nil
                           (catch Exception error error))))]
             (if (= change :throws)
               (is (identical? failure observed))
@@ -719,36 +789,38 @@
     (is (:raster.effect/effectful (meta binder)))
     (is (= 'raster.par/map-void! (-> result second second first)))))
 
-(deftest inlining-preserves-unused-checked-arguments
-  (with-redefs-fn {#'inline/try-resolve-deftm
-                  (fn [_] {:params ['x] :tags ['int] :walked-body [42]})}
-    (fn []
-      (let [inlined (#'inline/inline-invk '(.invk example/constant (int 4294967296)))]
-        (is (thrown? ArithmeticException (eval inlined))
-            "an unused checked argument still throws before entering the callee"))
-      (let [inlined (#'inline/inline-invk
-                    '(.invk example/constant (int (do (swap! calls inc) 3))))]
-        (is (= [42 1] (eval (list 'let ['calls '(atom 0)]
-                                 [inlined '(deref calls)]))))))))
+(deftest unowned-helper-descriptions-do-not-authorize-body-copying
+  (let [marker ::forged-helper-body
+        forged {:params ['x] :tags ['long] :return-tag 'long :walked-body [marker]}
+        forms ['(.invk example/constant (int 3))
+               '(.invk example/constant [(swap! calls inc)])
+               '(.invk example/constant {:key (swap! calls inc)})
+               '(.invk example/constant #{(swap! calls inc)})
+               '(.invk example/identity (.invk example/identity (+ 1 2)))
+               '(loop* [i 0 acc (.invk example/identity (long (+ i 2)))]
+                  (if (< i 3) (recur (inc i) (+ acc i)) acc))]
+        owner (atom {:static [] :values []})]
+    (with-redefs-fn {#'inline/try-resolve-deftm (fn [& _] forged)}
+      (fn []
+        (doseq [source forms]
+          (let [result (binding [entry/*emission-inputs* owner]
+                         (#'inline/inline-invk source))
+                invocations (fn [form]
+                              (count (filter #(and (seq? %) (= '.invk (first %)))
+                                             (tree-seq coll? seq form))))]
+            (is (= (invocations source) (invocations result)))
+            (is (not-any? #(= marker %) (tree-seq coll? seq result))
+                "params/tags/body without an exact caller owner are not inline authority")))))
+    (is (empty? (:definition-proofs @owner)))))
 
 (deftest direct-inline-arity-is-checked-before-substitution
   (with-redefs-fn {#'inline/try-resolve-deftm
-                  (fn [_] {:params ['x] :tags ['long] :walked-body [42]})}
+                  (fn [& _] {:params ['x] :tags ['long] :walked-body [42]})}
     (fn []
       (doseq [call ['(.invk example/constant)
                    '(.invk example/constant 1 (swap! calls inc))]]
         (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Arity mismatch"
                              (#'inline/inline-invk call)))))))
-
-(deftest unused-collection-arguments-still-evaluate-their-elements
-  (with-redefs-fn {#'inline/try-resolve-deftm
-                  (fn [_] {:params ['x] :walked-body [42]})}
-    (fn []
-      (doseq [argument ['[(swap! calls inc)] '{:key (swap! calls inc)}
-                       '#{(swap! calls inc)}]]
-        (let [inlined (#'inline/inline-invk (list '.invk 'example/constant argument))]
-          (is (= [42 1] (eval (list 'let ['calls '(atom 0)]
-                                   [inlined '(deref calls)])))))))))
 
 (deftest local-function-inlining-preserves-call-by-value
   (doseq [body [nil false 42 '(+ x x)]
@@ -764,35 +836,20 @@
       (is (= [(if (seq? body) 6 body) 1]
              (eval (list 'let ['calls '(atom 0)] [executable '(deref calls)])))))))
 
-(deftest binding-inline-accepts-constant-leaves
-  (with-redefs-fn {#'inline/try-resolve-deftm
-                  (fn [& _] {:params ['x] :tags ['long] :walked-body [42]})}
-    (fn []
-      (let [inlined (:form (#'inline/inline-one-pass
-                           '(let* [result (example/constant (int 4294967296))] result)))]
-        (is (thrown? ArithmeticException (eval inlined)))))))
-
-(deftest nested-argument-calls-are-expanded-before-lifting
-  (with-redefs-fn {#'inline/try-resolve-deftm
-                  (fn [_] {:params ['x] :tags ['long] :walked-body ['x]})}
-    (fn []
-      (let [inlined (#'inline/inline-invk
-                    '(.invk example/identity (.invk example/identity (+ 1 2))))]
-        (is (not-any? #(and (seq? %) (= '.invk (first %)))
-                      (tree-seq coll? seq inlined)))
-        (is (= 3 (eval inlined)))))))
-
-(deftest inlining-visits-loop-initializers-without-changing-binders
-  (with-redefs-fn {#'inline/try-resolve-deftm
-                  (fn [_] {:params ['x] :tags ['long] :walked-body ['x]})}
-    (fn []
-      (let [inlined (#'inline/inline-invk
-                    '(loop* [i 0 acc (.invk example/identity (long (+ i 2)))]
-                       (if (< i 3) (recur (inc i) (+ acc i)) acc)))]
-        (is (= ['i 'acc] (vec (take-nth 2 (second inlined)))))
-        (is (not-any? #(and (seq? %) (= '.invk (first %)))
-                      (tree-seq coll? seq inlined)))
-        (is (= 5 (eval inlined)))))))
+(deftest genuine-nested-and-loop-helper-callers-retain-public-behavior
+  (doseq [[caller inputs expected]
+          [[#'nested-owned-long-identity [3] 3]
+           [#'loop-initializer-owned-long-identity [0] 5]
+           [#'loop-initializer-owned-long-identity [4] 9]]]
+    (let [compiled (pipeline/compile-aot caller :simd? false)]
+      (is (= expected (apply @caller inputs) (apply compiled inputs)))))
+  (let [{:keys [source facts options]} (prepared-caller #'loop-initializer-owned-long-identity)
+        expanded (entry/call-with-definition-inputs
+                  #(inline/expand-for-backends source 3 (:param-env facts) options))
+        loop-form (some #(when (and (seq? %) (= 'loop* (first %))) %)
+                        (tree-seq coll? seq expanded))]
+    (is (some? loop-form))
+    (is (= ['i 'acc] (mapv #(with-meta % nil) (take-nth 2 (second loop-form)))))))
 
 (deftest late-dispatch-resolution-preserves-segmented-fold-schedule-requests
   (let [request {:association :implementation-defined}

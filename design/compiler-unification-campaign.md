@@ -48,7 +48,7 @@ tails, empty and changed inputs and a precision-sensitive narrowing negative.
 This deterministic defect is not yet established as the intermittent maxpool
 error's cause. Exact-head CI qualification is still required.
 
-The uncommitted whole-call inliner migration has a consolidated real-owner
+The bounded whole-call inliner migration has a consolidated real-owner
 source/arity/history gate passing 34 tests / 300 assertions. Five fabricated
 positive helper-metadata cases are replaced by one no-owner refusal test;
 genuine nested/loop callers and exact-header bytecode execution retain public
@@ -58,7 +58,14 @@ import; body/exit certification still follows it in a disposable owner. The
 history oracle closes first-invocation publication before measuring expansion,
 and observes one body import for its admitted application. Unplanned calls
 import nothing and retain wrong-arity diagnostics. The checked-input/capacity
-gate separately passes 10 tests / 61 assertions.
+gate and public input-completion cases separately pass 13 tests / 79 assertions.
+The mixed-precision optimizer's real generated field→typed-check→update route
+passes one test / 20 assertions with the migration. Independent review found
+no blocker in its ordered conversion, publication, history and causal-storage
+boundaries. It deliberately retains unplanned calls: multi-call heat composition
+still lacks a complete sequential site plan. GSDM training gets past the earlier
+host-alias refusal but then correctly refuses an unexpanded array-return helper;
+neither workload is qualified by these narrow passing gates.
 
 The shared AD prerequisite now closes the previously failing helper/allocation
 boundary. It isolates AD from an enclosing pipeline's source-call context and
@@ -83,7 +90,7 @@ found no remaining blocker in this bounded extension. Compound input regions,
 arithmetic count/index regions and fresh-storage writes still decline; this is
 not complete AD or full CI qualification.
 
-The wider inliner/native migration remains unqualified. Native reference
+The wider sequential/reference-return inliner and native migration remain unqualified. Native reference
 storage, checked failure propagation and cold source-call correspondence need
 their own closed consumers; no blanket marker stripping or identity AD rule
 waives those obligations.

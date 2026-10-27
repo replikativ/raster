@@ -408,7 +408,8 @@
         normalized (normalize-let-body form)
         result (if (:inline? opts)
                  (with-bindings {#'inline/*param-env* (:param-env opts)}
-                   (inline/lower-to-ad-primitives normalized))
+                   (inline/call-with-source-input-completions
+                    normalized opts #(inline/lower-to-ad-primitives normalized)))
                  normalized)
         ;; Ensure result is a let* form (dialect requirement)
         let-form (if (form/binding-form? result)
@@ -431,7 +432,7 @@
   Runs after buffer-fuse so rewritten ops (e.g. transpose-2d!) get inlined too.
   (=> :buffer-fused :expanded)"
   [form opts]
-  (let [expanded (inline/expand-for-backends form 3 (:param-env opts))]
+  (let [expanded (inline/expand-for-backends form 3 (:param-env opts) opts)]
     (if (= expanded form)
       form
       {:form expanded
@@ -537,7 +538,7 @@
           (record-fixpoint-census! :final final opts)
           {:form final :stats total-stats})
         (let [;; Step 1: Expand (inline deftm calls + value+grad AD inlining)
-              expanded (inline/expand-for-backends current 3 (:param-env opts))
+              expanded (inline/expand-for-backends current 3 (:param-env opts) opts)
               ;; Local nonescaping value products have the same scalar meaning
               ;; on JVM, C and accelerators. Preserve escaping objects, exact
               ;; factory ownership and ordered argument/conversion obligations.
@@ -1493,7 +1494,7 @@
                          inline/*preserve-canonical-intrinsics?* true]
                  (-> source
                      (inline/resolve-generic-deftm-calls (:param-env opts))
-                     (inline/expand-for-backends 3 (:param-env opts))
+                     (inline/expand-for-backends 3 (:param-env opts) opts)
                      (inline/resolve-generic-deftm-calls (:param-env opts))))
         _ (source-declaration/validate-native-array-declarations! source)
         typed (semantic-program-attempt source opts
