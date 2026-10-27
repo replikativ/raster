@@ -431,21 +431,25 @@
     (let [f (compiled ['failure] (completion/complete-value contract '(throw failure)))]
       (is (= {:error IllegalStateException} (outcome f (IllegalStateException. "stop")))))))
 
-(defn- owned-long-completion
-  ([operand] (owned-long-completion operand '[long long]))
-  ([operand tags]
+(defn- owned-integral-completion
+  [operand tags target]
   (let [contract (completion/bytecode-integral-input-contract
-                  Long/TYPE (completion/bytecode-operand-context
-                             {:preserve-source-call-results? true}))
+                  target (completion/bytecode-operand-context
+                          {:preserve-source-call-results? true}))
         original (completion/complete-value contract operand)
         input-body [original]
-        interface (types/ensure-fn-interface! tags)]
+        interface (types/ensure-fn-interface! tags)
+        return-tag (if (identical? Integer/TYPE target) 'int 'long)]
     (assoc (#'core/emit-owned-bytecode!
-            bytecode/compile-typed-impl! "raster.compiled.CompoundLongCompletion"
-            '[left right] tags 'long input-body
+            bytecode/compile-typed-impl! "raster.compiled.CompoundIntegralCompletion"
+            '[left right] tags return-tag input-body
             (the-ns 'raster.compiler.backend.jvm.bytecode-input-completion-test)
-            (:iface-name interface) 'compound-long-completion)
-           :input-body input-body :original original))))
+            (:iface-name interface) 'compound-integral-completion)
+           :input-body input-body :original original)))
+
+(defn- owned-long-completion
+  ([operand] (owned-long-completion operand '[long long]))
+  ([operand tags] (owned-integral-completion operand tags Long/TYPE)))
 
 (defonce completion-reference-inputs (atom []))
 
@@ -505,6 +509,51 @@
               actual (outcome (:invoke region) left right)]
           (is (= expected actual))
           (is (= (+ before 2) @input-calls) "each replay evaluates the callback exactly once"))))))
+
+(deftest owned-compound-int-completion-preserves-raw-narrowing-order-and-overflow
+  (doseq [operand [(list 'do '(clojure.core/swap! input-calls clojure.core/inc)
+                              '(clojure.core/* left right))
+                   (typed-helper-call #'integral-long-caller
+                                      '(clojure.core/* left right))
+                   (typed-helper-call #'integral-int-caller
+                                      '(clojure.core/int (clojure.core/* left right)))]]
+    (let [{:keys [implementation emission input-body original]}
+          (owned-integral-completion operand '[long long] Integer/TYPE)
+          record (bytecode/retained-input-completion-context emission input-body original)
+          before @input-calls
+          region (bytecode/compile-owned-bytecode-completion-region emission input-body original)]
+      (is (= before @input-calls) "constructing the Int replay executes no operand")
+      (is (= '[left right] (:parameters region)))
+      (is (= #{:long} (set (map :type (vals (:physical-ports region))))))
+      (is (contains? #{:long :ref} (:input-carrier record)))
+      (is (identical? Integer/TYPE (.getReturnType ^java.lang.reflect.Method (:method region))))
+      (doseq [[left right] [[0 0] [3 2] [-1 1] [4294967297 1]
+                            [65536 65536] [Long/MAX_VALUE Long/MAX_VALUE]]]
+        (is (= (outcome implementation left right)
+               (outcome (:invoke region) left right))
+            "the outlined completion keeps the original JVM l2i/Number.intValue behavior")))))
+
+(deftest owned-int-completion-faithfully-replays-an-actual-reference-input
+  (let [operand '(observe-completion-reference-input right)
+        {:keys [implementation emission input-body original]}
+        (owned-integral-completion operand '[long Object] Integer/TYPE)
+        record (bytecode/retained-input-completion-context emission input-body original)
+        region (bytecode/compile-owned-bytecode-completion-region emission input-body original)
+        conversions (atom 0)
+        number (proxy [Number] []
+                 (intValue [] (swap! conversions inc) (int 7))
+                 (longValue [] (long 7))
+                 (floatValue [] (float 7))
+                 (doubleValue [] (double 7)))]
+    (is (= :ref (:input-carrier record)))
+    (is (= ['right] (:parameters region)))
+    (is (= [Object] (vec (.getParameterTypes ^java.lang.reflect.Method (:method region)))))
+    (doseq [right [(Long/valueOf 3) nil "not a Number" number]]
+      (reset! completion-reference-inputs [])
+      (is (= (outcome implementation 0 right) (outcome (:invoke region) right)))
+      (is (= 2 (count @completion-reference-inputs)))
+      (is (every? #(identical? right %) @completion-reference-inputs)))
+    (is (= 2 @conversions) "each original/reference replay performs its actual intValue callback")))
 
 (deftest primitive-long-quot-observes-only-actual-identity-inputs
   (let [node '(clojure.core/quot left right)

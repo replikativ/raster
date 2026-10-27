@@ -4,6 +4,25 @@
 
 ### Current boundary ledger
 
+October 27 continuation: exact head `153b29946` is **draft, not merge-ready**.
+Unit job35358 completes all16 shards:7,774 tests /95,541 pass /101 failures /
+122 errors across138 failing Vars. Compared with061, seven new failing Vars
+expose graph scalar-interface and product-consumer fusion regressions in common
+component routing; one prior allocation-order Var recovers. These are required
+repairs, not accepted performance regressions or waived tests. CPU35357 completes
+all4 shards:682 tests /7,635 pass /20 failures /73 errors across79 failing Vars.
+Emission remains red; missing vendor checks are not passes. No merge/release.
+
+The integral-count follow-up preserves actual JVM Int narrowing separately from
+checked source arithmetic and mathematical capacity. Focused bytecode/source
+tests pass41/686; existing completion/plan regressions pass17/337, with existing
+ordered device replay1/54. Actual group-normalization now compiles with four
+double scratch allocations and a float output, and replays two shapes with two
+changed inputs on both OpenCL and Level Zero against the JVM (eight comparisons,
+zero maximum error on these inputs). It emits eight kernels including four
+conservative zero fills. Eliminating those fills requires a real extent/storage
+proof; Int-narrowed counts must not simply be equated to Long products.
+
 Latest completed unit CI is `061bf13ef` (35338, all16): 7,769 tests /
 95,508 pass / 53 failures / 112 errors across132 failing Vars. Three prior Vars
 recover; three newly failing Vars expose bare session/descriptor paths that do

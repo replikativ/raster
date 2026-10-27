@@ -954,7 +954,7 @@
              (and (= :scalar (:kind result)) (contains? '#{float double long int} (:tag result))))
          (or (= 1 (count (:operands step)))
              (and (seq (:operands step))
-                  (completion/planned-compound-long-input-parts (:expression step)))
+                  (completion/planned-compound-integral-input-parts (:expression step)))
              (and (empty? (:operands step))
                   (completion/numeric-object-literal-carrier (:expression step)))))))
 

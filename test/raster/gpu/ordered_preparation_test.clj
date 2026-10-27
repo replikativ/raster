@@ -20,6 +20,7 @@
             [raster.par :as par]
             [raster.arrays :as arrays]
             [raster.numeric :as n]
+            [raster.dl.nn :as nn]
             [raster.compiler.passes.scalar.effects :as effects]
             [raster.compiler.passes.scalar.source-import :as source-import]
             [raster.compiler.passes.parallel.structured-control-route :as structured]
@@ -353,6 +354,41 @@
   (if @ze-probe/gpu-available?
     (check-compound-input-frame! :ze:0 #'compound-frame-zero-map nil false)
     (ze-probe/gpu-skip! "completed allocation count")))
+
+(defn- check-groupnorm-count-frames! [target]
+  (let [compilation (equation-first/compile #'nn/group-norm-jvp-dx
+                                           {:target target :dtype :float})]
+    ;; Reuse one executable across different counts and changed read-only data.
+    ;; The four double scratch constructors consume Int counts; alloc-like's
+    ;; output consumes Long. Neither conversion proves mathematical capacity.
+    (is (seq (:source-completion-adapters compilation)))
+    (doseq [[batch channels spatial groups] [[1 2 4 1] [2 4 3 2]]]
+      (let [size (* batch channels spatial)
+            dx (float-array (map #(* 0.15 (- (mod % 5) 2)) (range size)))
+            x (float-array (map #(+ 0.2 (* 0.25 (mod % 7))) (range size)))
+            gamma (float-array (map #(+ 0.75 (* 0.1 %)) (range channels)))
+            arguments [dx x gamma (long batch) (long channels) (long spatial) (long groups) 1.0e-5]
+            live (link/instantiate-ordered-invocation! compilation arguments {})]
+        (try
+          (doseq [scale [1.0 -0.4]]
+            (dotimes [i size] (aset x i (float (+ 0.1 (* scale (inc i) 0.07)))))
+            (let [expected (apply nn/group-norm-jvp-dx arguments)]
+              (link/run! live)
+              (let [actual (link/download live (first (keys (link/outputs live))))]
+                (is (= (class expected) (class actual)))
+                (is (= (alength ^floats expected) (alength ^floats actual)))
+                (doseq [i (range (alength ^floats expected))]
+                  (is (< (Math/abs (- (double (aget ^floats expected i))
+                                      (double (aget ^floats actual i)))) 2.0e-5))))))
+          (finally (link/close! live)))))))
+
+(deftest groupnorm-replays-owned-int-and-long-allocation-counts
+  (if @ocl-probe/opencl-available?
+    (check-groupnorm-count-frames! :ocl:0)
+    (ocl-probe/opencl-skip! "groupnorm integral allocation counts"))
+  (if @ze-probe/gpu-available?
+    (check-groupnorm-count-frames! :ze:0)
+    (ze-probe/gpu-skip! "groupnorm integral allocation counts")))
 
 (deftm completed-float-terminal [completed :- Float] :- Float
   (let [out (float-array 1)]

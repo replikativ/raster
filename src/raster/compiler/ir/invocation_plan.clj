@@ -337,7 +337,7 @@
 
       (source-completion? step)
       (let [{:keys [contract operand]} (completion/canonical-parts (:expression step))
-            compound (completion/planned-compound-long-input-parts (:expression step))
+            compound (completion/planned-compound-integral-input-parts (:expression step))
             result (completion/invocation-result-description contract)
             expected (some-> (:tag result) dtype/dtype-for-scalar-tag)
             symbols (set (keys operands))]

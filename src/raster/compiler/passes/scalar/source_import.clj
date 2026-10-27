@@ -199,7 +199,7 @@
         sites (filterv #(= (:symbol step) (first (second %))) (map-indexed vector pairs))
         [position [binder expression]] (first sites)
         {:keys [contract operand]} (completion/canonical-parts expression)
-        compound (completion/planned-compound-long-input-parts expression)
+        compound (completion/planned-compound-integral-input-parts expression)
         result-description (completion/invocation-result-description contract)
         operands (:operands step)
         input (first operands)
@@ -239,7 +239,7 @@
      :operand operand :operand-id (:value input) :input-kind input-kind :result-kind result-kind
      :input-dtype input-dtype :result-dtype result-dtype}))
 
-(declare validate-contextual-source-witness! current-source-binding! current-compound-long-frame!)
+(declare validate-contextual-source-witness! current-source-binding! current-compound-integral-frame!)
 
 (defn ^:no-doc validate-source-completion-step!
   "Authenticate a complete owner-local adapter against the CURRENT execution boundary.
@@ -295,7 +295,8 @@
            compound-frame (when (:compound? binding)
                             (when-not witness
                               (fail! :source-completion-step-witness "compound input requires its final current witness" {}))
-                            (current-compound-long-frame! witness (:source-position binding) current observed))
+                            (current-compound-integral-frame!
+                             witness (:source-position binding) current observed))
            literal? (= :literal (:input-kind binding))
            port (when (and current (not literal?) (not (:compound? binding)))
                   (get (:before current) (:operand binding)))
@@ -2175,13 +2176,17 @@
                                                  (= :coerce (:adaptation completed)))) uses)))) references))))
       {:ports ports :reference-ports references})))
 
-(defn- current-compound-long-frame!
-  "Rederive the compound step's representation proof from its FINAL witness.
+(defn- current-compound-integral-frame!
+  "Rederive the compound Int/Long step's representation proof from its FINAL witness.
    Earlier normalization receipts or logical Long tags are not physical facts."
   [witness position current observed]
   (let [bindings (second (:scope witness))
         projector (closed-source-effect-projector (java.util.IdentityHashMap.))
-        emission (:emission witness)]
+        emission (:emission witness)
+        target (get-in observed [:contract :target-carrier])
+        target-stack (cond
+                       (identical? Integer/TYPE target) :int
+                       (identical? Long/TYPE target) :long)]
     (loop [ordinal 0 facts {}]
       (let [id (nth bindings (* 2 ordinal))
             expression (nth bindings (inc (* 2 ordinal)))
@@ -2198,13 +2203,103 @@
             (when-not (and frame (= (:before binding) (:before current) (:locals-before observed))
                            (identical? (:initializer binding) (:initializer current))
                            (identical? (:initializer binding) (:expression observed))
-                           (= :long (:stack result) (get-in current [:after :type]))
-                           (= :long (:completion-carrier observed) (:returned-carrier observed))
+                           target-stack
+                           (= target-stack (:stack result) (get-in current [:after :type]))
+                           (= target-stack (:completion-carrier observed)
+                              (:returned-carrier observed))
                            (false? (:object-parent? observed)))
               (fail! :source-completion-compound-ports
-                     "compound completion lacks its exact scalar Long physical frame" {:position position}))
+                     "compound completion lacks its exact scalar integral physical frame"
+                     {:position position :target target}))
             frame)
           (recur (inc ordinal) (assoc facts id {:local (:after binding) :result result})))))))
+
+(defn- direct-array-constructor-class
+  "Resolve only the shared dtype table's primitive-array constructor facet.
+   This is syntax routing plus Class lookup; current bytecode evidence below is
+   still required before constructing any source replacement."
+  [expression]
+  (when (and (seq? expression) (= 2 (count expression)) (symbol? (first expression)))
+    (some (fn [[_ facets]]
+            (when (= (first expression) (:jvm-array-constructor facets))
+              (Class/forName (:jvm-array-class-name facets))))
+          dtype/dtype-info)))
+
+(defn- construct-contextual-array-count-frame
+  "Name one exact owned newarray count at its original constructor site.
+   The physical count is JVM Int, while every public/frame input remains in
+   the existing Long domain. This transports wrapping and failure order only;
+   it grants no equality with a mathematical Long extent or capacity fact."
+  [witness original binding facts projector]
+  (let [{:keys [emission input-body]} witness
+        array-class (direct-array-constructor-class original)
+        record (when (and array-class (seq? (second original)))
+                 ((helper-backend 'retained-input-array-count-context)
+                  emission input-body original))
+        allocation (:allocation record)
+        allocation-count (:count allocation)
+        raw (:input-type record)
+        count-result (when record
+                       ((:value projector) emission (:before binding) facts (:operand record)))
+        frame-proof (when record
+                      (closed-long-frame-ports witness binding facts record))]
+    (when (and record allocation
+               (identical? original (:source-input record))
+               (identical? (second original) (:source-original record))
+               (identical? (:initializer binding) (:expression allocation))
+               (identical? array-class (:array-class allocation))
+               (true? (:fresh? allocation)) (= :jvm-zero (:initialization allocation))
+               (= :int (:completed-type record)) (= :raw-jvm-int (:completion record))
+               (source-policy/valid? (:source-policy record))
+               (= (:source-policy witness) (:source-policy record))
+               (identical? (:operand record) (:operand allocation-count))
+               (= (select-keys allocation-count
+                               [:operand :context :ports :unretained-sibling-calls?
+                                :source-policy :input-type :completed-type :completion])
+                  (select-keys record
+                               [:operand :context :ports :unretained-sibling-calls?
+                                :source-policy :input-type :completed-type :completion]))
+               (contains? #{:int :long :ref} raw)
+               count-result (identical? (:actual count-result) (:operand record))
+               (= raw (:stack count-result))
+               (or (contains? #{:int :long} raw)
+                   (identical? Long (:builtin-class count-result)))
+               frame-proof)
+      (let [contract (completion/planned-bytecode-input-contract
+                      Integer/TYPE (:context record) raw)
+            input (assoc (select-keys record
+                                      [:operand :context :ports :unretained-sibling-calls?])
+                         :contract contract :completion allocation)
+            parameter (gensym "array_count_formal__")
+            value (with-meta (gensym "completed_array_count__") {:raster.type/tag 'int})
+            source-count (:source-original record)
+            frame (construct-invocation-input-frame
+                   [input] [parameter] [value] (:scope witness) [source-count])
+            call (util/remake-from original (list (first original) value))
+            artifact {:frame frame :exported-ordinals [0]
+                      :exported-bindings (:bindings frame)
+                      :call call :original original :witness witness
+                      :physical-count record :allocation allocation}]
+        (retain-owned-artifact!
+         artifact
+         #(let [current ((helper-backend 'retained-input-array-count-context)
+                         emission input-body original)]
+            (validate-contextual-source-witness! witness)
+            (when-not (and current
+                           (identical? (:source-input record) (:source-input current))
+                           (identical? (:source-original record) (:source-original current))
+                           (identical? (:owned-source record) (:owned-source current))
+                           (identical? allocation (:allocation current))
+                           (identical? (:operand record) (:operand current))
+                           (= (select-keys record
+                                           [:context :ports :unretained-sibling-calls?
+                                            :source-policy :input-type :completed-type :completion])
+                              (select-keys current
+                                           [:context :ports :unretained-sibling-calls?
+                                            :source-policy :input-type :completed-type :completion])))
+              (fail! :source-input-array-count-correspondence
+                     "array count frame differs from its exact current constructor"
+                     {}))))))))
 
 (defn- construct-contextual-input-frame
   "Name one exact call's completed arguments without importing its body.
@@ -2237,9 +2332,10 @@
                                   compound? (seq? argument)]
                               (and (= (:stack result) raw)
                                    (if compound?
-                                     (and (identical? Long/TYPE carrier)
-                                          (contains? #{:long :ref} raw)
-                                          (or (= :long raw) (identical? Long (:builtin-class result)))
+                                     (and (contains? #{Integer/TYPE Long/TYPE} carrier)
+                                          (contains? #{:int :long :ref} raw)
+                                          (or (contains? #{:int :long} raw)
+                                              (identical? Long (:builtin-class result)))
                                           (boolean (closed-long-frame-ports witness binding facts input)))
                                      (and (symbol? argument)
                                           (= {argument (get before argument)} (:ports input))
@@ -2306,10 +2402,11 @@
               (assert-helper-occurrence-current! emission input-body original record)))))))
 
 (defn ^:no-doc project-contextual-invocation-arguments
-  "Normalize callback-free compound Long arguments at their original call site.
+  "Normalize callback-free compound Long arguments at their original call site,
+   including the JVM Int count consumed by an exact primitive-array constructor.
    Reuse the existing ordered input-frame constructor; retain the same global
    call and return behavior. Unknown prefixes/operands stop coverage. No source
-   execution, numerical equation, allocation or successful-check credit follows."
+   execution, numerical equation, mathematical capacity or successful-check credit follows."
   ([witness] (project-contextual-invocation-arguments witness {}))
   ([witness options]
   (when method-entry/*emission-inputs*
@@ -2335,7 +2432,10 @@
                    original (nth bindings (inc (* 2 ordinal)))
                    observed (current-source-binding!
                              witness ordinal binder original :source-input-frame-binding :source-input-frame-observation)
-                   frame (construct-contextual-input-frame witness original observed facts projector)
+                   frame (or (construct-contextual-array-count-frame
+                              witness original observed facts projector)
+                             (construct-contextual-input-frame
+                              witness original observed facts projector))
                    constructed (cond-> constructed
                                  ;; The frame keeps original occurrence evidence privately.
                                  ;; Its NEW source initializers must acquire new occurrences
@@ -2353,13 +2453,16 @@
                  (finish (into constructed (drop (* 2 (inc ordinal)) bindings)) frames)))))))))))
 
 (defn ^:no-doc contextual-invocation-argument-candidate?
-  "Cheap routing only; exact current invocation and callback closure are separate."
+  "Cheap routing only; exact current invocation/constructor and callback closure are separate."
   [source]
   (boolean
    (and (seq? source) (= 'let* (first source)) (vector? (second source))
         (some (fn [[_ expression]]
-                (and (seq? expression) (= '.invk (first expression))
-                     (some seq? (drop 2 expression))))
+                (and (seq? expression)
+                     (or (and (= '.invk (first expression))
+                              (some seq? (drop 2 expression)))
+                         (and (direct-array-constructor-class expression)
+                              (seq? (second expression))))))
               (partition 2 (second source))))))
 
 (defn ^:no-doc project-contextual-reference-helpers

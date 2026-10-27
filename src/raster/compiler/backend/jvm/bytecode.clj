@@ -7943,7 +7943,7 @@
     region))
 
 (defn ^:no-doc compile-owned-bytecode-completion-region
-  "Replay one CURRENT owned bytecode Long completion with actual Long/Object ports.
+  "Replay one CURRENT owned bytecode Int/Long completion with actual Long/Object ports.
    The original compound operand, evaluation contexts and source policy remain
    executable. This proves physical replay/ownership only, NOT callback closure,
    totality, source scheduling, transfer or permission to freeze mutable callees.
@@ -7951,18 +7951,21 @@
   [emission input-body original]
   (let [record (retained-input-completion-context emission input-body original)
         contract (:contract record)
+        target (:target-carrier contract)
+        target-stack (when (contains? #{Integer/TYPE Long/TYPE} target)
+                       (class-type->stack target))
         input (:operand-input record)
         ports (:ports input)
         policy (:operand-source-policy record)
-        unowned! #(throw (ex-info "Bytecode completion needs its exact current Long occurrence"
+        unowned! #(throw (ex-info "Bytecode completion needs its exact current integral occurrence"
                                  {:reason :unowned-bytecode-completion-region}))]
     (when-not (and record (= :jvm-bytecode-integral-input (:source-context contract))
                    (completion/canonical-contract? contract)
-                   (identical? Long/TYPE (:target-carrier contract))
-                   (contains? #{:long :ref} (:input-carrier record))
-                   (= :long (:completion-carrier record) (:returned-carrier record))
+                   target-stack
+                   (contains? #{:int :long :ref} (:input-carrier record))
+                   (= target-stack (:completion-carrier record) (:returned-carrier record))
                    (false? (:object-parent? record))
-                   (= (typed-input-adaptation (:input-carrier record) Long/TYPE) (:adaptation record))
+                   (= (typed-input-adaptation (:input-carrier record) target) (:adaptation record))
                    (map? input) (map? ports) (seq ports)
                    (every? (fn [[id port]]
                              (and (symbol? id)
@@ -7987,8 +7990,9 @@
                                          (identical? input (:operand-input current)))
                             (unowned!))))
           region (compile-planned-recipe-region
-                  emission input Long/TYPE recipe
-                  {:return-tag 'long :source-policy policy :element-type (:element-type record)
+                  emission input target recipe
+                  {:return-tag (symbol (.getName ^Class target))
+                   :source-policy policy :element-type (:element-type record)
                    ::body-input-context (:site-context record)}
                   owner-guard
                   (fn [observations]

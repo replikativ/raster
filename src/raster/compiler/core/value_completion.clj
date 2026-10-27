@@ -310,15 +310,16 @@
   (let [parts (canonical-parts expression)]
     (when (= object-input-contract (:contract parts)) parts)))
 
-(defn planned-compound-long-input-parts
-  "Recognize a declared owned input recipe, not its provenance or executability.
+(defn planned-compound-integral-input-parts
+  "Recognize a declared owned Int/Long result recipe, not its provenance or executability.
    Actual Method/completion, current ports, callback closure and representation
-   correspondence must still be established by the source consumer."
+   correspondence must still be established by the source consumer. Its input
+   values remain a separate, currently Long-only physical-frame obligation."
   [expression]
   (let [{:keys [contract operand] :as parts} (canonical-parts expression)]
     (when (and (= :jvm-bytecode-integral-input (:source-context contract))
-               (identical? Long/TYPE (:target-carrier contract))
-               (contains? #{:long :ref} (:expected-input-carrier contract))
+               (contains? #{Integer/TYPE Long/TYPE} (:target-carrier contract))
+               (contains? #{:int :long :ref} (:expected-input-carrier contract))
                (seq? operand))
       parts)))
 

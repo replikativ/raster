@@ -30,6 +30,10 @@
         out (arrays/alloc-like values (n/* width span))]
     out))
 
+(deftm direct-array-count-frame [width :- Long] :- (Array float)
+  (let [out (float-array (n/* width width))]
+    out))
+
 (defn- prepared-source [function]
   (let [source (core/resolve-deftm-var function)]
     (core/ensure-current-owned-bytecode!
@@ -119,6 +123,113 @@
                       (observe (:implementation current) reference width))))
              (is (nil? (source-import/project-contextual-invocation-arguments current))
                  "completed leaf arguments make this normalization idempotent"))))))))
+
+(deftest direct-array-count-frame-preserves-owned-int-completion-and-constructor-order
+  (let [source (prepared-source #'direct-array-count-frame)]
+    (entry/call-with-definition-inputs
+     (fn []
+       (let [frontend (entry/original-source-frontend source)
+             body (first (:body frontend))
+             options {:source-var source :source-ns (.ns ^clojure.lang.Var source)
+                      :lexical-inputs (get-in frontend [:emission :params])}
+             witness (source-import/prepare-contextual-source-witness body options)
+             projected (source-import/project-contextual-invocation-arguments
+                        witness {:required? true})]
+         (is (= 1 (count (:frames projected))))
+         (when projected
+           (let [artifact (first (:frames projected))
+                 before (:original artifact)
+                 after (:call artifact)
+                 physical (:physical-count artifact)
+                 rederived (bytecode/retained-input-array-count-context
+                            (:emission witness) (:input-body witness) before)
+                 [[count-id count-expression]] (get-in artifact [:frame :bindings])
+                 projected-count (some (fn [[id expression]]
+                                         (when (identical? id count-id) expression))
+                                       (partition 2 (second (:form projected))))
+                 contract (:contract (completion/canonical-parts count-expression))
+                 current (source-import/prepare-contextual-source-witness
+                          (:form projected) options)
+                 observe (fn [implementation width]
+                           (try
+                             (let [result (implementation width)]
+                               {:class (class result) :length (alength result)})
+                             (catch Throwable error
+                               {:error (class (if (instance? java.lang.reflect.InvocationTargetException error)
+                                                (.getCause error) error))})))]
+             (is (= (first before) (first after) 'clojure.core/float-array))
+             (is (= 2 (count after)))
+             (is (identical? count-id (second after)))
+             (is (= :jvm-bytecode-integral-input (:source-context contract)))
+             (is (identical? Integer/TYPE (:target-carrier contract)))
+             (is (contains? #{:int :long :ref} (:expected-input-carrier contract)))
+             (is (= :raw-jvm-int (get-in artifact [:physical-count :completion])))
+             (is (= :jvm-zero (get-in artifact [:allocation :initialization])))
+             (is (identical? (second before) (:source-original physical)))
+             (is (identical? (:source-original physical) (nth count-expression 2)))
+             (is (identical? (:operand physical)
+                             (get-in artifact [:allocation :count :operand])))
+             (is (and (identical? (:source-original physical) (:source-original rederived))
+                      (identical? (:owned-source physical) (:owned-source rederived))
+                      (identical? (:operand physical) (:operand rederived)))
+                 "the frame authority stays in the exact current retained count query")
+             (is (and projected-count
+                      (not-any? #(contains? (meta %)
+                                            :raster.compiler.backend.jvm.bytecode/call-occurrence)
+                                (tree-seq coll? seq projected-count)))
+                 "only the NEW source completion is detached from old occurrence tokens")
+             (doseq [width [0 2 -1 46341 4294967297 65536 Long/MAX_VALUE]]
+               (is (= (observe (:implementation witness) width)
+                      (observe (:implementation current) width))
+                   "zero, negative and wrapped Int counts retain JVM constructor behavior"))
+             (is (nil? (source-import/project-contextual-invocation-arguments current))
+                 "the named Int count makes direct constructor projection idempotent")
+             (let [query bytecode/retained-input-array-count-context
+                   attempt (fn []
+                             (try
+                               (if (nil? (source-import/project-contextual-invocation-arguments witness))
+                                 :declined
+                                 :accepted)
+                               (catch clojure.lang.ExceptionInfo error
+                                 (:reason (ex-data error)))))]
+               (with-redefs [bytecode/retained-input-array-count-context
+                             (fn [& arguments]
+                               (some-> (apply query arguments)
+                                       (update :operand #(with-meta (apply list %) (meta %)))))]
+                 (is (contains? #{:declined :source-input-array-count-correspondence}
+                                (attempt))
+                     "a copied count expression has no current occurrence authority"))
+               (with-redefs [bytecode/retained-input-array-count-context
+                             (fn [& arguments]
+                               (when-let [record (apply query arguments)]
+                                 (let [policy (update (:source-policy record) :unchecked-math not)]
+                                   (-> record
+                                       (assoc :source-policy policy)
+                                       (assoc-in [:allocation :count :source-policy] policy)))))]
+                 (is (contains? #{:declined :source-input-array-count-correspondence}
+                                (attempt))
+                     "a foreign count policy cannot replace the current source policy")))
+             (let [metadata (meta source)]
+               (try
+                 (alter-meta! source assoc ::stale-direct-count true)
+                 (is (thrown? clojure.lang.ExceptionInfo
+                              (entry/assert-producer-current! (:receipt projected))))
+                 (finally (reset-meta! source metadata)))))))))))
+
+(deftest object-number-array-count-does-not-acquire-a-callback-free-long-frame
+  (let [source (prepared-source #'prefix-object-owner)]
+    (entry/call-with-definition-inputs
+     (fn []
+       (let [frontend (entry/original-source-frontend source)
+             candidate '(let* [out (clojure.core/float-array
+                                     (clojure.core/int coefficient))]
+                          out)
+             options {:source-var source :source-ns (.ns ^clojure.lang.Var source)
+                      :lexical-inputs (get-in frontend [:emission :params])}
+             witness (source-import/prepare-contextual-source-witness
+                      candidate options)]
+         (is (nil? (source-import/project-contextual-invocation-arguments witness))
+             "Number.intValue may execute user code and is not a physical Long input frame"))))))
 
 (deftest actual-builtin-box-prefix-can-import-a-reference-call-without-erasing-checks
   (let [request (prefix-request #'prefix-owner false)]
