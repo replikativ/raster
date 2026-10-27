@@ -269,11 +269,17 @@
   (when-not (boolean? no-alias?)
     (throw (ex-info "Native :no-alias? must be Boolean"
                     {:reason :invalid-native-alias-policy :no-alias? no-alias?})))
-  (let [params (if frontend (get-in frontend [:source-entry :params]) (pl/get-params f-var dtype))
+  (let [selected (when (and (nil? frontend) (var? f-var))
+                   (pl/deftm-frontend-facts f-var dtype))
+        source-var (or (get-in frontend [:source-entry :source-var])
+                       (:resolved-var selected))
+        params (if frontend (get-in frontend [:source-entry :params])
+                   (or (:params selected) (pl/get-params f-var dtype)))
         wb     (if frontend (pl/normalize-source-bindings (or constructed-body (:body frontend)) params)
                    (pl/get-walked-body f-var dtype))
         raw    (if (= 1 (count wb)) (first wb) (list* 'do wb))
         source-ns (or (get-in frontend [:source-entry :source-ns])
+                      (:source-ns selected)
                       (when (var? f-var) (.ns ^clojure.lang.Var f-var)) *ns*)
         active (pl/clean-params params)
         penv   (pl/build-param-env f-var dtype)
@@ -285,11 +291,12 @@
         ;; :simd? false always keeps the JVM Vector-API lowering OFF; :keep-par-forms?
         ;; (set when simd?=true) instead PRESERVES par/reduce|map forms so the C
         ;; backend can emit __m256 intrinsics via csimd (vs clang auto-vec only).
-        opts  {:target :c :inline? true :simd? false :keep-par-forms? simd? :dtype dtype
-               :active-params active :param-env penv :source-ns source-ns
-               :preserve-declared-array-storage? true
-               :array-types (:array-types parameter-types)
-               :scalar-types (:scalar-types parameter-types)}]
+        opts  (cond-> {:target :c :inline? true :simd? false :keep-par-forms? simd? :dtype dtype
+                       :active-params active :param-env penv :source-ns source-ns
+                       :preserve-declared-array-storage? true
+                       :array-types (:array-types parameter-types)
+                       :scalar-types (:scalar-types parameter-types)}
+                (var? source-var) (assoc :source-var source-var))]
     (let [lowered (if no-alias?
                     (pl/run-passes raw pl/forward-passes opts)
                     (let [source (pl/run-passes raw [:lower] opts)]

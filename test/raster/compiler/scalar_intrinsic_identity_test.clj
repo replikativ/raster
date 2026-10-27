@@ -5,8 +5,11 @@
             [raster.par :as par]
             [raster.compiler.backend.intrinsics :as intrinsic]
             [raster.compiler.backend.gpu.c-emit :as c]
+            [raster.compiler.backend.gpu.opencl-pass :as opencl-pass]
             [raster.compiler.core.op-descriptor :as operation]
             [raster.compiler.core.dispatch :as dispatch]
+            [raster.compiler.core.method-entry :as method-entry]
+            [raster.compiler.pipeline :as pipeline]
             [raster.gpu.core :as gpu]))
 
 (deftm sin [x :- Double] :- Double (clojure.core/+ x 100.0))
@@ -35,6 +38,53 @@
                            {:name name}))))}
       #(apply str (map :source (gpu/compile! session :identity-control operation
                                            {:dtype :double}))))))
+
+(deftest session-compilation-forwards-one-dtype-selected-source-context
+  (let [{:keys [resolved-var parameters source-ns] :as frontend}
+        (pipeline/deftm-frontend-facts #'sin-map! :double)
+        walked '[(let* [result (clojure.core/double 1.0)] result)]
+        selections (atom 0)
+        observations (atom [])
+        emitted {:kernels [] :dispatches []}]
+    (with-redefs-fn
+      {#'pipeline/deftm-frontend-facts
+       (fn [source dtype]
+         (is (identical? #'sin-map! source))
+         (is (= :double dtype))
+         (swap! selections inc)
+         frontend)
+       #'gpu/resolve-deftm-var
+       (fn [& _]
+         (throw (AssertionError. "compilation repeated the independent first-overload selection")))
+       #'gpu/get-walked-body
+       (fn [source dtype]
+         (is (identical? resolved-var source))
+         (is (= :double dtype))
+         walked)
+       #'pipeline/schedule-parallel-form
+       (fn [form options]
+         (is (some? method-entry/*emission-inputs*))
+         (swap! observations conj [:schedule form options])
+         {:form ::scheduled})
+       #'opencl-pass/opencl-pass
+       (fn [form & options]
+         (is (some? method-entry/*emission-inputs*))
+         (swap! observations conj [:emit form options])
+         emitted)
+       #'gpu/rt-resolve
+       (fn [_ operation]
+         (is (= "register-kernel!" operation))
+         (fn [& _] (throw (AssertionError. "empty fixture registered a kernel"))))}
+      #(is (identical? emitted
+                       (#'gpu/compile-deftm-internal!
+                        #'sin-map! :ocl:source-context {:dtype :double}))))
+    (is (= 1 @selections))
+    (let [[_ _ options] (first @observations)]
+      (is (identical? resolved-var (:source-var options)))
+      (is (identical? source-ns (:source-ns options)))
+      (is (= parameters (:active-params options))))
+    (is (= [:schedule :emit] (mapv first @observations)))
+    (is (= ::scheduled (get-in @observations [1 1])))))
 
 (deftest own-namespaced-helper-does-not-acquire-sine-semantics
   (doseq [operation [#'sin-map! #'control-map!]]
