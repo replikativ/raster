@@ -4086,7 +4086,8 @@
               (form/binding-form? source) (vector? (second source))
               (even? (count (second source)))
               (every? symbol? (take-nth 2 (second source)))
-              (some #(completion/reference-input-parts (second %))
+              (some #(or (completion/reference-input-parts (second %))
+                         (completion/reference-return-parts (second %)))
                     (partition 2 (second source))))
      (method-entry/call-with-optional-definition-inputs
       (fn []
@@ -4109,14 +4110,16 @@
                   (when (and (:construct! *contextual-source-construction*)
                              (some (fn [[_ expression]]
                                      (let [{:keys [contract operand]} (completion/canonical-parts expression)]
-                                       (and (= :jvm-bytecode-result-context (:source-context contract))
-                                            (par/par-reduce-form? operand))))
+                                       (or (completion/reference-return-parts expression)
+                                           (and (= :jvm-bytecode-result-context (:source-context contract))
+                                                (par/par-reduce-form? operand)))))
                                    (partition 2 bindings)))
                     (:construct! *contextual-source-construction*))
                   {:keys [projected replaced]}
                   (reduce
                    (fn [{:keys [carriers] :as state} [ordinal [id expression]]]
-                     (let [checked (completion/reference-input-parts expression)
+                     (let [checked (or (completion/reference-input-parts expression)
+                                       (completion/reference-return-parts expression))
                            object-input (completion/object-input-parts expression)
                            operand (cond checked (:operand checked)
                                          object-input (:operand object-input)
@@ -4150,7 +4153,7 @@
                                         (binding-completion/object-binding-without-check?
                                          normalized-id source-ns source-binding-context)))))
                            known (get carriers operand)
-                           provenance (or (when (and known (accepts? known)) known)
+                           provenance (or (when (and known (not (:reference-return? checked)) (accepts? known)) known)
                                           (when (and current-constructor (symbol? operand))
                                             (current-constructor
                                              {:kind :reference-provenance :source source
@@ -4758,11 +4761,19 @@
             ;; A functional map result is a typed array value available to later source
             ;; descriptions. This is the map's declared element contract, not a consumer guess;
             ;; a resident map binding may name a different caller-owned physical destination.
-            (description-logical-array-dtype description)]
+            (description-logical-array-dtype description)
+            ;; These are ordered host completion boundaries. Their contracts
+            ;; grant no purity or successful conversion, but do not execute a
+            ;; device equation. Existing invocation/source admission still
+            ;; validates their operands and any buffer identity separately.
+            host-completion? (or (completion/invocation-result-description
+                                  (:contract (completion/canonical-parts expression)))
+                                 (completion/reference-input-parts expression))]
         (cond-> (update state :descriptions conj description)
           (or (not= :scalar (:kind description))
               (and (nil? allocation-dtype)
-                   (not (ordered-scalar-expression? expression))))
+                   (not (ordered-scalar-expression? expression))
+                   (not host-completion?)))
           (assoc :before-parallel? false)
           (or (not= :scalar (:kind description))
               (and (not (effects/removable-expr? expression))

@@ -9,8 +9,8 @@ fails; this branch is not merge-ready. All sixteen unit shards complete: 7,717
 tests, 94,716 passing assertions, 53 failures and 125 errors across 144 failing
 Vars. All 7,709 previously reported outcome Vars and their 94,679 assertions
 are retained; nine new outcome Vars add 228 assertions. Emission job 35253 fails
-at the same public mixed-scale boundary. CPU-OpenCL job 35252 is still pending;
-the preceding `b8f86362e` CPU job 35245 has all four completed shards: 677
+at the same public mixed-scale boundary. CPU-OpenCL job 35252 also fails with
+all four completed shards: 677
 tests, 7,404 passing assertions, 12 failures and 81 errors across 83 failing Vars.
 Setup and build pass; emitted-source fails on `mixed-storage/mixed-scale`, so
 dependent vendor compiler gates have not qualified this head. The stricter
@@ -141,6 +141,43 @@ materialized, owned-import and public AOT execution; affected object/SIMD/return
 gates pass 58 / 984. Independent review found no blocker. The public mixed-scale
 GPU fixture still refuses at the protected body boundary, so source-context and
 numerical correspondence must be completed before treating that vertical as green.
+
+The connected owned-map projection is now locally qualified through the common
+equation-first runtime. It preserves the original bound/body occurrence owners,
+adds only generated-wrapper observations, and joins the actual checked Int
+count, fresh zeroed allocation, map output and returned local slot. Reference
+return simplification consumes the current binding's exact nested completion
+objects and their actual CHECKCAST/identity adaptations; array dtypes or copied
+metadata never establish JVM Class or alias identity. Source completions require
+the existing ordered executor even before the first kernel. The focused
+provenance/return/preparation gate passes 13 tests / 242 assertions.
+
+The permanent public device test passes one test / 32 assertions: OpenCL and
+Level Zero, both kernel arithmetic modes, Float storage with a precision-sensitive
+Double coefficient, changed input values, JVM equality and host input immutability.
+No skip marker contributed to that count. Cold compilation is separately
+qualified: the explicit GPU source-construction scope may request preparation of
+an exact selected array-return helper after static/ready import abstention. The
+existing prerequisite handler abandons discovery, prepares independently, and
+restarts the whole owner. Optional queries stay non-preparing even with a target
+option; present unsupported/stale modules are not restamped. Four tests / 13
+assertions cover cold admission, query abstention, one-time unsupported preparation
+and exact preparation-failure propagation. A genuinely fresh helper/owner also
+executes on OpenCL without manual preparation. These are not full-suite results.
+
+The legacy descriptor half of the mixed-scale test remains red: its raw scalar
+evaluator does not understand completion terms and repeats the scalar-let prefix
+for each size/value closure. Merely projecting syntax would not preserve ordered
+effects. Migrate those callers to the existing ordered Prepared boundary; do not
+grow a second source executor or waive the failing legacy acceptance test.
+
+Fabricated nil-Var inlining positives are replaced by real owned definitions.
+The full fusion namespace passes 19 tests / 61 assertions, covering typed
+arithmetic/lexical inlining, hygiene and inline-on/off numerical parity. Core
+arithmetic and actual A-to-B helper-chain behavior are retained, but this does not
+claim transitive structural elimination: inherited occurrence-plan composition
+remains a coverage frontier. Existing input/reference completion tests separately
+pass 10 / 105 with callbacks, nullable/unused inputs and body effects retained.
 
 CI exception summaries now retain a bounded qualified definition name when the
 error supplies a Var or qualified symbol, never its root, metadata or source

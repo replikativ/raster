@@ -218,6 +218,28 @@
     (is (= :invocation-source-order-boundary
            (reason #(invocation-link/begin-ordered-realization compilation [(double-array 3)] nil))))))
 
+(deftest source-completion-prefix-requires-the-owned-executor-before-any-kernel
+  (doseq [[expression required?] [[(completion/complete-value
+                                   (completion/bytecode-boxed-parameter-contract Double/TYPE) 'x) true]
+                                ['(clojure.core/+ x 0.0) false]]]
+    (let [values (zipmap '[x y] (repeat (av/tensor {:dtype :double :shape []})))
+          plan (invocation/from-prefix
+                {:id :completion-prefix :parameters '[x]
+                 :parameter-values (select-keys values '[x])
+                 :bindings [['y expression]] :binding-values (select-keys values '[y])
+                 :program-values values :program-inputs '[y] :program-outputs '[y]})
+          program (parallel-program/make
+                   {:dialect :opencl-parallel :values values :inputs '[y] :outputs '[y]
+                    :source (list 'let* ['y expression] 'y)
+                    :attributes {:invocation-plan plan}})
+          forbidden (fn [& _] (throw (AssertionError. "ordering query must not execute source")))
+          report (with-redefs [scalar/evaluate-invocation-step forbidden
+                               materialization/materialize forbidden]
+                   (invocation-link/ordered-preparation-requirement
+                    {:semantic program :emitted program :target :ocl:0}))]
+      (is (= required? (:required? report)))
+      (is (= (if required? [:source-completion] []) (mapv :reason (:barriers report)))))))
+
 (deftest invocation-prefix-cannot-cross-an-earlier-host-equation
   (let [values {'n (av/tensor {:dtype :long :shape []})
                 'xs (av/tensor {:dtype :double :shape '[(extent xs)]})

@@ -773,14 +773,35 @@
   (let [binding (current-source-binding!
                  witness ordinal binder expression
                  :contextual-source-reference-form :contextual-source-reference-observation)
-        reference (completion/reference-input-parts expression)
+        reference (or (completion/reference-input-parts expression)
+                      (completion/reference-return-parts expression))
         object (completion/object-input-parts expression)
         operand (if (symbol? expression) expression (:operand (or reference object)))
         before (get (:before binding) operand)
         carrier (:reference-class before)
-        target (get-in reference [:contract :target-carrier])]
+        target (get-in reference [:contract :target-carrier])
+        returned? (:reference-return? reference)
+        returned-observations
+        (when returned?
+          (mapv #((requiring-resolve 'raster.compiler.backend.jvm.bytecode/retained-input-completion-context)
+                  (:emission witness) (:input-body witness) %)
+                (:completions reference)))
+        actual-return (when returned? (completion/reference-return-parts (:initializer binding)))]
     (when (and (symbol? operand) (= :ref (:type before)) (class? carrier)
                (some? (dtype/dtype-for-jvm-array-class carrier))
+               (or (not returned?)
+                   (and (= :ref (get-in binding [:after :type]))
+                        (identical? carrier (get-in binding [:after :reference-class]))
+                        actual-return
+                        (= operand (:operand actual-return))
+                        (= [:checkcast :identity] (mapv :adaptation returned-observations))
+                        (every? true? (map identical? (:completions actual-return)
+                                           (map :expression returned-observations)))
+                        (every? (fn [[source observed]]
+                                  (and observed (identical? source (:source-input observed))
+                                       (= (:contract (completion/canonical-parts source)) (:contract observed))
+                                       (= :ref (:input-carrier observed) (:completion-carrier observed))))
+                                (map vector (:completions reference) returned-observations))))
                (or (nil? reference)
                    (and (completion/canonical-contract? (:contract reference))
                         (not (true? (get-in reference [:contract :operand-context :void-context])))
@@ -864,9 +885,43 @@
                   (not (and (seq? %) (contains? '#{quote clojure.core/quote} (first %)))))
             seq source))
 
+(defn- import-owned-pmap-spine
+  [emission original destination import-child! binding-contexts]
+  (when (and destination (= 1 (count (:body emission)))
+             (identical? original (first (:body emission))))
+    (when-let [{:keys [scope bindings array-class] :as spine}
+               ((helper-backend 'retained-pmap-spine) emission original)]
+      (when (and (= array-class (:return-class destination))
+                 (every? #(= (:context destination) (:input-context %)) bindings))
+        (let [children (java.util.IdentityHashMap.)
+              _ (doseq [child [(nth original 2) (nth original 4)]]
+                  (.put children child (import-child! child)))
+              ;; Rebuild only compiler-owned wrappers. Original descendants
+              ;; keep their actual invocation/binding checks and lookup owner.
+              rebuilt (letfn [(visit [node]
+                                (cond
+                                  (.containsKey children node) (.get children node)
+                                  (and (seq? node) (contains? '#{quote clojure.core/quote} (first node))) node
+                                  (or (seq? node) (vector? node))
+                                  (util/remake-if-changed node (mapv visit node))
+                                  :else node))]
+                        (visit scope))
+              pairs (mapcat (fn [[id value] observation]
+                              [(vary-meta id assoc :tag (get-in observation [:after :hint])) value])
+                            (partition 2 (second rebuilt)) bindings)
+              result (with-meta (list 'let* (vec pairs) (nth rebuilt 2)) (meta rebuilt))]
+          ;; The actual count/allocated-array/map-result locals all have stable
+          ;; builtin declarations. Contexts match the actual new initializer
+          ;; site; no completion is dropped from an arbitrary source node.
+          (.put ^java.util.IdentityHashMap binding-contexts result (:bindings spine))
+          (when-let [projected? (:projected? destination)]
+            (vreset! projected? true))
+          result)))))
+
 (defn- checked-helper-body
   "Materialize actual lexical reference checks before hygiene or simplification."
-  [emission receivers binding-contexts]
+  ([emission receivers binding-contexts] (checked-helper-body emission receivers binding-contexts nil))
+  ([emission receivers binding-contexts destination]
   (letfn [(walk [node]
             (cond
               (and (seq? node) (contains? '#{quote clojure.core/quote} (first node))) node
@@ -875,7 +930,8 @@
                 (when-not ((helper-backend 'retained-pmap-expansion) emission node)
                   (decline! "Generated pmap import lacks its original shared expansion"
                             {:operation (first node)}))
-                (util/remake-if-changed node (mapv walk node)))
+                (or (import-owned-pmap-spine emission node destination walk binding-contexts)
+                    (util/remake-if-changed node (mapv walk node))))
               (and (seq? node) (= 'let* (first node)))
               (let [[head bindings & tail] node
                     previous (volatile! nil)
@@ -969,7 +1025,7 @@
               (util/remake-if-changed node (mapv walk node))
               (coll? node) (decline! "Generated helper contains an unsupported executable collection" {})
               :else node))]
-    (mapv walk (:body emission))))
+    (mapv walk (:body emission)))))
 
 (defn- qualified-helper-body
   ([emission outer-ns] (qualified-helper-body emission outer-ns checked-helper-body))
@@ -1133,7 +1189,8 @@
                "helper input slots must not capture caller operands or imported bindings" {}))))
   (let [argument-bindings
         (mapv (fn [value input]
-                [value (completion/complete-value (:contract input) (:operand input))])
+                [value (vary-meta (completion/complete-value (:contract input) (:operand input))
+                                  assoc :raster.effect/preserve-evaluation true)])
               values inputs)
         instantiated (util/subst-syms (zipmap parameters values) body)
         returned (reduce (fn [value contract] (completion/complete-value contract value))
@@ -1383,12 +1440,31 @@
                                 (= (:policy scope) (get-in frontend [:source-entry :source-policy]))
                                 (= (:parameter-carriers physical) (:parameter-carriers bridge))
                                 (not (:unretained-sibling-calls? saved)))
-                       (let [{:keys [body binding-facts]}
-                             (qualified-helper-body emission (get-in scope [:context :source-ns]))
+                       (let [context-for (get-in scope [:functions 'source-evaluation-context])
+                             caller-context (:caller-context planned)
+                             region-context (if (:object-call-result? caller-context)
+                                              (context-for caller-context :object-region) caller-context)
+                             projected? (volatile! false)
+                             destination {:context (completion/bytecode-operand-context
+                                                    (context-for region-context :initializer))
+                                          :return-class (:body-return-carrier bridge)
+                                          :projected? projected?}
+                             {:keys [body binding-facts]}
+                             (qualified-helper-body
+                              emission (get-in scope [:context :source-ns])
+                              (fn [module receivers contexts]
+                                (checked-helper-body module receivers contexts destination)))
                              body (if (= 1 (count body)) (first body) (list* 'do body))
+                             ;; Only the newly derived, checked pmap projection
+                             ;; crosses into ordinary numerical source here.
+                             ;; The original module and caller operands retain
+                             ;; their occurrence ownership and are not detached.
+                             body (if @projected?
+                                    ((helper-backend 'detach-emission-occurrences) body)
+                                    body)
                              values (mapv (fn [tag]
                                             (with-meta (gensym "reference_input__")
-                                              {:raster.type/tag tag :raster.effect/effectful true}))
+                                              {:raster.type/tag tag}))
                                           (:tags emission))
                              contracts (cond-> [(completion/bytecode-result-context-contract
                                                  (:result-context saved) (:emitted-result-type saved))]

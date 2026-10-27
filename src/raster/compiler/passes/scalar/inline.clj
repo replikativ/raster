@@ -65,6 +65,14 @@
 
 (def ^:dynamic ^:private *source-call-context* nil)
 (def ^:dynamic ^:private *source-call-plans* nil)
+(def ^:dynamic ^:private *helper-source-demands?* false)
+
+(defn ^:no-doc call-with-helper-source-demands
+  "Enable source prerequisite discovery only inside an explicit target construction.
+   Optional application queries never consult this gate or prepare code. A demand
+   unwinds the whole owning compilation before the existing independent preparer runs."
+  [construct]
+  (binding [*helper-source-demands?* true] (construct)))
 
 (defn ^:no-doc call-with-source-input-completions [source options construct]
   (binding [*source-call-context* (call-plan/source-context options)
@@ -445,13 +453,24 @@
   ;; the scope-aware subst-syms which handles scoping correctly.
   (subst-syms (merge devirt->dispatch smap) expr))
 
+(defn- demand-missing-reference-helper! [planned]
+  (when *helper-source-demands?*
+    (when-let [source (get-in planned [:physical :definition :source-var])]
+      (when-let [frontend (method-entry/original-source-frontend source)]
+        ;; The declared array return selects work only. The eventual original
+        ;; module must independently prove its body, Class and return recipe.
+        ;; A present but unsupported/stale module is not renewed around a result.
+        (when (and (get types/primitive-array-info (get-in frontend [:source-entry :return-tag]))
+                   (nil? (method-entry/observed-frontend-emission frontend)))
+          (method-entry/demand-original-source-frontend! source))))))
+
 (defn- build-inline-expansion
-  "Construct argument bindings and the substituted callee in one place.
-   A result binder requests the binding inliner's existing flat placement;
-   otherwise retain the nested body's lexical scopes for recursive expansion.
+  "Consume one complete owned helper expression, including all completions.
+   A result binder binds that expression once; otherwise preserve it as the
+   nested body. Prepared AD projections retain their own binding/result recipe.
    This construction is NOT a completion, correspondence or execution proof."
-  [{:keys [params walked-body prepared-program projection-mode] :as info}
-   args source-env subst-fn result-sym caller]
+  [{:keys [prepared-program projection-mode]}
+   args source-env _subst-fn result-sym caller]
   (if prepared-program
     (let [projection
           ((requiring-resolve 'raster.ad.reverse/project-prepared-value+grad-call)
@@ -471,7 +490,8 @@
                                    ;; fallback: it replays the same argument recipes and its
                                    ;; actual return CHECKCAST, but grants no native capability.
                                    (source-import/instantiate-ready-reference-helper
-                                    (:candidate planned) caller (:source-options planned)))]
+                                    (:candidate planned) caller (:source-options planned))
+                                   (do (demand-missing-reference-helper! planned) nil))]
           (source-import/validate-helper-application! application)
           (let [complete (:expression application)]
             (if result-sym

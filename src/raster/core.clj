@@ -407,8 +407,9 @@
                     ;; Extraction-local generated calls have actual emission
                     ;; observations, but intentionally no frontend InputOrigins.
                     :invocation-catalog (merge invocation-catalog (:invocation-catalog @inputs))
-                    :binding-catalog binding-catalog :binding-contexts (:binding-contexts @inputs)
-                    :completion-catalog completion-catalog
+                    :binding-catalog (merge binding-catalog (:binding-catalog @inputs))
+                    :binding-contexts (:binding-contexts @inputs)
+                    :completion-catalog (merge completion-catalog (:completion-catalog @inputs))
                     :completion-contexts (:completion-contexts @inputs)
                     :floating-conversion-contexts (:floating-conversion-contexts @inputs)
                     :arithmetic-contexts (:arithmetic-contexts @inputs)
@@ -416,6 +417,7 @@
                     :array-allocation-contexts (:array-allocation-contexts @inputs)
                     :reduction-catalog reduction-catalog
                     :pmap-catalog pmap-catalog :pmap-expansions (:pmap-expansions @inputs)
+                    :pmap-results (:pmap-results @inputs)
                     :input-origins input-origins
                     :reduction-expansions (:reduction-expansions @inputs)
                     :reduction-contexts (:reduction-contexts @inputs)

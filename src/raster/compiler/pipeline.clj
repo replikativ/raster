@@ -1471,7 +1471,9 @@
     (me/call-with-definition-inputs
      #(raster.ad.reverse/call-with-generated-source-construction
        source-import/construct-contextual-terminal-return
-       (fn [] (binding [*gpu-source-construction* true] (consume!)))))))
+       (fn []
+         (binding [*gpu-source-construction* true]
+           (inline/call-with-helper-source-demands consume!)))))))
 
 (defn schedule-parallel-form
   "Construct the same TypedSOAC/SegOp boundary used by the ordinary compiler for an already

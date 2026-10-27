@@ -337,6 +337,23 @@
     (when (= :jvm-bytecode-boxed-parameter-input (get-in parts [:contract :source-context]))
       parts)))
 
+(defn reference-return-parts
+  "Recognize a closed reference return recipe over one lexical value. This
+   supplies no operand Class or permission to remove either completion; a
+   current owned emitter observation must discharge both reference edges."
+  [expression]
+  (let [checked (canonical-parts expression)
+        contextual (canonical-parts (:operand checked))
+        carrier (get-in checked [:contract :target-carrier])]
+    (when (and (= :jvm-checkcast (get-in checked [:contract :source-context]))
+               (class? carrier) (not (.isPrimitive ^Class carrier))
+               (= :jvm-bytecode-result-context (get-in contextual [:contract :source-context]))
+               (= :ref (get-in contextual [:contract :result-carrier]))
+               (false? (get-in contextual [:contract :operand-context :void-context]))
+               (symbol? (:operand contextual)))
+      {:contract (:contract checked) :operand (:operand contextual)
+       :reference-return? true :completions [expression (:operand checked)]})))
+
 (defn bytecode-context-form?
   "A canonical region whose reconstruction needs original bytecode authority.
    Shape recognition is a rewrite barrier, not proof of ownership or execution."

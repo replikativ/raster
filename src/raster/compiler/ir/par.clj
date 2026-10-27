@@ -184,7 +184,8 @@
   C2 recognizes as a counted loop pattern.
 
   Also handles offset variant: (raster.par/map! out idx bound :offset base cast body)"
-  [form]
+  ([form] (expand-par-map! form identity))
+  ([form retain-result]
   (if (and (>= (count form) 8) (= :offset (nth form 4)))
     ;; Offset variant
     (let [[_ out-sym i-sym bound-expr _kw base-expr cast-fn body-expr] form
@@ -200,7 +201,7 @@
                         (list 'do
                               (list 'clojure.core/aset out-sym (list '+ base-sym i-sym) aset-expr)
                               (list 'recur (list 'clojure.core/unchecked-inc-int i-sym)))
-                        out-sym))))
+                        (retain-result out-sym)))))
     ;; Standard variant
     (let [[_ out-sym i-sym bound-expr cast-fn body-expr] form
           n-sym (gensym "n__")
@@ -213,7 +214,7 @@
                         (list 'do
                               (list 'clojure.core/aset out-sym i-sym aset-expr)
                               (list 'recur (list 'clojure.core/unchecked-inc-int i-sym)))
-                        out-sym))))))
+                        (retain-result out-sym))))))))
 
 (defn expand-par-map2!
   "Expand a (raster.par/map2! out1 out2 idx bound cast body1 body2) form to

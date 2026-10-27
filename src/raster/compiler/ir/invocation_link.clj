@@ -743,6 +743,8 @@
        {:required? false :barriers []}
        (let [host-ids (into #{} (comp (filter #(true? (get-in % [:attributes :host-only])))
                                       (map :id)) (:equations program))
+             completion-ids (into #{} (comp (filter invocation/source-completion?) (map :id))
+                                  (:steps invocation))
              result
              (reduce
               (fn [{:keys [numerical-position host-position allocation-position] :as state} entry]
@@ -758,6 +760,11 @@
                                 {:reason reason :position position :preceding-position preceding
                                  :action kind})]
                   (cond-> state
+                    ;; Owned source completions have a separate executor and
+                    ;; completion receipt even before the first numerical stage.
+                    ;; They are never ordinary eager scalar computations.
+                    (contains? completion-ids (:invocation-step entry))
+                    (update :barriers conj (barrier :source-completion nil))
                     (and (some? numerical-position) (or prefix? host? allocation?))
                     (update :barriers conj (barrier :after-numerical numerical-position))
                     (and prefix? (some? host-position))

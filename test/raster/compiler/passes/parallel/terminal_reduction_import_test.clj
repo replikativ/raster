@@ -328,6 +328,36 @@
       #(is (= :stale-definition-proof-input
               (reason (fn [] (entry/assert-definition-inputs-current! @parent))))))))
 
+(deftest current-reference-return-projection-joins-actual-nested-completions
+  (let [{:keys [options]} (contextual-witness-request 'Object)
+        formal (first (:lexical-inputs options))
+        carrier (.arrayType Double/TYPE)
+        binder (with-meta 'returned-array {:tag 'doubles})
+        inner (completion/complete-value
+               (completion/bytecode-result-context-contract
+                {:object-result? true :object-call-result? false
+                 :preserve-source-call-results? false :void-context false} :ref) formal)
+        expression (completion/complete-value (completion/reference-check-contract carrier) inner)
+        source (list 'let* [binder expression] binder)]
+    (entry/call-with-definition-inputs
+     (fn []
+       (let [witness (source-import/prepare-contextual-source-witness source options)
+             observe #(source-import/observe-reference-provenance! witness 0 binder expression (constantly true))
+             actual bytecode/retained-input-completion-context]
+         (is (= {:formal formal :carrier carrier :current-source? true} (observe)))
+         (doseq [change [(fn [record] (assoc record :expression
+                                            (with-meta (apply list (:expression record))
+                                              (meta (:expression record)))))
+                         #(assoc % :adaptation :jvm-primitive-coercion)
+                         #(assoc % :input-carrier :double)]]
+           (with-redefs [bytecode/retained-input-completion-context
+                         (fn [& args] (some-> (apply actual args) change))]
+             (is (nil? (observe)))))
+         (is (= :contextual-source-reference-form
+                (reason #(source-import/observe-reference-provenance!
+                          witness 0 binder (with-meta (apply list expression) (meta expression))
+                          (constantly true))))))))))
+
 (deftest functional-map-reference-projection-is-batched-before-current-reduction-analysis
   (entry/call-with-definition-inputs
    (fn []

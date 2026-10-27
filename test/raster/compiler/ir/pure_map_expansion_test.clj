@@ -1,6 +1,7 @@
 (ns raster.compiler.ir.pure-map-expansion-test
   (:require [clojure.test :refer [deftest is]]
             [raster.core :as core :refer [deftm]]
+            [raster.arrays :as arrays]
             [raster.par]
             [raster.compiler.ir.par :as par]
             [raster.compiler.backend.jvm.bytecode :as bytecode]
@@ -20,6 +21,9 @@
 
 (deftm counted-float-owner [counter :- (Array long) n :- Long] :- (Array float)
   (counted-float-map counter n))
+
+(deftm typed-descendant-map [input :- (Array float) n :- Long] :- (Array float)
+  (raster.par/pmap i (arrays/alength input) float (arrays/aget input i)))
 
 (defn- source-function [source]
   (binding [*ns* (the-ns 'raster.compiler.ir.pure-map-expansion-test)]
@@ -155,3 +159,55 @@
          (is (thrown? clojure.lang.ExceptionInfo (entry/observed-frontend-emission frontend))))
        (with-redefs [descriptor/cast-ops (assoc-in descriptor/cast-ops ['float :result-tag] 'double)]
          (is (thrown? clojure.lang.ExceptionInfo (entry/observed-frontend-emission frontend))))))))
+
+(deftest pmap-spine-requires-actual-binding-allocation-and-both-return-aliases
+  (prepared-application)
+  (entry/call-with-definition-inputs
+   (fn []
+     (let [frontend (entry/original-source-frontend (core/resolve-deftm-var #'counted-float-map))
+           emission (entry/observed-frontend-emission frontend)
+           [token original] (first (:pmap-catalog emission))
+           spine (bytecode/retained-pmap-spine emission original)
+           expansion (:expansion spine)
+           scope (:scope spine)]
+       (is (some? spine))
+       (is (= (class (float-array 0)) (:array-class spine)))
+       (is (nil? (bytecode/retained-pmap-spine emission (with-meta (apply list original) (meta original)))))
+       (doseq [changed [(dissoc emission :binding-catalog)
+                        (dissoc emission :pmap-results)
+                        (assoc-in emission [:pmap-expansions token :expanded]
+                                  (with-meta (apply list scope) (meta scope)))
+                        (assoc-in emission [:pmap-expansions token :recipe :count] 'foreign-count)
+                        (assoc-in emission [:pmap-expansions token :status] :ambiguous)]]
+         (is (nil? (bytecode/retained-pmap-spine changed original))))
+       (doseq [role [:map-return :root-return]
+               changed [(assoc-in emission [:pmap-results [token role] :status] :ambiguous)
+                        (update-in emission [:pmap-results [token role] :local :slot] inc)
+                        (assoc-in emission [:pmap-results [token role] :local :reference-class]
+                                  (class (double-array 0)))
+                        (assoc-in emission [:pmap-results [token role] :expression]
+                                  (with-meta (symbol (name (get expansion role)))
+                                    (meta (get expansion role))))]]
+         (is (nil? (bytecode/retained-pmap-spine changed original))))))))
+
+(deftest generated-map-wrappers-do-not-remint-original-typed-descendants
+  (let [source (core/resolve-deftm-var #'typed-descendant-map)]
+    (entry/call-with-definition-inputs #(core/prepare-owned-source-frontend! source))
+    (entry/call-with-definition-inputs
+     (fn []
+       (let [frontend (entry/original-source-frontend source)
+             emission (entry/observed-frontend-emission frontend)
+             original (first (vals (:pmap-catalog emission)))
+             bound (nth original 2)
+             body (nth original 4)
+             spine (bytecode/retained-pmap-spine emission original)]
+         (is (some? spine))
+         (doseq [[child query] [[bound bytecode/retained-invocation-context]
+                               [body bytecode/retained-array-read]]]
+           (let [observed (query emission child)]
+             (is (= :known (:status observed)))
+             (is (identical? observed (query emission child)))
+             (is (nil? (query
+                        emission (with-meta (apply list child) (meta child)))))))
+         (is (identical? bound (nth (nth (second (:scope spine)) 1) 1)))
+         (is (identical? body (nth (nth (:map (:expansion spine)) 5) 2))))))))

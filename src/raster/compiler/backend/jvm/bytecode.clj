@@ -643,7 +643,7 @@
   (if (instance? clojure.lang.IObj expression)
     (vary-meta expression dissoc ::call-occurrence ::binding-scope-occurrence
                ::reduction-occurrence ::reduction-witness ::reduction-role
-               ::pmap-occurrence
+               ::pmap-occurrence ::pmap-token ::pmap-witness ::pmap-role
                ::completion-occurrence)
     expression))
 
@@ -668,17 +668,14 @@
                   (mex/walk-preserving-meta visit identity cleared)))))]
     (visit source)))
 
-(defn ^:no-doc retain-invocation-occurrences
-  "Give each executable call occurrence an emission-local identity.
-   Run after semantic source transforms, before backend macroexpansion. This
-   catalog is private to the owning emission, not a source/cache identity or
-   authority reconstructed by comparing expressions. Quoted values stay opaque."
-  [body]
+(defn- retain-occurrences
+  [body ^java.util.IdentityHashMap preserved]
   (let [catalog (atom {}) scopes (atom {}) reductions (atom {}) pure-maps (atom {})
         completions (atom {}) origins (atom {})]
     (letfn [(visit [expression]
-              (if (and (seq? expression)
-                       (contains? #{'quote 'clojure.core/quote} (first expression)))
+              (if (or (and preserved (.containsKey preserved expression))
+                      (and (seq? expression)
+                           (contains? #{'quote 'clojure.core/quote} (first expression))))
                 expression
                 (let [node (mex/walk-preserving-meta
                             visit identity
@@ -721,6 +718,14 @@
          :completion-catalog @completions
          :input-origins (when (seq @origins)
                           (InputOrigins. body owned @origins))}))))
+
+(defn ^:no-doc retain-invocation-occurrences
+  "Give each executable call occurrence an emission-local identity.
+   Run after semantic source transforms, before backend macroexpansion. This
+   catalog is private to the owning emission, not a source/cache identity or
+   authority reconstructed by comparing expressions. Quoted values stay opaque."
+  [body]
+  (retain-occurrences body nil))
 
 (defn- retain-reduction-observation! [ctx role observation]
   (when (and me/*emission-inputs* (= role (::reduction-role ctx)))
@@ -781,25 +786,92 @@
                                           {:status :ambiguous} record))))
         expanded))))
 
+(declare ^:private expand-owned-pmap-effect ^:private retain-pmap-return!)
+
 (defn- expand-owned-pmap
   "Consume the shared source materialization before wrapper/macro paths diverge.
    The record owns a construction edge only, not numerical or storage admission."
   [form]
   (when me/*emission-inputs*
     (doseq [v [#'par/pure-map-expansion #'descriptor/cast-result-tag #'descriptor/cast-ops
-               #'dtype/dtype-for-scalar-tag #'dtype/dtype-info]]
-      (me/observe-definition-input! v (:ns (meta v)) (:name (meta v)))))
+               #'dtype/dtype-for-scalar-tag #'dtype/dtype-info
+               #'retain-occurrences #'expand-owned-pmap #'expand-owned-pmap-effect #'retain-pmap-return!]]
+      (me/observe-definition-input! v (:ns (meta v)) (:name (meta v))))
+    ;; This is the canonical compiler-owned effect operation introduced by the
+    ;; consumed recipe. Its source spelling must remain valid when reimported.
+    (when-let [v (ns-resolve *ns* 'raster.par/map!)]
+      (me/observe-definition-input! v *ns* 'raster.par/map!)))
   (let [recipe (par/pure-map-expansion (gensym "pmap_result__") form)
         token (::pmap-occurrence (meta form))
-        source (when me/*emission-inputs* (get-in @me/*emission-inputs* [:pmap-sources token]))]
+        source (when me/*emission-inputs* (get-in @me/*emission-inputs* [:pmap-sources token]))
+        owned (when (and source (identical? form source))
+                ;; Only this exact authenticated parent's bound/body subtrees
+                ;; may retain their original identities. Metadata alone never
+                ;; authorizes token reuse. Do not remint their InputOrigins.
+                (let [preserved (java.util.IdentityHashMap.)]
+                  (doseq [node [(nth source 2) (nth source 4)]]
+                    (.put preserved node true))
+                  (retain-occurrences [(:form recipe)] preserved)))
+        witness (when owned (Object.))
+        mark (fn [node role] (vary-meta node assoc ::pmap-token token
+                                       ::pmap-witness witness ::pmap-role role))
+        root (when owned (first (:body owned)))
+        mapped (when root (mark (nth (second root) 5) :map))
+        returned (when root (mark (nth root 2) :root-return))
+        expanded (if root
+                   (with-meta (list 'let* (assoc (second root) 5 mapped) returned) (meta root))
+                   (:form recipe))
+        owned (when owned
+                (-> owned
+                    (assoc-in [:binding-catalog (::binding-scope-occurrence (meta root))] expanded)
+                    (assoc-in [:catalog (::call-occurrence (meta mapped))] mapped)))]
     (when (and source (identical? form source))
+      (swap! me/*emission-inputs*
+             (fn [inputs]
+               (reduce (fn [result [destination key]]
+                         (update result destination merge (get owned key)))
+                       inputs [[:invocation-catalog :catalog]
+                               [:binding-catalog :binding-catalog]
+                               [:completion-catalog :completion-catalog]])))
       (swap! me/*emission-inputs* update :pmap-expansions
              (fn [records]
                (assoc records token
                       (if (contains? records token) {:status :ambiguous}
-                          {:status :known :source source :recipe recipe
+                          {:status :known :source source :recipe recipe :expanded expanded
+                           :witness witness :map mapped :root-return returned
                            :producer @#'par/pure-map-expansion})))))
-    (:form recipe)))
+    expanded))
+
+(defn- expand-owned-pmap-effect [form]
+  (let [token (::pmap-token (meta form))
+        record (when me/*emission-inputs* (get-in @me/*emission-inputs* [:pmap-expansions token]))]
+    (if (and (= :known (:status record)) (identical? form (:map record))
+             (identical? (::pmap-witness (meta form)) (:witness record)))
+      (do
+        (me/observe-definition-input! #'par/expand-par-map! (the-ns 'raster.compiler.ir.par) 'expand-par-map!)
+        (par/expand-par-map!
+         form (fn [output]
+                (let [returned (vary-meta output assoc ::pmap-token token
+                                          ::pmap-witness (:witness record) ::pmap-role :map-return)]
+                  (swap! me/*emission-inputs* assoc-in [:pmap-expansions token :map-return] returned)
+                  returned))))
+      (par/expand-par-map! form))))
+
+(defn- retain-pmap-return! [symbol locals actual-type context]
+  (when-let [inputs me/*emission-inputs*]
+    (let [token (::pmap-token (meta symbol)) role (::pmap-role (meta symbol))
+          record (get-in @inputs [:pmap-expansions token])]
+      (when (and (contains? #{:root-return :map-return} role)
+                 (= :known (:status record))
+                 (identical? (::pmap-witness (meta symbol)) (:witness record))
+                 (identical? symbol (get record role)) (contains? locals symbol))
+        (swap! inputs update :pmap-results
+               (fn [results]
+                 (assoc results [token role]
+                        (if (contains? results [token role]) {:status :ambiguous}
+                            {:status :known :expression symbol :local (get locals symbol)
+                             :result-type actual-type
+                             :context (completion/bytecode-operand-context context)}))))))))
 
 (defn ^:no-doc retained-pmap-expansion
   "The exact shared pmap recipe consumed by this original module.
@@ -1677,7 +1749,7 @@
     (pre-expand-par-forms (expand-owned-pmap form))
 
     (par/par-map-form? form)
-    (try (par/expand-par-map! form)
+    (try (expand-owned-pmap-effect form)
          (catch Throwable _ form))
     ;; A Long semantic domain does not authorize narrowing the source count or
     ;; boxing the ordinal as Integer. Only the private counter is specialized.
@@ -3169,6 +3241,54 @@
    Filled/literal allocations and copied source occurrences have no observation."
   [emission original]
   (retained-call-observation emission original :array-allocation-contexts))
+
+(defn ^:no-doc retained-pmap-spine
+  "Actual count/allocation/map binding chain and both returned array aliases of
+   one consumed pmap recipe. Caller authenticates the module. This establishes
+   no map-body purity, numerical lowering, extent totality or context relocation."
+  [emission original]
+  (when-let [expansion (retained-pmap-expansion emission original)]
+    (let [scope (:expanded expansion) bindings (when (seq? scope) (second scope))
+          token (::pmap-occurrence (meta original))
+          count-id (get-in expansion [:recipe :count]) output (get-in expansion [:recipe :output])]
+      (when (and (= 'let* (first scope)) (vector? bindings) (= 6 (count bindings))
+                 (= count-id (nth bindings 0)) (= output (nth bindings 2))
+                 (identical? (nth bindings 5) (:map expansion))
+                 (identical? (nth scope 2) (:root-return expansion)))
+        (let [observations (mapv #(retained-binding-context emission scope %) (range 3))
+              [count-binding allocation-binding effect-binding] observations
+              allocation (retained-zero-array-allocation emission (nth bindings 3))
+              array-class (:array-class allocation)
+              output-local (:after allocation-binding)
+              results (mapv #(get (:pmap-results emission) [token %]) [:map-return :root-return])
+              chain? (every? (fn [[prior next]]
+                               (= (assoc (:before prior) (:binder prior) (:after prior)) (:before next)))
+                             (partition 2 1 observations))]
+          (when (and (every? some? observations) chain?
+                     (= :int (get-in count-binding [:after :type]))
+                     (= 'int (get-in count-binding [:after :hint]))
+                     (true? (get-in count-binding [:after :verified]))
+                     (= :known (:status allocation)) (true? (:fresh? allocation))
+                     (= :jvm-zero (:initialization allocation)) (true? (:primitive-count? allocation))
+                     (class? array-class) (.isArray ^Class array-class)
+                     (.isPrimitive ^Class (.getComponentType ^Class array-class))
+                     (= :int (get-in allocation [:count :input-type]))
+                     (= :int (get-in allocation [:count :completed-type]))
+                     (= :raw-jvm-int (get-in allocation [:count :completion]))
+                     (false? (get-in allocation [:count :unretained-sibling-calls?]))
+                     (= count-id (get-in allocation [:count :operand]))
+                     (= {count-id (:after count-binding)} (get-in allocation [:count :ports]))
+                     (= :ref (:type output-local) (get-in effect-binding [:after :type]))
+                     (= array-class (:reference-class output-local)
+                        (get-in effect-binding [:after :reference-class]))
+                     (true? (:verified output-local)) (true? (get-in effect-binding [:after :verified]))
+                     (every? (fn [[role result]]
+                               (and (= :known (:status result)) (= :ref (:result-type result))
+                                    (= output-local (:local result))
+                                    (identical? (get expansion role) (:expression result))))
+                             (map vector [:map-return :root-return] results)))
+            {:expansion expansion :scope scope :bindings observations
+             :allocation allocation :array-class array-class :returns results}))))))
 
 (defn- emit-aget-intrinsic
   "Emit bytecode for aget (array read). Handles typed array checkcast and
@@ -6490,6 +6610,7 @@
                         :ref)
 
       (symbol? form) (let [type (emit-symbol code form locals ctx)]
+                       (retain-pmap-return! form locals type ctx)
                        (when (and (contains? locals form) (contains? #{:int :long} (:type (get locals form))))
                          (retain-primitive-index-route! ctx :local type))
                        type)
