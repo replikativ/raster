@@ -4,6 +4,34 @@
 
 ### Current boundary ledger
 
+Latest completed checkpoint is now `09069071f`: unit 35284 completes all
+sixteen shards, 7,734 tests / 95,041 passing assertions / 46 failures / 116
+errors across 134 failing Vars. Against `125438f30`, eight Vars recover and one
+new allocation-replay Var fails (`:invocation-ordered-allocation-definition`).
+All 7,728 shared outcome Vars remain; shared assertions increase
+94,966→95,074 and seven new Vars add 142 assertions. CPU-OpenCL 35280 completes
+all four shards, 678 tests / 7,305 passing assertions / 12 failures / 76 errors
+across 78 failing Vars. Five Vars recover and none newly fail there, but the
+already-failing ordered-root test now stops 151 assertions earlier; net shared
+assertions decrease 7,514→7,393. This coverage loss is not waived and the replay
+repair must include that root test. Emission 35281 still stops at the same
+mixed-storage energy-gradient fixture. PR1566 remains draft; current
+`cc6f9ef61` adds the independently qualified whole-owner readiness scope and
+needs its own CI. No merge or release is justified by these partial gains.
+
+The replay mismatch has a locally qualified shared repair: frontend retention,
+InvocationPlan's existing raw constructor projection, and ordered replay now
+retain/compare the complete allocation-definition projection, including both
+initialization facets. Size, dtype and public initialization remain independently
+checked derived projections; missing historical fields are not filled in.
+The literal-helper regression passes 1 test / 10 assertions, including tampered
+claim/step rejection before any size evaluation. The related gate passes
+56 / 608 (39 allocation/source-order tests plus 17 ordered-realization tests).
+The full 18-test ordered namespace still has its pre-existing physical-return
+ownership error, and the actual OpenCL root reaches 182 passing assertions then
+the known equation-coverage refusal. Thus the 151-assertion early-stop regression
+is locally repaired, not the whole root or full suite qualified.
+
 The next shared observation prerequisite is pushed as `56669777f`:
 actual primitive conversion facts (with the existing floating query domain
 preserved), root Object boxing/literal facts, and actual `ARRAYLENGTH` facts.
@@ -24,7 +52,7 @@ gate passes 39 tests / 360 assertions, repeated independently in the shared REPL
 This does not yet qualify the later preservation of escaping allocation owners
 through numerical realization and component splitting, nor the 26-Var CI family.
 
-Latest completed accounting, `125438f30` (October 27): unit job 35270
+Previous completed accounting, `125438f30` (October 27): unit job 35270
 fails; this branch is not merge-ready. All sixteen unit shards complete: 7,727
 tests, 94,784 passing assertions, 46 failures and 123 errors across 141 failing
 Vars. Shared outcome Vars retain 94,913→94,915 assertions. One fabricated

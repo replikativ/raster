@@ -451,6 +451,15 @@
                           :initialization (:public initializations)
                           :realized-initialization (:realized initializations))))))
 
+(defn ^:no-doc allocation-definition-projection
+  "Return the complete retained definition proof from a freshly rederived allocation-source.
+   Extent, dtype and :initialization are consumer projections checked independently against
+   storage. Every constructor/helper field, including public and realized initialization,
+   remains exact correspondence material; missing historical fields are never reconstructed."
+  [source]
+  (when (map? source)
+    (dissoc source :extent :dtype :initialization)))
+
 (defn- same-integral-extent? [source dimension values]
   (or (semantic/retained-source-equivalent? source dimension)
       (try

@@ -6570,7 +6570,8 @@
           (let [projection (invocation-source/allocation-source source-expression values)]
             (cond-> allocation
               (:helper projection)
-              (assoc :source-projection (select-keys projection [:constructor :helper])))))
+              (assoc :source-projection
+                     (invocation-source/allocation-definition-projection projection)))))
         allocations))
 
 (defn- source-attributes [pairs source-entries allocations values]

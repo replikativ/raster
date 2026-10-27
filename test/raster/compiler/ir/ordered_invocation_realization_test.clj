@@ -717,8 +717,9 @@
         evaluate (fn [& _] (swap! calls inc) (throw (AssertionError. "evaluated unowned size")))]
     (is (some? step-index) "the returned whole buffer now retains its invocation allocation owner")
     (is (some? (get-in claim [:source-projection :helper])))
-    (is (fingerprint/equivalent? (select-keys projection [:constructor :helper])
-                                (:source-projection claim)))
+    (is (fingerprint/equivalent?
+         (invocation-source/allocation-definition-projection projection)
+         (:source-projection claim)))
     ;; These are ownership preflight checks only, not simulated acquisition of
     ;; earlier storage. They must refuse before asking for any count or resource.
     (doseq [[changed expected]
@@ -747,6 +748,8 @@
                   compilation [(float-array [7.0]) (float-array 1)] nil)
         position (first (keep-indexed (fn [i entry] (when (= 'out (:storage entry)) i))
                                      (:source-order initial)))
+        step-index (first (keep-indexed (fn [i step] (when (= 'out (:symbol step)) i))
+                                       (get-in initial [:materialization :plan :steps])))
         calls (atom [])
         state (assoc initial :source-cursor position)
         prepared (invocation-link/prepare-source-allocation
@@ -760,4 +763,18 @@
     (is (= 1 (:elements prepared)))
     (is (= :zero (:initialization prepared)))
     (is (= position (get-in prepared [:state :source-cursor])))
-    (is (empty? (get-in prepared [:state :acquired-storage])))))
+    (is (empty? (get-in prepared [:state :acquired-storage])))
+    ;; Check both retained producers before evaluating a size or acquiring a
+    ;; buffer. This real literal helper is independently executable; placing
+    ;; these controls behind a larger unsupported program would not test them.
+    (is (some? step-index))
+    (doseq [changed [(assoc-in state [:source-allocations 'out :source-projection
+                                     :public-initialization] :unspecified)
+                     (assoc-in state [:materialization :plan :steps step-index
+                                      :source-projection :realized-initialization] :unspecified)]]
+      (is (= :invocation-ordered-allocation-definition
+             (reason #(invocation-link/prepare-source-allocation
+                       changed
+                       (fn [& _] (swap! calls conj :unowned-evaluation)
+                         (throw (AssertionError. "evaluated changed allocation proof"))) nil)))))
+    (is (= 1 (count @calls)) "changed definition facets refuse before evaluating a size")))

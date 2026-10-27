@@ -1377,6 +1377,8 @@
         ;; concrete volume agreement is checked below, not guessed from names.
         constructor-contract (cond-> physical-value resident-scalar? (assoc :shape [1]))
         projection (invocation-source/allocation-source expression values)
+        definition-projection
+        (invocation-source/allocation-definition-projection projection)
         initialization (:initialization projection)
         retained-projections (keep :source-projection [step claim action])]
     (when-not (and destination (= :zero initialization)
@@ -1387,7 +1389,7 @@
       (fail! :invocation-ordered-next-allocation
              "the next source entry is not an admitted size-only zero allocation" {:entry entry}))
     (when (or (and (:helper projection) (empty? retained-projections))
-              (some #(not (semantic/equivalent? (select-keys projection [:constructor :helper]) %))
+              (some #(not (semantic/equivalent? definition-projection %))
                     retained-projections))
       (fail! :invocation-ordered-allocation-definition
              "allocation helper lacks or differs from its retained constructor definition"
