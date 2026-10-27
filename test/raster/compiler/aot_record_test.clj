@@ -1,6 +1,7 @@
 (ns raster.compiler.aot-record-test
   (:require [clojure.test :refer [deftest is testing]]
-            [raster.core :refer [deftm]]
+            [raster.core :as core :refer [deftm]]
+            [raster.compiler.core.method-entry :as method-entry]
             [raster.numeric :as n]
             [raster.sci.distributions :as dist]
             [raster.compiler.pipeline :as pipeline]))
@@ -24,6 +25,28 @@
                 ;; Normal logpdf is -1/2 (...); exponential uses rate s.
                 expected (+ normal (if exponential? (- (Math/log s) (* s x)) 0.0))]
             (is (< (Math/abs (- expected (compiled x s))) 1.0e-12))))))))
+
+(deftest semantic-source-walk-shares-the-aot-parent-loader
+  (let [thread (Thread/currentThread)
+        previous (.getContextClassLoader thread)
+        parent (clojure.lang.DynamicClassLoader. previous)
+        prepare core/prepare-deftm-frontend!
+        observed (atom [])]
+    (try
+      (.setContextClassLoader thread parent)
+      (let [compiled
+            (with-redefs-fn
+              {#'core/prepare-deftm-frontend!
+               (fn [selected]
+                 (swap! observed conj [selected method-entry/*compilation-classloader*])
+                 (prepare selected))}
+              #(pipeline/compile-aot #'normal-lp :dtype :double))]
+        (is (= 1 (count @observed)))
+        (is (identical? parent (second (first @observed)))
+            "the semantic typed walk must use the parent selected for AOT")
+        (is (number? (compiled 0.5 2.0))))
+      (finally
+        (.setContextClassLoader thread previous)))))
 
 (deftest loader-selection-verifies-retained-class-identity
   (let [cls (class (dist/->Normal 0.0 1.0))

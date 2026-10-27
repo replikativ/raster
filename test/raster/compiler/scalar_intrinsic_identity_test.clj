@@ -53,7 +53,9 @@
         (pipeline/deftm-frontend-facts #'sin-map! :double)
         walked '[(let* [result (clojure.core/double 1.0)] result)]
         selections (atom 0)
+        preparations (atom [])
         observations (atom [])
+        prepare core/prepare-deftm-frontend!
         emitted {:kernels [] :dispatches []}]
     (with-redefs-fn
       {#'pipeline/deftm-frontend-facts
@@ -62,6 +64,10 @@
          (is (= :double dtype))
          (swap! selections inc)
          frontend)
+       #'core/prepare-deftm-frontend!
+       (fn [source]
+         (swap! preparations conj [source method-entry/*emission-inputs*])
+         (prepare source))
        #'gpu/resolve-deftm-var
        (fn [& _]
          (throw (AssertionError. "compilation repeated the independent first-overload selection")))
@@ -87,13 +93,119 @@
       #(is (identical? emitted
                        (#'gpu/compile-deftm-internal!
                         #'sin-map! :ocl:source-context {:dtype :double}))))
-    (is (= 1 @selections))
+    (is (= 2 @selections) "the dtype selection is independently renewed inside the owner")
+    (is (= 1 (count @preparations)))
+    (is (identical? resolved-var (ffirst @preparations)))
+    (is (nil? (second (first @preparations)))
+        "semantic source readiness precedes the outer definition-input owner")
     (let [[_ _ options] (first @observations)]
       (is (identical? resolved-var (:source-var options)))
       (is (identical? source-ns (:source-ns options)))
       (is (= parameters (:active-params options))))
     (is (= [:schedule :emit] (mapv first @observations)))
     (is (= ::scheduled (get-in @observations [1 1])))))
+
+(deftest fresh-public-session-root-prepares-only-semantic-source-before-ownership
+  (let [scope (create-ns (symbol (str "raster.compiler.cold-source-root-" (gensym))))]
+    (try
+      (binding [*ns* scope]
+        (clojure.core/refer 'clojure.core)
+        (eval
+         '(raster.core/deftm cold-map!
+            [input :- (Array double) output :- (Array double) n :- Long] :- (Array double)
+            (raster.par/map! output i n double (clojure.core/aget input i)))))
+      (let [source (ns-resolve scope 'cold-map!)
+            resolved (:resolved-var (pipeline/deftm-frontend-facts source :double))
+            prepare core/prepare-deftm-frontend!
+            preparations (atom [])
+            session (atom {:device-id :ocl:cold-source :closed? false :kernels {}
+                           :dispatches {} :kernel-cache {}})]
+        (is (method-entry/call-with-definition-inputs
+             #(nil? (method-entry/original-source-frontend resolved)))
+            "the test root starts without a semantic frontend")
+        (with-redefs-fn
+          {#'core/prepare-deftm-frontend!
+           (fn [selected]
+             (swap! preparations conj [selected method-entry/*emission-inputs*])
+             (prepare selected))
+           #'gpu/rt-resolve
+           (fn [_ operation]
+             (if (= "register-kernel!" operation)
+               (fn [& _] nil)
+               (throw (AssertionError. (str "cold compiler requested native " operation)))))}
+          #(is (= 1 (count (gpu/compile! session :cold-source source {:dtype :double})))))
+        (is (= [[resolved nil]] @preparations))
+        (is (nil? method-entry/*emission-inputs*)
+            "the public compile does not leak its definition-input owner"))
+      (finally
+        (remove-ns (ns-name scope))))))
+
+(deftest nested-source-compilation-validates-without-preparing
+  (let [{:keys [resolved-var] :as frontend}
+        (pipeline/deftm-frontend-facts #'sin-map! :double)
+        _ (core/prepare-deftm-frontend! resolved-var)
+        selections (atom 0)]
+    (with-redefs-fn
+      {#'pipeline/deftm-frontend-facts
+       (fn [source dtype]
+         (is (identical? #'sin-map! source))
+         (is (= :double dtype))
+         (swap! selections inc)
+         frontend)
+       #'core/prepare-deftm-frontend!
+       (fn [& _]
+         (throw (AssertionError. "a nested compiler owner prepared source")))}
+      #(method-entry/call-with-definition-inputs
+        (fn []
+          (let [owner method-entry/*emission-inputs*]
+            (is (= ::nested
+                   (pipeline/call-with-deftm-source-inputs
+                    #'sin-map! :double
+                    (fn [fresh]
+                      (is (identical? owner method-entry/*emission-inputs*))
+                      (is (identical? resolved-var (:resolved-var fresh)))
+                      ::nested))))))))
+    (is (= 2 @selections) "nested validation also reselects without mutation")))
+
+(deftest public-session-compilation-rejects-a-changed-source-selection
+  (let [initial (pipeline/deftm-frontend-facts #'sin-map! :double)
+        replacement (:resolved-var (pipeline/deftm-frontend-facts #'control-map! :double))
+        selections (atom 0)
+        session (atom {:device-id :ocl:source-selection :closed? false :kernels {}
+                       :dispatches {} :kernel-cache {}})]
+    (with-redefs-fn
+      {#'pipeline/deftm-frontend-facts
+       (fn [_ _]
+         (if (= 1 (swap! selections inc))
+           initial
+           (assoc initial :resolved-var replacement)))}
+      #(try
+         (gpu/compile! session :changed-source #'sin-map! {:dtype :double})
+         (is false "a changed overload selection reached scheduling")
+         (catch clojure.lang.ExceptionInfo error
+           (is (= :retained-frontend-entry-mismatch (:reason (ex-data error)))))))
+    (is (= 2 @selections))
+    (is (empty? (:kernels @session)))
+    (is (empty? (:kernel-cache @session)))))
+
+(deftest public-compiler-roots-share-the-source-input-service
+  (let [service pipeline/call-with-deftm-source-inputs
+        calls (atom [])]
+    (with-redefs-fn
+      {#'pipeline/call-with-deftm-source-inputs
+       (fn [source dtype construct! & [discard!]]
+         (swap! calls conj [source dtype method-entry/*emission-inputs*])
+         (service source dtype construct! discard!))}
+      #(do
+         (is (string? (compiled-source #'sin-map!)))
+         (is (ifn? (pipeline/compile-aot #'sin-map! :dtype :double)))
+         (is (map? (pipeline/compile-gpu-program
+                    #'sin-map! :ocl:0 :dtype :double :on-non-resident :throw)))))
+    (is (= [[#'sin-map! :double nil]
+            [#'sin-map! :double nil]
+            [#'sin-map! :double nil]]
+           @calls)
+        "session, AOT, and resident construction all prepare before their outer owner")))
 
 (deftest own-namespaced-helper-does-not-acquire-sine-semantics
   (doseq [operation [#'sin-map! #'control-map!]]

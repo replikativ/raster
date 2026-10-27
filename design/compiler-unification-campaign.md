@@ -4,7 +4,26 @@
 
 ### Current boundary ledger
 
-Latest completed checkpoint is now `09069071f`: unit 35284 completes all
+Latest completed exact-head CI is `1c077fb6b`: all sixteen unit shards
+(35294) finish with 7,735 tests / 95,038 pass / 46 failures / 118 errors across
+136 failing Vars. The replay regression is fixed, but cold semantic readiness
+fails in two scalar-helper tests and cold physical allocator readiness fails in
+one allocation test. No outcome Vars were removed. All four CPU-OpenCL shards
+(35295) finish with 678 tests / 7,456 pass / 12 failures / 76 errors across
+78 failing Vars; the 151 lost root assertions are restored (7,393→7,544).
+Emission 35296 still fails and dependent vendor gates remain unqualified.
+
+The cold semantic-root repair is locally qualified: one shared service prepares
+the exact selected semantic frontend before outer history capture, reselects and
+validates inside the owner, and never prepares when nested. Session, AOT, and
+resident compilation consume the same fresh facts. The existing AOT parent
+classloader surrounds semantic walking as well as emission. Independent rerun
+of the full scalar-intrinsic and AOT-record namespaces passes 19 / 178, including
+a genuinely fresh public compiler root and retained record Class execution.
+The warm delegated-allocation test passes 1 / 6 but is explicitly NOT a cold
+physical-helper qualification. That separate prerequisite remains open.
+
+Previous completed checkpoint, `09069071f`: unit 35284 completes all
 sixteen shards, 7,734 tests / 95,041 passing assertions / 46 failures / 116
 errors across 134 failing Vars. Against `125438f30`, eight Vars recover and one
 new allocation-replay Var fails (`:invocation-ordered-allocation-definition`).

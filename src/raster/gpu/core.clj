@@ -30,7 +30,6 @@
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.dispatch :as dispatch]
             [raster.compiler.core.inference :as inf]
-            [raster.compiler.core.method-entry :as method-entry]
             [raster.compiler.ir.buffer-view :as bview]
             [raster.compiler.ir.execution-plan :as execution]
             [raster.compiler.ir.kernel-abi :as kabi]
@@ -118,11 +117,10 @@
   [v device-id {:keys [dtype min-elements preserve-declared-array-storage?]
                 :or {dtype :float min-elements 0}}]
   (let [result
-        (method-entry/call-with-definition-inputs
-         (fn []
-           (let [{:keys [resolved-var params parameters source-ns]}
-                 (pl/deftm-frontend-facts v dtype)
-                 walked-body (get-walked-body resolved-var dtype)
+        (pl/call-with-deftm-source-inputs
+         v dtype
+         (fn [{:keys [resolved-var params parameters source-ns]}]
+           (let [walked-body (get-walked-body resolved-var dtype)
                  resolved-metadata (meta resolved-var)
                  active-params parameters
                  tags (:raster.core/deftm-tags resolved-metadata)

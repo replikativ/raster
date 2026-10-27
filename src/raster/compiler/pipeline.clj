@@ -234,6 +234,44 @@
      :source-policy (:raster.core/source-policy metadata)
      :return-tag (:raster.core/return-tag metadata)}))
 
+(defn ^:no-doc call-with-deftm-source-inputs
+  "Run one exact dtype-selected source root under the definition-input owner.
+
+   A genuinely outer compiler request prepares only the immutable semantic
+   frontend before acquiring the owner.  A nested compiler request never
+   prepares that frontend: it can only reselect and validate source already made
+   available by its parent.  In both cases the source is freshly reselected
+   inside the owner, and the constructor receives those fresh facts rather than
+   repeating its own overload choice.  Legacy/anonymous roots without a semantic
+   frontend keep their existing path; absence grants no source-import authority."
+  ([f-var requested-dtype construct!]
+   (call-with-deftm-source-inputs f-var requested-dtype construct! nil))
+  ([f-var requested-dtype construct! discard!]
+   (let [initial (deftm-frontend-facts f-var requested-dtype)
+         selected (:resolved-var initial)
+         outer? (nil? me/*emission-inputs*)
+         prepared? (boolean (when outer?
+                              (rcore/prepare-deftm-frontend! selected)))]
+     (me/call-with-definition-inputs
+      (fn []
+        (let [fresh (deftm-frontend-facts f-var requested-dtype)
+              current (:resolved-var fresh)]
+          (when-not (identical? selected current)
+            (throw (ex-info "dtype-selected source changed before compiler ownership"
+                            {:reason :retained-frontend-entry-mismatch
+                             :expected selected :actual current
+                             :dtype requested-dtype})))
+          (let [frontend (when (var? current)
+                           (me/original-source-frontend current))]
+            (when (and prepared? (nil? frontend))
+              (throw (ex-info "prepared source has no current original frontend"
+                              {:reason :retained-frontend-entry-mismatch
+                               :source current :dtype requested-dtype})))
+            (when frontend
+              (me/assert-frontend-semantic-selection! frontend current))
+            (construct! fresh))))
+      discard!))))
+
 ;; ================================================================
 ;; Dialect validation — formal structural invariants via nanopass
 ;; ================================================================
@@ -1710,16 +1748,15 @@
   [f-var & {:keys [inline? simd? dtype target-device preserve-declared-array-storage?
                    reuse-buffers?]
             :or {inline? true simd? true}}]
-  (me/call-with-definition-inputs
-   (fn []
-  (let [;; Use the classloader that defined the target function's defrecord types.
-        ;; Creating a child DCL causes class identity issues: defrecord classes
-        ;; loaded through a child resolve to DIFFERENT Class objects than those
-        ;; in the dispatch table, because Clojure DCL branches can't see each
-        ;; other's defineClass'd classes. Using the same DCL avoids this.
-        ;; The cost is compiled classes can't be GC'd separately — acceptable
-        ;; since users compile a handful of functions, not thousands.
-        parent-cl (let [tcl (.getContextClassLoader (Thread/currentThread))]
+  ;; Use the classloader that defined the target function's defrecord types.
+  ;; Creating a child DCL causes class identity issues: defrecord classes loaded
+  ;; through a child resolve to DIFFERENT Class objects than those in the dispatch
+  ;; table, because Clojure DCL branches can't see each other's defineClass'd
+  ;; classes. The semantic frontend preparation is itself a typed source walk, so
+  ;; it must run under this same retained parent rather than the caller's ambient
+  ;; loader. The cost is compiled classes can't be GC'd separately — acceptable
+  ;; since users compile a handful of functions, not thousands.
+  (let [parent-cl (let [tcl (.getContextClassLoader (Thread/currentThread))]
                     (if (instance? clojure.lang.DynamicClassLoader tcl)
                       tcl
                       ;; Find a DCL from the f-var's namespace
@@ -1730,25 +1767,11 @@
                           var-cl
                           tcl))))]
     (binding [me/*compilation-classloader* parent-cl]
-      (let [params (get-params f-var dtype)
-            walked-body (get-walked-body f-var dtype)
-            active-params (clean-params params)
-            param-env (build-param-env f-var dtype)
-          ;; Get the declared return type from the deftm var
-            resolved-var (or (resolve-deftm-var f-var dtype) f-var)
-            return-tag (:raster.core/return-tag (meta resolved-var))
-            effective-dtype (or dtype (infer-dtype resolved-var)
-                              ;; Scalar-only functions (no array params) default to
-                              ;; double precision — the JVM's native floating-point type.
-                                :double)
-            ;; The deftm's defining namespace — threaded into the passes so any
-            ;; re-walk (pe-rewalk) recognizes deftm calls and devirtualizes them.
-            ;; Without it the re-walk runs under *ns* and silently leaves deftm
-            ;; calls un-devirtualized (and bare in lifted closure helpers).
-            source-ns (let [m (meta resolved-var)]
-                        (or (when-let [s (:raster.core/deftm-source-ns m)]
-                              (try (the-ns s) (catch Exception _ nil)))
-                            (when (var? resolved-var) (.ns ^clojure.lang.Var resolved-var))))
+      (call-with-deftm-source-inputs
+       f-var dtype
+       (fn [{:keys [resolved-var parameters param-env effective-dtype source-ns return-tag]}]
+         (let [walked-body (get-walked-body resolved-var dtype)
+            active-params parameters
             ;; Param annotations ({sym -> typedclojure annotation}), so the PE
             ;; re-walk reconstructs the SAME type-env as walk-1 (array :element,
             ;; (Fn ...) :fn-info) instead of a tag-only env that under-devirtualizes.
@@ -1815,10 +1838,10 @@
                              (vary-meta (:fn result) assoc ::compiled-diagnostics (dissoc result :fn)))))]
         (if target-device
           ((requiring-resolve 'raster.gpu.ze-runtime/make-gpu-fn) compile!)
-          (compile!))))))
-   (when target-device
-     (fn [compiled]
-       ((requiring-resolve 'raster.gpu.ze-runtime/close!) compiled)))))
+          (compile!))))
+       (when target-device
+         (fn [compiled]
+           ((requiring-resolve 'raster.gpu.ze-runtime/close!) compiled)))))))
 
 ;; ================================================================
 ;; Resident GPU program extraction (Option A: bound-dispatch path)
@@ -2248,8 +2271,10 @@
   [f-var device-id & {:keys [dtype on-non-resident gemm-precision schedule compiler-report?
                             preserve-declared-array-storage?]
                       :or {on-non-resident :throw gemm-precision :mixed-f16-f32}}]
-  (me/call-with-definition-inputs
-   (fn []
+  (call-with-deftm-source-inputs
+   f-var dtype
+   (fn [{:keys [resolved-var parameters param-env effective-dtype source-ns]
+         :as frontend}]
     (call-with-gpu-source-construction device-id
    (fn []
   (when (dispatch/host-only? f-var)
@@ -2284,7 +2309,6 @@
                     {:reason :contraction-equation-dispatch-requires-equation-first
                      :device device-id})))
         gemm-precision (:precision resolved-schedule)
-        resolved-var (or (resolve-deftm-var f-var dtype) f-var)
         _ (when (dispatch/host-only? resolved-var)
             (throw (ex-info "GPU specialization resolved to an explicitly host-only deftm method"
                             {:reason :gpu-compiler-host-only
@@ -2293,12 +2317,8 @@
                                                  (str (:name (meta resolved-var))))
                                          resolved-var)
                              :device device-id :dtype dtype})))
-        frontend (deftm-frontend-facts resolved-var dtype)
-        walked-body  (get-walked-body f-var dtype)
-        active-params (:parameters frontend)
-        param-env    (:param-env frontend)
-        effective-dtype (:effective-dtype frontend)
-        source-ns    (:source-ns frontend)
+        walked-body  (get-walked-body resolved-var dtype)
+        active-params parameters
         ;; --- soa-lower (resident GPU value-type explosion) ----------------------------------
         ;; Run the front half to :write-read-fused, explode any Params-container / value-type param
         ;; into per-field array params, then construct TypedSOAC and resume to the backend. Gated on a value-type param
