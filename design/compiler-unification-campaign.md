@@ -47,13 +47,33 @@ and observes one body import for its admitted application. Unplanned calls
 import nothing and retain wrong-arity diagnostics. The checked-input/capacity
 gate separately passes 10 tests / 61 assertions.
 
-The wider migration is not yet qualified: current owned-AD integration has one
-active completion-marker failure in the helper/allocation gradient case
-(41 tests / 571 assertions, 570 pass, one error), independently reproduced with
-the pre-cleanup resolver. Native allocation-return helper expansion also remains
-blocked by its entry/conversion/allocation representation boundary. Both need
-systematic producer/consumer closure, not blanket marker stripping or new
-identity AD rules. These failures remain merge blockers.
+The shared AD prerequisite now closes the previously failing helper/allocation
+boundary. It isolates AD from an enclosing pipeline's source-call context and
+uses one reverse engine with the two existing completion consumer domains.
+Source-produced companions reuse guarded canonical-to-JVM projection and exact
+Class captures; bytecode-produced companions retain actual completion regions
+and sibling methods. Fresh roots come from retained allocation observations.
+Only closed primitive local/literal input regions grant empty external-memory
+effects; owned execution alone does not authorize generic operand effects.
+The memory receipt pins its original program, emission, formals, region vector
+and every memory-fact collection by identity: equal copied maps with retagged
+symbols cannot change replay classification.
+
+Six affected AD namespaces pass 53 tests / 712 assertions, both with the draft
+inliner and with the committed ordinary inliner restored. The real artifact
+tampering negatives, nullable unused inputs, nested floating context, allocation
+and bounds failure order remain covered. Public VJP reuses the same paired
+companion for arbitrary seeds and snapshot pullbacks; a genuine no-inline
+fixture injects redefinition after paired construction, requires old-artifact
+refusal/retry, then verifies reuse. Independent design/implementation review
+found no remaining blocker in this bounded extension. Compound input regions,
+arithmetic count/index regions and fresh-storage writes still decline; this is
+not complete AD or full CI qualification.
+
+The wider inliner/native migration remains unqualified. Native reference
+storage, checked failure propagation and cold source-call correspondence need
+their own closed consumers; no blanket marker stripping or identity AD rule
+waives those obligations.
 
 The first native-entry prerequisite is qualified separately: the existing JVM
 producer can outline each actual boxed-entry parameter conversion without

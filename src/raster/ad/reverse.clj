@@ -4330,6 +4330,70 @@
   (atom {:registry-revision nil :definition-revision nil :entries {}}))
 
 (declare ad-prepare)
+(declare ^:private derive-flat-product-program)
+(declare ^:private owned-bytecode-body-program)
+
+(defn- retained-helper-allocations
+  "Return exact executable newarray occurrences retained by this emission.
+   This is only path selection; the owned bytecode normalizer independently
+   consumes every receipt and supplies the generated storage identities.
+   Quoted data is opaque and one identity cannot represent two evaluations."
+  [emission body]
+  (let [retained (requiring-resolve
+                  'raster.compiler.backend.jvm.bytecode/retained-zero-array-allocation)
+        seen (java.util.IdentityHashMap.)
+        occurrences (volatile! [])]
+    (letfn [(visit [node]
+              (when-let [observation (and (instance? clojure.lang.IObj node)
+                                          (retained emission node))]
+                (when (.containsKey seen node)
+                  (throw (ex-info "paired helper repeats one retained allocation occurrence"
+                                  {:reason :ad-paired-helper-memory-interface})))
+                (.put seen node true)
+                (vswap! occurrences conj [node observation]))
+              (when-not (and (seq? node)
+                             (contains? '#{quote clojure.core/quote} (first node)))
+                (cond
+                  (record? node) (doseq [[_ value] node] (visit value))
+                  (map? node) (doseq [[key value] node] (visit key) (visit value))
+                  (coll? node) (doseq [child node] (visit child)))))]
+      (visit body)
+      @occurrences)))
+
+(defn- memory-free-owned-input-region?
+  "True only for an exact outlined primitive local/literal conversion. The
+   region may throw while completing its value, but cannot read or write
+   external storage and contains no sibling call. Generic invocation operands
+   remain outside this bounded capability."
+  [region]
+  (let [input (:input region)
+        operand (:operand input)
+        ports (:ports input)
+        spec (:spec region)
+        body (:walked-body spec)
+        expression (when (= 1 (count body)) (first body))
+        completion (value-completion/canonical-parts expression)
+        completed-operand (:operand completion)
+        ^java.lang.reflect.Method method (:method region)
+        carrier (when (instance? java.lang.reflect.Method method)
+                  (.getReturnType method))
+        direct? (or (number? operand) (symbol? operand))]
+    (and (map? input) (map? ports) (map? spec)
+         (= false (:unretained-sibling-calls? input))
+         direct?
+         (if (symbol? operand)
+           (= #{operand} (set (keys ports)))
+           (empty? ports))
+         (every? #(contains? #{:int :long :float :double :bool} (:type %))
+                 (vals ports))
+         carrier (.isPrimitive ^Class carrier)
+         (or (identical? expression operand)
+             (and completion (identical? completed-operand operand)
+                  (contains? #{:jvm-bytecode-floating-input
+                               :jvm-bytecode-integral-input
+                               :source-integral-cast
+                               :source-floating-cast}
+                             (get-in completion [:contract :source-context])))))))
 
 (defn- get-paired-helper-program-once
   "Compile an owned bytecode helper's paired forward/pullback program.
@@ -4390,7 +4454,7 @@
           revisions (requiring-resolve 'raster.ad.normalized-scalar/revisions)
           capture (requiring-resolve 'raster.ad.normalized-scalar/execution-guard)
           expected (revisions)
-          cache-key [::paired-helper implementation active-indices emission expected]
+          cache-key [::owned-paired-helper-v8 implementation active-indices emission expected]
           cache @vjp-cache
           cached (when (and (= (:template-revision expected) (:registry-revision cache))
                             (= (:compiler-revision expected) (:definition-revision cache)))
@@ -4402,33 +4466,144 @@
               actual-body (if (= 1 (count body)) (first body) (list* 'do body))
               completed-body (with-meta (list (symbol "clojure.core" (name return-tag)) actual-body)
                                {:raster.type/tag return-tag})
+              allocations (retained-helper-allocations emission actual-body)
               entry-guard (capture source-ns expected [{:parameters all-params :body completed-body}])
               _ (entry-guard)
               proof-inputs (atom {:static [] :values []})
-              program
+              used (atom (util/free-syms-flat [all-params actual-body]))
+              source-policy (get-in emission [:source-entry :source-policy])
+              _ (when-not (value-completion/source-policy? source-policy)
+                  (throw (ex-info "paired helper lost its emitted source policy"
+                                  {:reason :ad-paired-helper-emission})))
+              construction
               (binding [*ns* source-ns
                         method-entry/*emission-inputs* proof-inputs
-                        *generated-product-context* nil
                         *constant-gradient-arrays* (set (keep-indexed
                                                         (fn [index parameter]
                                                           (when (and (contains? types/primitive-array-info (nth tags index))
                                                                      (not (contains? (set active-indices) index)))
                                                             parameter)) all-params))
-                        ;; A paired companion is a compositional pullback,
-                        ;; not the final public gradient boundary. An unused
-                        ;; input must remain absent across this helper edge.
                         *source-memory-context* {:values all-params :internal-region? true
                                                  :value-facts (into {} (map (fn [p] [p {:value p}])) all-params)
                                                  :activity (zipmap active-params (repeat true))
                                                  :replayed {} :unprojectable {} :aliases {}}
                         util/*shadowing-locals* (set all-params)]
                 (with-ad-gensym
-                  (let [prepared (ad-prepare completed-body (zipmap all-params tags))
-                        [bindings results] (extract-let-parts prepared)]
-                    (if (and (= 1 (count results)) (loop-init? (first results)))
-                      (gen-reverse-loop-with-let-program bindings (first results) active-params)
-                      (gen-reverse-let-program bindings results active-params)))))
-              program-guard (capture source-ns expected [{:parameters all-params :body (:form program)}])
+                  (if (seq allocations)
+                    (binding [*generated-product-context*
+                              {:backend :jvm-bytecode :used-identifiers used}]
+                      (let [ordered (owned-bytecode-body-program emission all-params active-params)
+                            raw-program
+                            (binding [*generated-product-context*
+                                      {:backend :jvm-bytecode :used-identifiers used
+                                       :owned-helper-calls (:calls ordered)
+                                       :owned-reduction-regions (:reductions ordered)}]
+                              (derive-flat-product-program
+                               (:bindings ordered) (:result ordered) active-params))
+                            helpers (:helpers ordered)
+                            fresh-storage (:fresh-storage ordered)
+                            owned-effect-bindings (:owned-effect-bindings ordered)]
+                        (when-not (and (set? fresh-storage)
+                                       (= (count allocations) (count fresh-storage))
+                                       (set? owned-effect-bindings)
+                                       (every? true? (map :memory-free?
+                                                          (:input-regions ordered))))
+                          (throw (ex-info "paired helper lost its exact allocation occurrences"
+                                          {:reason :ad-paired-helper-memory-interface})))
+                        {:program (assoc raw-program
+                                        :fresh-storage fresh-storage
+                                        :owned-effect-bindings owned-effect-bindings)
+                         :source-produced? false
+                         :captures (mapv (fn [{:keys [companion helper]}]
+                                           {:port companion :value (:companion helper)}) helpers)
+                         :guards (vec (mapcat (fn [{:keys [guard helper]}]
+                                                [guard (:guard helper)]) helpers))
+                         :input-regions (:input-regions ordered)}))
+                    (let [captures (atom []) guards (atom []) methods (atom [])
+                          helpers (atom {}) call-regions (atom [])
+                          raw-program
+                          (binding [*generated-product-context*
+                                    {:source-policy source-policy :used-identifiers used
+                                     :captures captures :guards guards :methods methods
+                                     :helpers helpers :call-regions call-regions}]
+                            (let [prepared (ad-prepare completed-body (zipmap all-params tags))
+                                  [bindings results] (extract-let-parts prepared)]
+                              (if (and (= 1 (count results)) (loop-init? (first results)))
+                                (gen-reverse-loop-with-let-program
+                                 bindings (first results) active-params)
+                                (gen-reverse-let-program bindings results active-params))))]
+                      {:program (assoc raw-program :fresh-storage #{}
+                                      :owned-effect-bindings #{})
+                       :source-produced? true
+                       :captures @captures :guards @guards :input-regions []}))))
+              canonical-form (get-in construction [:program :form])
+              classes (volatile! #{})
+              _ (when (:source-produced? construction)
+                  (util/postwalk-preserving-meta
+                   (fn [node]
+                     (when-let [{:keys [contract]} (value-completion/canonical-parts node)]
+                       (when (= :jvm-checkcast (:source-context contract))
+                         (vswap! classes conj (:target-carrier contract))))
+                     node)
+                   canonical-form))
+              source-identifiers
+              (into (util/free-syms-flat [all-params canonical-form])
+                    (map :port (:captures construction)))
+              class-captures
+              (mapv (fn [carrier]
+                      (let [port (loop [id (gensym "paired_reference_class__")]
+                                   (if (contains? source-identifiers id)
+                                     (recur (gensym "paired_reference_class__")) id))]
+                        {:port port :value carrier}))
+                    @classes)
+              captures (into (vec (:captures construction)) class-captures)
+              reference-bindings (into {} (map (juxt :value :port)) class-captures)
+              executable-form
+              (if (:source-produced? construction)
+                (value-completion/project-to-jvm-source
+                 canonical-form source-policy reference-bindings)
+                canonical-form)
+              capture-bindings
+              (vec (mapcat (fn [{:keys [port value]}]
+                             [port (list 'clojure.core/nth
+                                         (value-completion/complete-value
+                                          value-completion/object-input-contract
+                                          (list 'quote [value])) 0)])
+                           captures))
+              program (assoc (:program construction) :form
+                             (if (seq capture-bindings)
+                               (list 'let* capture-bindings executable-form)
+                               executable-form))
+              canonical-program-guard
+              (capture source-ns expected
+                       [{:parameters (into all-params
+                                           (map :port (:captures construction)))
+                         :body canonical-form}])
+              program-guard
+              (capture source-ns expected
+                       [{:parameters (into all-params (map :port captures))
+                         :body (:form program)}])
+              validate-memory!
+              (when (seq allocations)
+                (let [expected-program program
+                      expected-regions (:input-regions construction)
+                      expected-parameters all-params
+                      expected-emission emission
+                      interface-keys [:fresh-storage :owned-effect-bindings
+                                      :writes :replays :value-facts]
+                      expected-interface (select-keys program interface-keys)]
+                  (fn [artifact]
+                    (when-not (and (identical? expected-program (:program artifact))
+                                   (identical? expected-regions (:input-regions artifact))
+                                   (identical? expected-parameters (:parameters artifact))
+                                   (identical? expected-emission (:emission artifact))
+                                   (every? (fn [key]
+                                             (identical? (get expected-interface key)
+                                                         (get artifact key)))
+                                           interface-keys))
+                      (throw (ex-info "paired helper changed its owned memory interface"
+                                      {:reason :ad-paired-helper-memory-interface})))
+                    artifact)))
               emission-guard (method-entry/prepare-emission-input-guard! emission)
               observations @proof-inputs
               source-guard (fn []
@@ -4442,8 +4617,19 @@
                                         {:reason :ad-paired-helper-interface})))
                       (entry-guard)
                       (method-entry/assert-definition-inputs-current! observations)
-                      (program-guard))
+                      (canonical-program-guard)
+                      (program-guard)
+                      (doseq [nested-guard (:guards construction)] (nested-guard))
+                      (doseq [region (:input-regions construction)]
+                        ((:guard region))
+                        ((:validate-spec! region) (:spec region))))
               _ (source-guard)
+              input-region-specs (mapv :spec (:input-regions construction))
+              compile-pair
+              (if (seq input-region-specs)
+                (fn [& arguments]
+                  (apply compile-pair (concat arguments [input-region-specs])))
+                compile-pair)
               {companion :implementation companion-emission :emission}
               (binding [*ns* source-ns
                         method-entry/*compilation-classloader* loader]
@@ -4471,7 +4657,11 @@
                       :definition-revision (:definition-revision emission)
                       :return-tag return-tag
                       :writes (:writes program) :replays (:replays program)
-                      :value-facts (:value-facts program) :aliases (:aliases program)}]
+                      :value-facts (:value-facts program) :aliases (:aliases program)
+                      :fresh-storage (:fresh-storage program)
+                      :owned-effect-bindings (:owned-effect-bindings program)
+                      :input-regions (:input-regions construction)
+                      :validate-memory! validate-memory!}]
           ;; Share the existing cache generation; an older derivation must not
           ;; evict entries already published by a newer generation.
           (swap! vjp-cache
@@ -4582,36 +4772,136 @@
   "Project a paired scalar helper's retained replay roots onto caller values.
    Primitive inputs are copied values, not borrowed storage. Array roots must
    correspond to actual visible arguments, never private helper identifiers or
-   guessed freshness. The ordinary caller engine owns subsequent alias/write
-   checks. Mutable or private-storage exports require a richer owned interface."
-  [{:keys [parameters emission writes replays value-facts]} arguments visible-values]
+   guessed freshness. Private roots come only from the original emitter's
+   retained newarray observations carried through the paired source producer.
+   This bounded interface supports reads of those roots, but no writes."
+  [{:keys [parameters program emission writes replays value-facts fresh-storage
+           owned-effect-bindings validate-memory!]
+    :as artifact}
+   arguments visible-values]
   (when-not (and (vector? parameters) (vector? arguments)
                  (= (count parameters) (count arguments))
+                 (map? program)
                  (set? writes) (set? replays) (map? value-facts)
+                 (set? fresh-storage)
+                 (set? owned-effect-bindings)
                  (set? visible-values))
     (throw (ex-info "paired helper memory projection requires its actual formal/argument interface"
                     {:reason :ad-paired-helper-memory-interface})))
-  (when-not (and (empty? writes)
-                 (every? #(= :pure (effects/analyze-effect %)) (:body emission)))
-    (throw (ex-info "paired helper effects require an explicit owned memory export interface"
-                    {:reason :ad-paired-helper-effects :writes writes})))
-  (let [formals (zipmap parameters parameters)
-        actuals (zipmap parameters arguments)
-        projected
-        (into #{}
-              (keep (fn [replay]
-                      (let [root (exact-replay-root replay value-facts)
-                            formal (get formals root)
-                            tag (types/sym-type-tag (or formal root))]
-                        (when-not (contains? types/primitive-info tag)
-                          (let [actual (get actuals root)]
-                            (when-not (and formal (contains? types/primitive-array-info tag)
-                                           (symbol? actual) (contains? visible-values actual))
-                              (throw (ex-info "paired helper has a replay root outside its caller-owned interface"
-                                              {:reason :ad-unprojectable-helper-replay
-                                               :replay replay :root root :argument actual})))
-                            actual))))) replays)]
-    {:kind :region :regions [{:writes #{} :replays projected :value-facts {}}]}))
+  (let [owned-memory? (seq fresh-storage)
+        _ (when owned-memory?
+            (when-not (ifn? validate-memory!)
+              (throw (ex-info "paired helper has no owned memory receipt"
+                              {:reason :ad-paired-helper-memory-interface})))
+            (validate-memory! artifact))
+        forward-bindings (:forward-bindings program)
+        _ (when-not (if owned-memory?
+                      (and (vector? forward-bindings) (even? (count forward-bindings)))
+                      (and (map? emission)
+                           (every? #(= :pure (effects/analyze-effect %)) (:body emission))))
+            (throw (ex-info "paired helper memory proof does not match its producer"
+                            {:reason :ad-paired-helper-memory-interface})))
+        forward-pairs (partition 2 (or forward-bindings []))
+        bound (set (map first forward-pairs))
+        _ (when-not (and (set/subset? fresh-storage bound)
+                         (set/subset? owned-effect-bindings bound)
+                         (empty? (set/intersection fresh-storage (set parameters))))
+            (throw (ex-info "paired helper lost its retained private allocation identities"
+                            {:reason :ad-paired-helper-memory-interface})))
+        unowned-effects
+        (into []
+              (keep (fn [[id expression]]
+                      (when (and (not= :pure (effects/analyze-effect expression))
+                                 (not (contains? fresh-storage id))
+                                 (not (contains? owned-effect-bindings id)))
+                        id)))
+              forward-pairs)]
+    (when (or (seq writes) (seq unowned-effects))
+      (throw (ex-info "paired helper effects require an explicit owned memory export interface"
+                      {:reason :ad-paired-helper-effects
+                       :writes writes :unowned-effects unowned-effects})))
+    (let [formals (zipmap parameters parameters)
+          actuals (zipmap parameters arguments)
+          projected
+          (into #{}
+                (keep (fn [replay]
+                        (let [root (exact-replay-root replay value-facts)
+                              formal (get formals root)
+                              tag (types/sym-type-tag (or formal root))]
+                          (when-not (or (contains? types/primitive-info tag)
+                                        (contains? fresh-storage root))
+                            (let [actual (get actuals root)]
+                              (when-not (and formal (contains? types/primitive-array-info tag)
+                                             (symbol? actual) (contains? visible-values actual))
+                                (throw (ex-info "paired helper has a replay root outside its caller-owned interface"
+                                                {:reason :ad-unprojectable-helper-replay
+                                                 :replay replay :root root :argument actual})))
+                              actual))))) replays)]
+      {:kind :region :regions [{:writes #{} :replays projected :value-facts {}}]})))
+
+(defn- owned-root-vjp-fn
+  "Project an exact selected scalar entry through the existing paired-helper
+   producer. Unlike value+grad, this retains the paired program's arbitrary
+   seed port. The entry guard surrounds each new forward acquisition; the
+   returned pullback is already immutable captured code and may outlive a later
+   source redefinition, matching the public VJP snapshot contract."
+  [resolved all-params active-indices]
+  (method-entry/call-with-definition-inputs
+   (fn []
+     (let [source (symbol (str (.ns ^clojure.lang.Var resolved))
+                          (str (.sym ^clojure.lang.Var resolved)))
+           operation (mangled/impl->op source)
+           implementation-op (symbol (namespace source) (str (name source) "-impl"))
+           receiver (ns-resolve (.ns ^clojure.lang.Var resolved)
+                                (symbol (name implementation-op)))
+           _ (when-not receiver
+               (throw (ex-info "VJP requires a selected typed caller"
+                               {:reason :ad-unowned-bytecode-caller})))
+           _ (rcore/ensure-current-owned-bytecode! receiver)
+           definition (method-entry/selected-definition
+                       operation implementation-op (count all-params))
+           interface (get @types/fn-interface-by-name
+                          (get-in definition [:entry :typed-iface]))
+           methods (when interface
+                     (filter #(= "invk" (.getName ^java.lang.reflect.Method %))
+                             (.getMethods ^Class (:iface-class interface))))
+           method (when (= 1 (count methods)) (first methods))
+           _ (when-not (and definition method
+                            (identical? resolved (:source-var definition)))
+               (throw (ex-info "VJP caller is not its registered selected definition"
+                               {:reason :ad-unowned-bytecode-caller})))
+           artifact (get-selected-paired-helper-program
+                     operation implementation-op (count all-params) method active-indices)
+           companion (:companion artifact)
+           guard (:guard artifact)
+           active-position (zipmap active-indices (range))
+           arity (count all-params)]
+       (when-not (and (ifn? companion) (ifn? guard)
+                      (= arity (count (:parameters artifact)))
+                      (= active-indices (:active-indices artifact)))
+         (throw (ex-info "VJP paired root lost its exact public interface"
+                         {:reason :ad-paired-helper-interface})))
+       (fn [& arguments]
+         (when-not (= arity (count arguments))
+           (throw (clojure.lang.ArityException. (count arguments) (str source))))
+         (guard)
+         (let [pair (apply companion arguments)]
+           (guard)
+           (when-not (and (vector? pair) (= 2 (count pair)) (ifn? (second pair)))
+             (throw (ex-info "VJP paired root returned a malformed value/pullback pair"
+                             {:reason :ad-paired-helper-interface})))
+           (let [[primal pullback] pair]
+             [primal
+              (fn [seed]
+                (let [gradients (pullback seed)]
+                  (when-not (and (vector? gradients)
+                                 (= (count active-indices) (count gradients)))
+                    (throw (ex-info "VJP pullback returned a malformed gradient interface"
+                                    {:reason :ad-paired-helper-interface})))
+                  (mapv (fn [index]
+                          (when-let [position (get active-position index)]
+                            (nth gradients position)))
+                        (range arity))))])))))))
 
 (defn- get-vjp-fn
   "Get or compile the AD-transformed function for a deftm var.
@@ -4664,15 +4954,24 @@
                                params))
               parameter-plan (tangent-parameter-plan all-params tags nil)
               diff-active-params (:candidate-params parameter-plan)
-              transformed (binding [*source-memory-context* {:values all-params
-                                                            :value-facts {} :unprojectable {}
-                                                            :replayed {} :aliases {}}
-                                    util/*shadowing-locals* (into util/*shadowing-locals* all-params)]
-                            (with-ad-gensym
-                              (transform-body
-                               (ad-prepare (first walked-body)
-                                           (zipmap all-params tags))
-                               diff-active-params)))
+              active-indices (mapv (zipmap all-params (range)) diff-active-params)
+              construction
+              (try
+                {:transformed
+                 (binding [*source-memory-context* {:values all-params
+                                                    :value-facts {} :unprojectable {}
+                                                    :replayed {} :aliases {}}
+                           util/*shadowing-locals* (into util/*shadowing-locals* all-params)]
+                   (with-ad-gensym
+                     (transform-body
+                      (ad-prepare (first walked-body)
+                                  (zipmap all-params tags))
+                      diff-active-params)))}
+                (catch clojure.lang.ExceptionInfo failure
+                  (if (= :ad-unowned-derived-pullback (:reason (ex-data failure)))
+                    {:owned (owned-root-vjp-fn resolved all-params active-indices)}
+                    (throw failure))))
+              transformed (:transformed construction)
               ;; transformed is (let* bindings [primal pullback-fn])
               ;; The pullback returns gradients for diff-active-params only;
               ;; wrap it so it returns gradients aligned with all-params (nil
@@ -4703,7 +5002,8 @@
                                       (list 'let* [raw-grads-sym
                                                    (list pullback-sym dy-sym)]
                                             padded-grads-form)))))
-                compiled-fn (eval (value-completion/project-to-jvm-source fn-form))]
+                compiled-fn (or (:owned construction)
+                                (eval (value-completion/project-to-jvm-source fn-form)))]
             ;; A mutation during transformation may otherwise produce a closure
             ;; assembled from more than one registry snapshot. Do not publish or
             ;; return it: retry against the new monotonic revision instead.
@@ -4751,7 +5051,7 @@
 
 (declare hoist-nested-lets)
 
-(defn- lower-composites
+(defn- lower-composites*
   "ANF-normalize + inline composite (un-templated) deftm calls into AD
   primitives, iterating to a fixpoint.
 
@@ -4784,6 +5084,16 @@
             (>= i 32) (throw (ex-info "AD composite lowering did not converge"
                                       {:body body}))
             :else (recur relifted (inc i))))))))
+
+(defn- lower-composites
+  "Lower composites under an explicit source-call isolation boundary. AD must
+   not consume the enclosing pipeline's caller plans: ordinary source import
+   carries JVM completion forms that need their own transpose owner. Leaving
+   an untemplated owned call intact lets prepare-value+grad retry through the
+   existing whole-bytecode AD owner instead."
+  [body]
+  (inline/call-with-source-input-completions
+   body nil #(lower-composites* body)))
 
 (defn- lower-recurrence-bodies
   "Inline constructor-bearing code inside a structured scan or reduction,
@@ -7327,7 +7637,9 @@
         conversion-context (requiring-resolve 'raster.compiler.backend.jvm.bytecode/retained-floating-conversion)
         calls (java.util.IdentityHashMap.)
         reductions (java.util.IdentityHashMap.)
-        state (atom {:bindings [] :helpers [] :input-regions [] :activity (zipmap active (repeat true))})
+        state (atom {:bindings [] :helpers [] :input-regions [] :fresh-storage #{}
+                     :owned-effect-bindings #{}
+                     :activity (zipmap active (repeat true))})
         fail! (fn [& [details]]
                 (throw (ex-info "Owned caller needs an attested numerical lexical region"
                                 (merge {:reason :ad-unclosed-bytecode-body-region} details))))]
@@ -7377,9 +7689,14 @@
                                        (throw (ex-info "Input sibling lost its owning spec"
                                                        {:reason :ad-unowned-bytecode-input-spec}))))
                     operands (mapv #(get-in env [% :value]) (:parameters region))]
-                (swap! state update :input-regions conj
-                       (assoc region :spec spec :validate-spec! validate-spec!))
-                (append! (ad-gensym prefix tag) (list* name operands))))
+                (let [result (ad-gensym prefix tag)
+                      region (assoc region :spec spec :validate-spec! validate-spec!
+                                    :memory-free? (memory-free-owned-input-region?
+                                                   (assoc region :spec spec)))]
+                  (swap! state update :input-regions conj region)
+                  (when (:memory-free? region)
+                    (swap! state update :owned-effect-bindings conj result))
+                  (append! result (list* name operands)))))
             (lower-call [expression env]
               (let [context (retained emission expression)
                     {:keys [dispatch? lexical-callee operation implementation-op]} (op/call-description expression)]
@@ -7445,7 +7762,10 @@
                                                {:value value :active? (boolean (get-in @state [:activity value]))}))))]
                                     (.putAll calls ^java.util.Map (:calls ordered))
                                     (swap! state update :helpers into (:helpers ordered))
-                                    (doseq [[id init] (partition 2 (:bindings ordered))] (append! id init))
+                                    (swap! state update :input-regions into (:input-regions ordered))
+                                    (doseq [[id init] (partition 2 (:bindings ordered))]
+                                      (swap! state update :owned-effect-bindings conj id)
+                                      (append! id init))
                                     (:result ordered))
 
                                   direct-array direct-array
@@ -7497,6 +7817,7 @@
                     (fail!))
                   (.put calls call entry)
                   (swap! state update :helpers conj entry)
+                  (swap! state update :owned-effect-bindings conj raw)
                   (append! raw call))))
             (lower-read [original env after]
               (let [observed ((requiring-resolve 'raster.compiler.backend.jvm.bytecode/retained-array-read)
@@ -7569,9 +7890,14 @@
                   ;; Keep the potentially failing allocation immediately after
                   ;; its original completed count. Freshness is not permission
                   ;; to discard an unused allocation or move it across work.
-                  (append! (ad-gensym "body_array" array-tag)
-                           (with-meta (list constructor count-value)
-                             {:raster.effect/preserve-evaluation true})))))
+                  (let [result (ad-gensym "body_array" array-tag)]
+                    ;; Exact retained-zero-array-allocation above owns this
+                    ;; generated storage identity. No source syntax or effect
+                    ;; spelling can add an entry to this set.
+                    (swap! state update :fresh-storage conj result)
+                    (append! result
+                             (with-meta (list constructor count-value)
+                               {:raster.effect/preserve-evaluation true}))))))
             (lower-conversion [expression env]
               (let [{:keys [operand input-type target-carrier ports context source-operation conversion-kind] :as record}
                     (conversion-context emission expression)
@@ -7760,6 +8086,7 @@
                       (get types/tag->java-class tag) (:result-context body-context))]
         ;; This is the original METHOD return boundary, independent of the
         ;; body's logical tail dtype. Reverse projection transposes it too.
+        (swap! state update :owned-effect-bindings conj result)
         (append! result (value-completion/complete-value contract body-result))
         (assoc @state :result result :calls calls :reductions reductions)))))
 

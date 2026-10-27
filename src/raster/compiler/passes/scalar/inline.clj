@@ -13,6 +13,7 @@
             [raster.compiler.core.inference :as inf]
             [raster.compiler.core.numeric-constant :as constant]
             [raster.compiler.core.method-entry :as method-entry]
+            [raster.compiler.core.inline-call-plan :as call-plan]
             [raster.compiler.core.intrinsic-source :as intrinsic-source]
             [raster.compiler.core.util :as util]
             [raster.compiler.core.value-completion :as completion]
@@ -60,6 +61,14 @@
   "Explicit JVM target admission for private owned AD calls. Portable source
    consumers and native/GPU entries must not extract their bytecode programs."
   false)
+
+(def ^:dynamic ^:private *source-call-context* nil)
+(def ^:dynamic ^:private *source-call-plans* nil)
+
+(defn ^:no-doc call-with-source-input-completions [source options construct]
+  (binding [*source-call-context* (call-plan/source-context options)
+            *source-call-plans* nil]
+    (construct)))
 
 (defn- inlinable-body?
   "Check if a walked body form is suitable for inlining.
