@@ -4,11 +4,11 @@
 
 ### Current boundary ledger
 
-Latest completed unit/CPU accounting, `588320453` (October 27): unit job 35206
-and CPU-OpenCL job 35207 fail; this branch is not merge-ready. Later checkpoints
+Latest completed unit/CPU accounting, `32ff5587a` (October 27): unit job 35221
+and CPU-OpenCL job 35220 fail; this branch is not merge-ready. Later checkpoints
 require their own exact-head qualification.
-All sixteen unit shards complete: 7,675 tests, 95,317 passing assertions, 22 failures and 29
-errors across 40 failing Vars. CPU-OpenCL has all four completed shards: 677
+All sixteen unit shards complete: 7,678 tests, 95,354 passing assertions, 22 failures and 28
+errors across 39 failing Vars. CPU-OpenCL has all four completed shards: 677
 tests, 8,629 passing assertions, 6 failures and 27 errors across 31 failing Vars.
 Setup, build, emitted-source, CUDA and HIP compiler checks pass at this checkpoint. Compiler-only
 vendor checks do not establish native execution or waive the failed unit/device
@@ -25,15 +25,28 @@ the older nested-MMM test expecting the now-owned helper cases to refuse. Those
 including default/selected gradients, empty reductions and unchanged inputs.
 The five affected AD namespaces pass 43 tests / 718 assertions with the
 committed inliner. Unknown Object/compound-array and active-discrete refusals
-remain independently tested. The other 40 unit and 31 CPU failing Vars are
+remain independently tested. The other 39 unit and 31 CPU failing Vars are
 still unqualified; this test migration does not waive them.
 
-The latest unit checkpoint adds a maxpool-gradient ClassCastException (`long[]`
-to `int[]` inside an extracted helper). Its isolated committed-source replay
-passes one test / four assertions, which does not clear the CI failure. The
+The earlier unit checkpoint exposed a maxpool-gradient ClassCastException (`long[]`
+to `int[]` inside an extracted helper). It is absent from the latest completed
+run, but that does not establish its cause or clear the regression. Its isolated
+committed-source replay passes one test / four assertions. The
 existing helper diagnostics are printed on that test's unchanged failure path
 to distinguish cold specialization, stored versus use-site tags, and liveness
 exposing malformed code. No retry or fallback replaces the failing execution.
+
+An independently reproduced JVM gather defect is now repaired: VectorAPI's
+indexed load accepts `int[]`, not arbitrary logical integer arrays. Hardware
+selection consumes the enclosing program's exact plain host-storage facts;
+Long, unknown, packed or mismatched storage retains the ordinary scalar map.
+Verified same-width identity conversions no longer hide eligible int gathers;
+narrowing conversions are never discarded. The old committed raw Long gather
+reproduces the ClassCastException at two preferred vector widths, while the
+fixed public scalar/SIMD comparison passes 7 tests / 183 assertions, including
+tails, empty and changed inputs and a precision-sensitive narrowing negative.
+This deterministic defect is not yet established as the intermittent maxpool
+error's cause. Exact-head CI qualification is still required.
 
 The uncommitted whole-call inliner migration has a consolidated real-owner
 source/arity/history gate passing 34 tests / 300 assertions. Five fabricated
