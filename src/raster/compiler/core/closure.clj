@@ -494,7 +494,8 @@
          field-tags (mapv infer-alloc-tag safe-buf-syms)
          ;; Compile: generates statics class + wrapper class (extends AFn)
          bc-result (compile-hoisted! class-name all-fn-specs
-                                     {:field-tags   field-tags
+                                     {:prepare-static-source (:prepare-static-source opts)
+                                      :field-tags   field-tags
                                       :fn-param-tags fn-param-tags
                                       :return-tag   ret-tag
                                       :compute-name 'compute

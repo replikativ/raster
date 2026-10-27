@@ -4,12 +4,15 @@
    The result contains typed scalars and logical buffer initializers for the exact internal
    ParallelProgram inputs plus explicitly resolved caller-owned result storage. Unresolved resident
    storage refuses before argument projection. It allocates no driver
-   objects and does not evaluate Clojure source: scalar regions are delegated as closed TypedSOAC
-   regions to an injected compiler or interpreter. A later lowering realizes MaterializedBuffers
-   as LinkValues/BufferViews."
+   objects. Pure scalar regions are delegated as closed TypedSOAC regions to an injected compiler
+   or interpreter. Observable source completions require a separate owner-supplied executor;
+   opaque host references never cross the numerical program boundary. A later lowering realizes
+   MaterializedBuffers as LinkValues/BufferViews."
   (:require [clojure.set :as set]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.params-flatten :as params-flatten]
+            [raster.compiler.core.types :as types]
+            [raster.compiler.core.value-completion :as completion]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.index-expression :as index-expression]
             [raster.compiler.ir.kernel-launch :as launch]
@@ -17,12 +20,19 @@
             [raster.compiler.ir.invocation-plan :as invocation]))
 
 (defrecord MaterializedBuffer [id value shape source initialization])
+(defrecord MaterializedOpaque [id value source])
 (defrecord MaterializedInvocation
            [plan values program-buffers program-scalars attributes])
 (defrecord InvocationMaterializationState [plan values lexical next-step])
 
+(def ^:private source-free-parameters-key ::source-free-parameters)
+
 (defn materialized-buffer? [value]
   (and value (= "raster.compiler.ir.invocation_materialization.MaterializedBuffer"
+                (.getName (class value)))))
+
+(defn materialized-opaque? [value]
+  (and value (= "raster.compiler.ir.invocation_materialization.MaterializedOpaque"
                 (.getName (class value)))))
 
 (defn materialized-invocation? [value]
@@ -56,6 +66,28 @@
 
 (defn- buffer-value? [value]
   (and (= :tensor (:kind value)) (seq (:shape value))))
+
+(defn- opaque-value? [value]
+  (and (= :opaque (:kind value)) (empty? (:shape value))))
+
+(defn- checked-opaque [id expected actual]
+  ;; Neither equality, hashing nor printing of the payload is a validation
+  ;; operation. Its host reference (including nil) remains entirely opaque.
+  (when-not (and (opaque-value? expected) (materialized-opaque? actual)
+                 (some? (:id actual)) (= expected (:value actual)))
+    (fail! :invocation-materialization-opaque
+           "host reference requires its retained opaque value wrapper" {:value-id id}))
+  actual)
+
+(defn- checked-opaque-step [{:keys [id value] :as step} actual]
+  (checked-opaque id value actual)
+  (when (and (or (invocation/program-result-import? step) (invocation/source-completion? step))
+             (not= id (:id actual)))
+    (fail! (if (invocation/program-result-import? step)
+             :invocation-materialization-import-identity :invocation-materialization-source-identity)
+           "opaque source value belongs to a different invocation step"
+           {:step id :actual (:id actual)}))
+  actual)
 
 (defn- primitive-array-dtype [value]
   (when (and value (.isArray (class value)))
@@ -124,25 +156,14 @@
    (index-expression/project-dimension
     dimension #(get-in values [(get lexical %) :type]) fail!)))
 
-(defn- runtime-buffer-shape [parameter abstract source lexical values]
+(defn- resolved-parameter-buffer-shape [parameter abstract elements lexical values]
   (let [id (:id parameter)
         symbol (:symbol parameter)
-        rank (count (:shape abstract))
-        elements (primitive-array-length source)]
-    (when-not elements
-      (fail! :invocation-materialization-buffer
-             "the initial invocation vertical requires primitive-array buffer arguments"
-             {:value-id id :actual (some-> source type)}))
+        rank (count (:shape abstract))]
     (when-not (= 1 rank)
       (fail! :invocation-materialization-buffer-shape
              "a flat primitive-array argument requires a retained rank-one logical shape"
              {:value-id id :shape (:shape abstract) :elements elements}))
-    (let [actual-dtype (primitive-array-dtype source)
-          expected-dtype (dtype/canon (:dtype abstract))]
-      (when-not (= expected-dtype actual-dtype)
-        (fail! :invocation-materialization-buffer-dtype
-               "public buffer storage dtype differs from its AbstractValue"
-               {:value-id id :expected expected-dtype :actual actual-dtype})))
     (let [dimension (first (:shape abstract))
           expected
           (cond
@@ -163,6 +184,21 @@
                "public buffer storage length differs from its retained logical shape"
                {:value-id id :symbol symbol :expected [expected] :actual [elements]})))
     [elements]))
+
+(defn- runtime-buffer-shape [parameter abstract source lexical values]
+  (let [id (:id parameter)
+        elements (primitive-array-length source)]
+    (when-not elements
+      (fail! :invocation-materialization-buffer
+             "the initial invocation vertical requires primitive-array buffer arguments"
+             {:value-id id :actual (some-> source type)}))
+    (let [actual-dtype (primitive-array-dtype source)
+          expected-dtype (dtype/canon (:dtype abstract))]
+      (when-not (= expected-dtype actual-dtype)
+        (fail! :invocation-materialization-buffer-dtype
+               "public buffer storage dtype differs from its AbstractValue"
+               {:value-id id :expected expected-dtype :actual actual-dtype})))
+    (resolved-parameter-buffer-shape parameter abstract elements lexical values)))
 
 (defn- scalar-number [values id]
   (let [value (get values id)]
@@ -213,7 +249,35 @@
    (:shape abstract)))
 
 (defn- checked-computed-scalar [step value]
+  (when (invocation/source-completion? step)
+    (let [contract (:contract (completion/canonical-parts (:expression step)))
+          carrier (get types/primitive-info (:tag (completion/invocation-result-description contract)))]
+      ;; A source completion already performed its actual conversion. A
+      ;; dtype label is not permission to silently convert its result again.
+      (when-not (and (typed-scalar? value) carrier
+                     (identical? carrier (class (:value value))))
+        (fail! :invocation-materialization-source-carrier
+               "source completion executor did not return its declared physical result"
+               {:step (:id step) :expected carrier :actual (some-> (:value value) class)}))))
   (checked-scalar (:id step) (:value step) value))
+
+(defn- checked-completed-value [step value]
+  (if (opaque-value? (:value step))
+    (checked-opaque-step step value)
+    (checked-computed-scalar step value)))
+
+(defn- source-completion-producers
+  "Follow only explicit invocation value aliases to their source completion.
+   This is a plan-local dataflow projection, not an inferred numeric type."
+  [plan]
+  (reduce (fn [producers step]
+            (cond
+              (invocation/source-completion? step) (assoc producers (:id step) step)
+              (invocation/value-alias? step)
+              (if-let [producer (get producers (:source step))]
+                (assoc producers (:id step) producer) producers)
+              :else producers))
+          {} (:steps plan)))
 
 (defn- validate-buffer! [binding-id buffer expected]
   (when-not (materialized-buffer? buffer)
@@ -256,6 +320,50 @@
                   :actual-elements actual-elements})))))
   buffer)
 
+(defn- checked-parameter-buffer
+  "Build or recheck one parameter buffer from the same retained plan contract.
+   Source-free mode is descriptor-only: it retains exact shape/storage metadata but has no
+   initializer and establishes no readiness or resident borrow."
+  [parameter actual lexical scalar-values source-free? retained?]
+  (let [{:keys [id value]} parameter
+        _ (when retained? (validate-buffer! id actual value))
+        _ (when (and (not retained?) (materialized-buffer? actual))
+            (fail! :invocation-materialization-buffer
+                   "raw parameter materialization cannot accept a retained buffer descriptor"
+                   {:value-id id :actual (type actual)}))
+        source (if retained? (:source actual) actual)
+        shape (if source-free?
+                (do
+                  (when-not retained?
+                    (fail! :invocation-materialization-state-parameter
+                           "source-free parameters require an exact retained buffer descriptor"
+                           {:value-id id}))
+                  (resolved-parameter-buffer-shape parameter value (first (:shape actual))
+                                                   lexical scalar-values))
+                (runtime-buffer-shape parameter value source lexical scalar-values))
+        expected (->MaterializedBuffer id value shape
+                                       (when-not source-free? source)
+                                       (if source-free? :unspecified :copy))]
+    (when (and retained? (not= expected actual))
+      (fail! :invocation-materialization-state-parameter
+             "retained buffer parameter differs from its exact parameter contract"
+             {:value-id id :expected expected :actual actual}))
+    expected))
+
+(defn- checked-source-free-parameter-ids
+  [state plan]
+  (if-not (contains? state source-free-parameters-key)
+    #{}
+    (let [parameter-ids (get state source-free-parameters-key)
+          buffers (into {} (keep (fn [{:keys [id value]}]
+                                   (when (buffer-value? value) [id value]))) (:parameters plan))]
+      (when-not (and (set? parameter-ids) (seq parameter-ids)
+                     (set/subset? parameter-ids (set (keys buffers))))
+        (fail! :invocation-materialization-source-free-parameters
+               "source-free parameters must name exact shaped buffer parameters"
+               {:parameters parameter-ids :available (set (keys buffers))}))
+      parameter-ids)))
+
 (defn validate!
   [materialization]
   (when-not (materialized-invocation? materialization)
@@ -265,6 +373,7 @@
         plan (invocation/validate! plan)
         _ (refuse-external-dimensions! plan)
         _ (refuse-external-storage! plan)
+        completion-producers (source-completion-producers plan)
         invocation-ids (set (concat (map :id (:parameters plan)) (map :id (:steps plan))))
         lexical (into {} (map (juxt :symbol :id))
                       (concat (:parameters plan) (:steps plan)))]
@@ -280,9 +389,16 @@
     ;; Retained parameters/steps can feed shape computations without being
     ;; final program inputs. Their declared scalar domains still apply when a
     ;; materialization is validated again at a later boundary.
-    (doseq [{:keys [id value]} (concat (:parameters plan) (:steps plan))
+    (doseq [{:keys [id value] :as slot} (concat (:parameters plan) (:steps plan))
             :when (scalar-value? value)]
-      (checked-scalar id value (get values id)))
+      (checked-completed-value (get completion-producers id slot) (get values id)))
+    (doseq [{:keys [id value] :as slot} (concat (:parameters plan) (:steps plan))
+            :when (opaque-value? value)]
+      (checked-completed-value (get completion-producers id slot) (get values id))
+      (when (and (invocation/value-alias? slot)
+                 (not (identical? (get values id) (get values (:source slot)))))
+        (fail! :invocation-materialization-alias
+               "opaque aliases must retain their producer's exact wrapper" {:value-id id})))
     (let [storage-values (set (map :program-value (:storage-bindings plan)))
           materialized-values (set/union (set (:program-inputs plan)) storage-values)]
       (when-not (= materialized-values
@@ -311,6 +427,8 @@
       (checked-scalar id (get-in plan [:values id]) scalar))
     (doseq [{:keys [program-value invocation-value]}
             (concat (:bindings plan) (:storage-bindings plan))]
+      (when-let [producer (get completion-producers invocation-value)]
+        (checked-completed-value producer (get program-scalars program-value)))
       (when-not (= (get values invocation-value)
                    (or (get program-buffers program-value)
                        (get program-scalars program-value)))
@@ -374,20 +492,21 @@
   [plan arguments]
   (project-parameter-arguments (invocation/validate-parameter-projection! plan) arguments))
 
-(defn begin-materialization
-  "Validate public arguments without evaluating any invocation step.
+(defn- checked-parameter-plan [plan]
+  (let [plan (invocation/validate! plan)]
+    (refuse-external-dimensions! plan)
+    (refuse-external-storage! plan)
+    plan))
 
-   The returned immutable state owns no driver resources or evaluator. It is not a completed
-   MaterializedInvocation or permission to bind its unevaluated suffix. Advancing a state chain
-   evaluates one step at a time; callers may place existing device completion boundaries between
-   advances. Reusing an older state explicitly repeats computation, not a successful-check proof.
-   Host arrays remain borrowed sources, not snapshots or newly acquired lifetime leases."
+(defn- initialize-parameters
   [plan arguments]
-  (let [plan (invocation/validate! plan)
-        _ (refuse-external-dimensions! plan)
-        _ (refuse-external-storage! plan)
-        arguments (project-parameter-arguments plan arguments)]
-    (let [parameter-pairs (mapv vector (:parameters plan) arguments)
+  ;; Check before pairing: mapv vector would otherwise silently truncate a missing leaf.
+  (when-not (and (vector? arguments) (= (count (:parameters plan)) (count arguments)))
+    (fail! :invocation-materialization-arity
+           "physical arguments must follow the declared parameter order"
+           {:parameters (mapv :symbol (:parameters plan))
+            :expected (count (:parameters plan)) :actual (count arguments)}))
+  (let [parameter-pairs (mapv vector (:parameters plan) arguments)
           scalar-values
           (into {}
                 (keep (fn [[parameter argument]]
@@ -400,15 +519,51 @@
           (reduce
            (fn [values [parameter argument]]
              (let [{:keys [id value]} parameter]
-               (if (buffer-value? value)
+               (cond
+                 (opaque-value? value)
+                 (assoc values id (->MaterializedOpaque id value argument))
+
+                 (buffer-value? value)
                  (assoc values id
-                        (->MaterializedBuffer id value
-                                              (runtime-buffer-shape parameter value argument
-                                                                    initial-lexical scalar-values)
-                                              argument :copy))
-                 values)))
+                        (checked-parameter-buffer parameter argument initial-lexical scalar-values
+                                                  false false))
+
+                 (scalar-value? value) values
+                 :else (fail! :invocation-materialization-parameter-kind
+                              "public argument has no supported host materialization"
+                              {:value-id id :kind (:kind value)}))))
            scalar-values parameter-pairs)]
-      (->InvocationMaterializationState plan parameter-values initial-lexical 0))))
+    (->InvocationMaterializationState plan parameter-values initial-lexical 0)))
+
+(defn ^:no-doc begin-parameter-materialization
+  "Initialize declared physical parameters after an owner's logical entry projection.
+   This checks arity, scalar values/domains and buffer contracts, not the original root Class/tree or
+   source completion. It cannot authorize a new public calling convention or scalar replacement."
+  [plan parameter-arguments]
+  (initialize-parameters (checked-parameter-plan plan) parameter-arguments))
+
+(defn begin-materialization
+  "Validate public arguments without evaluating any invocation step.
+
+   The returned immutable state owns no driver resources or evaluator. It is not a completed
+   MaterializedInvocation or permission to bind its unevaluated suffix. Advancing a state chain
+   evaluates one step at a time; callers may place existing device completion boundaries between
+   advances. Reusing an older state explicitly repeats computation, not a successful-check proof.
+   Host arrays remain borrowed sources, not snapshots or newly acquired lifetime leases."
+  [plan arguments]
+  (let [plan (checked-parameter-plan plan)]
+    (initialize-parameters plan (project-parameter-arguments plan arguments))))
+
+(defn- step-operand-values [step values]
+  (into {} (map (fn [{:keys [symbol value]}] [symbol (get values value)])) (:operands step)))
+
+(defn- source-completion-executor [evaluators step-id]
+  (let [execute (when (map? evaluators) (:source-completion evaluators))]
+    (when-not (ifn? execute)
+      (fail! :invocation-materialization-source-executor
+             "source completion requires a separately supplied owned executor"
+             {:step step-id}))
+    execute))
 
 (defn- advance-materialization
   [{:keys [plan values lexical next-step] :as state} evaluate-scalar]
@@ -422,26 +577,46 @@
               (fail! :invocation-materialization-shape-source
                      "shape projection source is not a materialized buffer"
                      {:step id :source (:source step) :actual source}))
-            (checked-computed-scalar
-             step {:type (get-in step [:value :dtype])
-                   :value (nth (:shape source) (:axis step))}))
+            (let [result (checked-computed-scalar
+                          step {:type (get-in step [:value :dtype])
+                                :value (nth (:shape source) (:axis step))})]
+              ;; Shape dimensions are stored as Longs, but a source alength
+              ;; produces an Int unless its retained result explicitly widens.
+              ;; Check the domain BEFORE converting; this is this operation's
+              ;; result production, not normalization of arbitrary public scalars.
+              (update result :value #(case (dtype/canon (:type result))
+                                       :int (int %)
+                                       :long (long %)))))
+
+          (invocation/source-completion? step)
+          (let [execute (source-completion-executor evaluate-scalar id)]
+            (let [result (execute step (step-operand-values step values))]
+              (checked-completed-value
+               step (if (opaque-value? (:value step))
+                      (->MaterializedOpaque id (:value step) result)
+                      result))))
+
+          (invocation/program-result-import? step)
+          (fail! :invocation-materialization-program-result
+                 "numerical result imports require the owning ordered execution boundary"
+                 {:step id :equation (:equation step) :result (:result step)})
 
           (invocation/scalar-compute? step)
-          (do
-            (when-not (ifn? evaluate-scalar)
+          (let [evaluate (if (map? evaluate-scalar) (:scalar evaluate-scalar) evaluate-scalar)]
+            (when-not (ifn? evaluate)
               (fail! :invocation-materialization-scalar-evaluator
                      "scalar invocation regions require a typed evaluator"
                      {:step id :region (:region step)}))
             (checked-computed-scalar
-             step (evaluate-scalar
-                   step (into {} (map (fn [{:keys [symbol value]}]
-                                        [symbol (get values value)])) (:operands step)))))
+             step (evaluate step (step-operand-values step values))))
 
           (invocation/buffer-clone? step)
           (let [source (get values (:source step))]
-            (when-not (materialized-buffer? source)
+            (when-not (and (materialized-buffer? source)
+                           (not (contains? (get state source-free-parameters-key #{})
+                                           (:id source))))
               (fail! :invocation-materialization-clone-source
-                     "buffer clone source is not materialized storage"
+                     "buffer clone source is not materialized host-backed storage"
                      {:step id :source (:source step) :actual source}))
             (->MaterializedBuffer id (:value step)
                                   (concrete-shape id (:value step) lexical values)
@@ -471,7 +646,9 @@
     (fail! :invocation-materialization-state-type "expected an InvocationMaterializationState"
            {:actual (type state)}))
   (let [{:keys [plan values lexical next-step]} state
-        plan (invocation/validate! plan)]
+        plan (invocation/validate! plan)
+        completion-producers (source-completion-producers plan)
+        source-free-parameter-ids (checked-source-free-parameter-ids state plan)]
     (refuse-external-dimensions! plan)
     (refuse-external-storage! plan)
     (when-not (and (integer? next-step) (<= 0 next-step (count (:steps plan))))
@@ -489,50 +666,116 @@
             parameter-lexical (into {} (map (juxt :symbol :id)) parameters)
             parameter-values (select-keys values (map :id parameters))
             scalar-values (into {} (filter (comp typed-scalar? val)) parameter-values)
-            check-scalar! (fn [id value actual]
-                            (when-not (typed-scalar? actual)
+            check-completed! (fn [{:keys [id] :as slot} actual]
+                            (when (and (scalar-value? (:value slot)) (not (typed-scalar? actual)))
                               (fail! :invocation-materialization-state-scalar
                                      "retained scalar state requires a typed value"
                                      {:value-id id :actual actual}))
-                            (checked-scalar id value actual))]
+                            (checked-completed-value (get completion-producers id slot) actual))]
         (doseq [{:keys [id value] :as parameter} parameters]
           (let [actual (get values id)]
-            (if (scalar-value? value)
-              (check-scalar! id value actual)
-              (do
-                (validate-buffer! id actual value)
-                (let [expected (->MaterializedBuffer
-                                id value
-                                (runtime-buffer-shape parameter value (:source actual)
-                                                      parameter-lexical scalar-values)
-                                (:source actual) :copy)]
-                  (when-not (= expected actual)
-                    (fail! :invocation-materialization-state-parameter
-                           "retained buffer parameter differs from its original projection"
-                           {:value-id id :expected expected :actual actual})))))))
+            (cond
+              (opaque-value? value) (checked-opaque id value actual)
+              (scalar-value? value)
+              (check-completed! parameter actual)
+              :else
+              (checked-parameter-buffer parameter actual parameter-lexical scalar-values
+                                        (contains? source-free-parameter-ids id) true))))
         ;; Reuse the same interpreter to check deterministic shape, allocation,
         ;; clone and alias steps in their original lexical environment. Only
-        ;; ScalarCompute results are supplied, never reevaluated during validation.
+        ;; ScalarCompute and SourceCompletion results are supplied, never
+        ;; reevaluated during validation.
         (reduce
          (fn [prior step]
            (let [{:keys [id symbol value]} step
                  actual (get values id)]
-             (if (invocation/scalar-compute? step)
-               (do (check-scalar! id value actual)
+             (cond
+               (invocation/program-result-import? step)
+               (do
+                 (checked-opaque-step step actual)
+                 (-> prior
+                     (assoc-in [:values id] actual)
+                     (assoc-in [:lexical symbol] id)
+                     (update :next-step inc)))
+
+               (or (invocation/scalar-compute? step) (invocation/source-completion? step))
+               (do (check-completed! step actual)
                    (-> prior
                        (assoc-in [:values id] actual)
                        (assoc-in [:lexical symbol] id)
                        (update :next-step inc)))
-               (let [expected (advance-materialization prior nil)]
-                 (when-not (= actual (get-in expected [:values id]))
+               :else
+               (let [_ (when-let [producer (get completion-producers id)]
+                         (checked-completed-value producer actual))
+                     expected (advance-materialization prior nil)]
+                 (when-not (if (opaque-value? value)
+                             (identical? actual (get-in expected [:values id]))
+                             (= actual (get-in expected [:values id])))
                    (fail! :invocation-materialization-state-producer
                           "retained structured value differs from its ordered producer"
-                          {:value-id id :actual actual
-                           :expected (get-in expected [:values id])}))
+                          (cond-> {:value-id id}
+                            (not (opaque-value? value))
+                            (assoc :actual actual :expected (get-in expected [:values id])))))
                  expected))))
-         (->InvocationMaterializationState plan parameter-values parameter-lexical 0)
+         (cond-> (->InvocationMaterializationState plan parameter-values parameter-lexical 0)
+           (seq source-free-parameter-ids)
+           (assoc source-free-parameters-key source-free-parameter-ids))
          (take next-step (:steps plan))))
       state)))
+
+(defn ^:no-doc source-free-parameter-state
+  "Replace exact, already checked prefix-zero buffer parameters with source-free descriptors.
+
+   This is a pure conditional-storage projection for an owner that will separately perform a
+   replay-bound refresh. It preserves parameter identity, AbstractValue and concrete shape, but
+   carries no host bytes, native value, initialization credit, readiness proof or lifetime borrow.
+   The resulting state must be consumed directly; it cannot be serialized as raw arguments."
+  [state parameter-ids]
+  (let [state (validate-state! state)
+        parameter-ids (when (set? parameter-ids) parameter-ids)
+        available (into #{} (keep (fn [{:keys [id value]}]
+                                    (when (buffer-value? value) id)))
+                        (get-in state [:plan :parameters]))]
+    (when-not (= 0 (:next-step state))
+      (fail! :invocation-materialization-position
+             "source-free parameter projection requires the unadvanced parameter prefix"
+             {:next-step (:next-step state)}))
+    (when (contains? state source-free-parameters-key)
+      (fail! :invocation-materialization-source-free-parameters
+             "source-free parameter projection may be installed only once"
+             {:parameters (get state source-free-parameters-key)}))
+    (when-not (and (set? parameter-ids) (seq parameter-ids)
+                   (set/subset? parameter-ids available))
+      (fail! :invocation-materialization-source-free-parameters
+             "source-free projection must name exact shaped buffer parameter IDs"
+             {:parameters parameter-ids :available available}))
+    (validate-state!
+     (-> (reduce (fn [state id]
+                   (update-in state [:values id]
+                              #(assoc % :source nil :initialization :unspecified)))
+                 state parameter-ids)
+         ;; This closed mode marker is conditional structural metadata, not a historical-shape
+         ;; seal, readiness, lifetime, content, or native-storage certificate.
+         (assoc source-free-parameters-key parameter-ids)))))
+
+(defn ^:no-doc initial-parameter-arguments
+  "Read already checked entry slots without revisiting the logical argument containers.
+   This borrows their sources; it neither snapshots bytes nor grants source-completion credit."
+  [state]
+  (when (contains? state source-free-parameters-key)
+    (fail! :invocation-materialization-source-free-arguments
+           "source-free parameter descriptors cannot be serialized as host arguments"
+           {:parameters (get state source-free-parameters-key)}))
+  (when-not (= 0 (:next-step state))
+    (fail! :invocation-materialization-position
+           "entry slots must be captured before source materialization advances" {}))
+  (let [state (validate-state! state)]
+    (mapv (fn [{:keys [id]}]
+            (let [value (get-in state [:values id])]
+              (cond (or (materialized-buffer? value) (materialized-opaque? value)) (:source value)
+                    (typed-scalar? value) (:value value)
+                    :else value)))
+          (get-in state [:plan :parameters]))))
 
 (defn materialize-next
   "Evaluate exactly the next invocation step after validating the current prefix.
@@ -542,6 +785,25 @@
     (when (= (:next-step state) (count (get-in state [:plan :steps])))
       (fail! :invocation-materialization-complete "materialization has no remaining step" {}))
     (advance-materialization state evaluate-scalar)))
+
+(defn supply-program-result
+  "Install one opaque source value at the exact next numerical-result import.
+   This pure transition performs no transfer or conversion and proves no device
+   completion. The ordered owner must first discharge the import's producer,
+   payload and initialized-view obligations. Its actual snapshot step—not an
+   equal reconstructed record—identifies where the supplied value belongs."
+  [state step source]
+  (let [{:keys [plan next-step] :as state} (validate-state! state)
+        actual (nth (:steps plan) next-step nil)]
+    (when-not (and (invocation/program-result-import? actual) (identical? step actual))
+      (fail! :invocation-materialization-import-step
+             "a numerical result may only supply its exact next source import"
+             {:next-step next-step}))
+    (validate-state!
+     (-> state
+         (assoc-in [:values (:id step)] (->MaterializedOpaque (:id step) (:value step) source))
+         (assoc-in [:lexical (:symbol step)] (:id step))
+         (update :next-step inc)))))
 
 (defn- available-program-bindings
   [{:keys [plan values]}]
@@ -582,10 +844,21 @@
   "Specialize a typed plan against public arguments without allocating driver resources.
 
    This eager convenience entry uses the same step interpreter as incremental materialization.
-   `evaluate-scalar` receives the retained closed ScalarCompute and typed operand map, and must
-   return one typed scalar. It is neither retained nor called for shapes, allocations or aliases."
+   A function evaluator receives pure ScalarCompute steps. An explicit executor map may provide
+   :scalar and :source-completion functions separately. Source completions return a typed
+   scalar or, for an opaque result, the raw host reference (including nil). Source
+   execution authority belongs to the caller's exact prepared owner, never this semantic plan.
+   Plans requiring a source executor refuse before evaluating any step when it is absent.
+   Executors are not retained or called for shapes, allocations or aliases."
   [plan arguments evaluate-scalar]
-  (let [initial (begin-materialization plan arguments)
+  (let [plan (invocation/validate! plan)
+        _ (when-let [step (first (filter invocation/program-result-import? (:steps plan)))]
+            (fail! :invocation-materialization-program-result
+                   "eager host materialization cannot supply numerical results"
+                   {:step (:id step) :equation (:equation step) :result (:result step)}))
+        _ (when-let [step (first (filter invocation/source-completion? (:steps plan)))]
+            (source-completion-executor evaluate-scalar (:id step)))
+        initial (begin-materialization plan arguments)
         final (reduce (fn [state _] (advance-materialization state evaluate-scalar))
                       initial (get-in initial [:plan :steps]))]
     ;; The eager chain is produced here, not supplied by a caller. Keep its

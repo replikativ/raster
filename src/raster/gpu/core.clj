@@ -116,35 +116,43 @@
    instead of reconstructing them later from the flat kernel list."
   [v device-id {:keys [dtype min-elements preserve-declared-array-storage?]
                 :or {dtype :float min-elements 0}}]
-  (let [walked-body (get-walked-body v dtype)
-        resolved (or (resolve-deftm-var v) v)
-        params (:raster.core/deftm-params (meta resolved))
-        tags   (:raster.core/deftm-tags (meta resolved))
-        ;; Declared scalar/array element types — the SINGLE shared derivation, used by the
-        ;; pipeline's pass-backend too (opencl-pass/derive-param-types). One source of truth.
-        {:keys [scalar-types array-types]}
-        (opencl-pass/derive-param-types params tags dtype
-                                       {:preserve-declared-array-storage? preserve-declared-array-storage?})
-        form (let [f (if (= 1 (count walked-body))
-                       (first walked-body)
-                       (cons 'do walked-body))
-                   f (if (seq scalar-types) (vary-meta f assoc :scalar-types scalar-types) f)
-                   f (if (seq array-types)  (vary-meta f assoc :array-types array-types) f)]
-               f)
-        scheduled (:form (pl/schedule-parallel-form
-                          form {:target-device device-id
-                                :dtype dtype
-                                :array-types array-types
-                                :scalar-types scalar-types}))
-        par-opencl opencl-pass/opencl-pass
-        register!  (rt-resolve device-id "register-kernel!")
-        result (par-opencl scheduled
-                           :device-id device-id
-                           :dtype dtype
-                           :preserve-declared-array-storage? preserve-declared-array-storage?
-                           :array-types array-types
-                           :scalar-types scalar-types
-                           :min-elements min-elements)]
+  (let [result
+        (pl/call-with-deftm-source-inputs
+         v dtype
+         (fn [{:keys [resolved-var params parameters source-ns]}]
+           (let [walked-body (get-walked-body resolved-var dtype)
+                 resolved-metadata (meta resolved-var)
+                 active-params parameters
+                 tags (:raster.core/deftm-tags resolved-metadata)
+                 ;; Declared scalar/array element types — the SINGLE shared derivation, used by the
+                 ;; pipeline's pass-backend too (opencl-pass/derive-param-types). One source of truth.
+                 {:keys [scalar-types array-types]}
+                 (opencl-pass/derive-param-types
+                  params tags dtype
+                  {:preserve-declared-array-storage? preserve-declared-array-storage?})
+                 form (let [f (if (= 1 (count walked-body))
+                                (first walked-body)
+                                (cons 'do walked-body))
+                            f (if (seq scalar-types) (vary-meta f assoc :scalar-types scalar-types) f)
+                            f (if (seq array-types) (vary-meta f assoc :array-types array-types) f)]
+                        f)
+                 scheduled (:form (pl/schedule-parallel-form
+                                   form (cond-> {:target-device device-id
+                                                 :dtype dtype
+                                                 :array-types array-types
+                                                 :scalar-types scalar-types
+                                                 :active-params active-params}
+                                          (var? resolved-var) (assoc :source-var resolved-var)
+                                          source-ns (assoc :source-ns source-ns))))]
+             (opencl-pass/opencl-pass
+              scheduled
+              :device-id device-id
+              :dtype dtype
+              :preserve-declared-array-storage? preserve-declared-array-storage?
+              :array-types array-types
+              :scalar-types scalar-types
+              :min-elements min-elements))))
+        register! (rt-resolve device-id "register-kernel!")]
     (doseq [k (:kernels result)]
       (register! (:kernel-name k) k))
     result))

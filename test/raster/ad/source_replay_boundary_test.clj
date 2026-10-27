@@ -6,6 +6,8 @@
             [raster.ad.reverse :as rev]
             [raster.ad.jvp :as jvp]
             [raster.gpu.core :as gpu]
+            [raster.compiler.backend.cpu.codegen :as cpu]
+            [raster.compiler.core.value-completion :as completion]
             [raster.compiler.pipeline :as pipeline]))
 
 (deftm replay-then-external-write
@@ -161,13 +163,25 @@
 (deftest unlowered-native-guards-are-explicit-refusals
   ;; The generated guard is an actual source effect. Until native preflight
   ;; transports it, target compilation must refuse rather than erase it.
-  (let [data (try (let [compiled (pipeline/compile-aot #'inlined-gradient :target :c :dtype :double)]
-                (when (instance? java.lang.AutoCloseable compiled)
-                  (.close ^java.lang.AutoCloseable compiled))
-                nil)
-                 (catch clojure.lang.ExceptionInfo e (ex-data e)))]
-    (is (= :unsupported-c-family-ir (:reason data)))
-    (is (= "Reverse AD replay input aliases a later write" (:expression data))))
+  (let [compilations (atom 0)
+        data (with-redefs [cpu/compile-source!
+                           (fn [& _]
+                             (swap! compilations inc)
+                             (throw (AssertionError. "Unclosed guard reached native compilation")))]
+               (try (let [compiled (pipeline/compile-aot #'inlined-gradient :target :c :dtype :double)]
+                      (when (instance? java.lang.AutoCloseable compiled)
+                        (.close ^java.lang.AutoCloseable compiled))
+                      nil)
+                    (catch clojure.lang.ExceptionInfo e (ex-data e))))
+        nodes (tree-seq coll? seq (:expression data))]
+    ;; Native emission now refuses the retained value-completion obligation
+    ;; before the older unsupported string/throw check. Verify the stronger
+    ;; boundary without allowing either the completion or alias guard to vanish.
+    (is (= :unclosed-c-family-value-completion (:reason data)))
+    (is (completion/contains-completion? (:expression data)))
+    (is (some #{"Reverse AD replay input aliases a later write"} nodes))
+    (is (some #{:ad-replayed-array-alias} nodes))
+    (is (zero? @compilations)))
   (is (= :structured-control-host-continuation
          (try (pipeline/compile-gpu-program #'explicit-guarded-map :ocl:source-replay-test :dtype :double) nil
               (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))

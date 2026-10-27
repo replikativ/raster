@@ -37,6 +37,7 @@
             [raster.compiler.passes.parallel.structured-control-route :as structured-route]
             [raster.compiler.passes.parallel.typed-soac-resident :as resident]
             [raster.compiler.passes.scalar.soa-lower :as soa-lower]
+            [raster.compiler.passes.scalar.source-import :as source-import]
             [raster.compiler.pipeline :as pipeline]
             [raster.gpu.schedule :as gpu-schedule]
             [raster.core :as rcore]))
@@ -140,6 +141,7 @@
             :active-params parameters
             :public-parameters parameters
             :source-ns source-ns
+            :source-var (:resolved-var frontend)
             :return-tag (:return-tag frontend)
             :array-types (:array-types parameter-types)
             :scalar-types (:scalar-types parameter-types)}
@@ -427,6 +429,43 @@
      :dispatch-reassociated? dispatch-reassociated?
      :dispatch-contractions? dispatch-contractions?}))
 
+(defn- attach-source-action-adapters
+  "Build process-local source recipes from the final semantic source, not a
+   pre-fusion witness. These authorize no execution or transfer. Source-free
+   programs have no original entry with which to discharge such recipes."
+  [compilation compiler-options]
+  (let [program (:semantic compilation)
+        plan (get-in program [:attributes :invocation-plan])
+        completions (filterv invocation/source-completion? (:steps plan))
+        imports (filterv invocation/program-result-import? (:steps plan))]
+    (if-not (or (seq completions) (seq imports))
+      compilation
+      (let [source-var (:source-var compiler-options)
+            _ (when-not (var? source-var)
+                (fail! :equation-first-source-action-owner
+                       "source actions require their original deftm entry" {}))
+            ;; Readiness was demanded before scheduling/emission. This late
+            ;; consumer may validate/adopt it, but must never prepare or refresh.
+            original (method-entry/prepared-original-source-frontend! source-var)
+            witness (source-import/prepare-contextual-source-witness
+                     (:source program)
+                     (assoc compiler-options :lexical-inputs (:public-parameters compiler-options)))
+            request {:frontend original :source-program program :emitted (:emitted compilation)
+                     :plan plan :witness witness
+                     :caller-options (when (contains? compiler-options :scalar-math)
+                                       (select-keys compiler-options [:scalar-math]))}]
+        (cond-> compilation
+          (seq completions)
+          (assoc :source-completion-adapters
+                 (into {} (map (fn [step]
+                                 [(:id step) (source-import/compile-source-completion-step
+                                              (assoc request :step step))])) completions))
+          (seq imports)
+          (assoc :program-result-import-adapters
+                 (into {} (map (fn [step]
+                                 [(:id step) (source-import/compile-program-result-import-step
+                                              (assoc request :step step))])) imports)))))))
+
 (defn- compile-semantic
   "Schedule and emit one exact typed semantic program without source or ABI reconstruction."
   [{:keys [id function-id target dtype source-ns options compiler-options]
@@ -436,7 +475,19 @@
     (fail! :equation-first-coverage
            "program is outside the direct TypedSOAC/structured-control vertical"
            {:function function-id :dialect (:dialect semantic) :fallback :none}))
-  (let [{:keys [target-descriptor resolved-schedule
+  (let [invocation-plan (some-> semantic :attributes :invocation-plan invocation/validate!)
+        _ (when-not invocation-plan
+            (fail! :equation-first-invocation
+                   "equation-first semantic program has no retained public invocation plan"
+                   {:function function-id}))
+        _ (when (some #(or (invocation/source-completion? %) (invocation/program-result-import? %))
+                      (:steps invocation-plan))
+            (let [source-var (:source-var compiler-options)]
+              (when-not (var? source-var)
+                (fail! :equation-first-source-action-owner
+                       "source actions require their original deftm entry" {}))
+              (method-entry/demand-original-source-frontend! source-var)))
+        {:keys [target-descriptor resolved-schedule
                 dispatch-reassociated? dispatch-contractions?]} context
         scheduled (structured-route/schedule-program semantic compiler-options)
         backend (device/select-runtime-backend target true nil)
@@ -468,17 +519,16 @@
            function-id emission
            (assoc compiler-options :target-dialect target-dialect
                   :schedule resolved-schedule))
-          emission)
-        invocation-plan (some-> semantic :attributes :invocation-plan invocation/validate!)]
-    (when-not invocation-plan
-      (fail! :equation-first-invocation
-             "equation-first semantic program has no retained public invocation plan"
-             {:function function-id}))
-    (->EquationFirstCompilation
+          emission)]
+    (attach-source-action-adapters
+     (->EquationFirstCompilation
      id function-id target dtype source-ns
      (cond-> (-> compiler-options
                  (assoc :schedule resolved-schedule)
-                 (dissoc :values))
+                 ;; Entry admission consumes these process-local authorities.
+                 ;; The executable keeps its pure source/semantic contracts,
+                 ;; not the Var or emitter-policy context used to prove them.
+                 (dissoc :values :source-var :source-binding-context))
        source-ns (assoc :source-ns source-ns)
        (contains? options :resident-outputs)
        (assoc :resident-outputs (:resident-outputs options)))
@@ -488,7 +538,8 @@
       :schedule {:dialect (:dialect scheduled)
                  :equations (count (:equations scheduled))}
       :emission (:stats emission)
-      :fallback :none})))
+      :fallback :none})
+     compiler-options)))
 
 (def ^:private typed-compilation-options
   #{:target :schedule :scalar-math :resident-outputs})
@@ -509,18 +560,53 @@
              {:resident-outputs resident-outputs :outputs outputs})))
   resident-outputs)
 
+(defn- validated-emitted-terminal-output
+  "Keep semantic residency separate from target validation, without discarding unchecked schedules."
+  [compilation result caller-options]
+  (try
+    (let [scheduled (:scheduled compilation)
+          emitted (:emitted compilation)
+          producer (some #(when (= [result] (:results %)) %) (:equations scheduled))
+          algorithm (:algorithm producer)]
+      (when (and (soac/program-form? algorithm)
+                 (= 'scalar (some-> algorithm soac/equations first soac/operation-kind)))
+        (let [request (when (contains? caller-options :scalar-math)
+                        (select-keys caller-options [:scalar-math]))
+              logical (emitted-program/retained-typed-program-view emitted scheduled request)]
+          (when logical
+            (structured-route/validated-public-resident-output logical result)))))
+    ;; This is an optional output-property query, not permission to execute a
+    ;; malformed artifact. Ordinary preparation independently validates it too.
+    (catch clojure.lang.ExceptionInfo _ nil)))
+
+(defn ^:no-doc validated-resident-output
+  "Return an exact public scalar value certified through scheduling and emission.
+   Rank zero, an outer representation attribute or a dtype alone is not evidence of resident
+   storage. The caller still owns compilation freshness, execution and initialized output views."
+  ([compilation result] (validated-resident-output compilation result nil))
+  ([compilation result caller-options]
+  (let [producer (some #(when (= [result] (:results %)) %)
+                       (get-in compilation [:scheduled :equations]))
+        algorithm (:algorithm producer)
+        terminal? (and (soac/program-form? algorithm)
+                       (= 'scalar (some-> algorithm soac/equations first soac/operation-kind)))
+        scheduled-value
+        (if terminal?
+          (validated-emitted-terminal-output compilation result caller-options)
+          (structured-route/validated-public-resident-output (:scheduled compilation) result))
+        emitted-value (get-in compilation [:emitted :values result])]
+    (when (and scheduled-value
+               (some #{result} (get-in compilation [:emitted :outputs]))
+               (semantic/equivalent? scheduled-value emitted-value))
+      scheduled-value))))
+
 (defn- validate-resident-output-compilation!
-  [compilation resident-outputs]
+  [compilation resident-outputs caller-options]
   (doseq [result resident-outputs]
-    (let [scheduled-value
-          (structured-route/validated-public-resident-output (:scheduled compilation) result)
-          emitted-value (get-in compilation [:emitted :values result])]
-      (when-not (and scheduled-value
-                     (some #{result} (get-in compilation [:emitted :outputs]))
-                     (semantic/equivalent? scheduled-value emitted-value))
-        (fail! :equation-first-resident-output-representation
-               "requested resident output did not retain its certified emitted representation"
-               {:result result :target (:target compilation)}))))
+    (when-not (validated-resident-output compilation result caller-options)
+      (fail! :equation-first-resident-output-representation
+             "requested resident output did not retain its certified emitted representation"
+             {:result result :target (:target compilation)})))
   compilation)
 
 (defn- scalar-region-local-dtypes
@@ -660,8 +746,35 @@
        (merge policy
               {:id id :function-id function-id :target target :dtype carrier :source-ns nil
                :options options :compiler-options compiler-options})
-       promoted)
-      resident-outputs))))
+      promoted)
+      resident-outputs options))))
+
+(defn- project-semantic-source
+  "Keep target-local source construction out of original/JIT source publication."
+  [source compiler-options representation]
+  (pipeline/call-with-gpu-source-construction
+   (:target-device compiler-options)
+   (fn []
+     (let [represented-source (pipeline/run-passes
+                               source pipeline/gpu-resident-pre-soa-passes compiler-options)
+           represented (soa-lower/soa-lower represented-source (:params representation)
+                                             (:soa-env representation))
+           projection (:projection representation)
+           physical-parameters (mapv :sym (:params represented))
+           physical-types (when projection
+                            (opencl-pass/derive-param-types physical-parameters
+                                                           (mapv :tag (:params represented))
+                                                           (:dtype compiler-options) compiler-options))
+           compiler-options (cond-> compiler-options
+                              projection (assoc :active-params physical-parameters
+                                                :public-parameters physical-parameters
+                                                :array-types (:array-types physical-types)
+                                                :scalar-types (:scalar-types physical-types)))]
+       {:program (pipeline/run-passes
+                  (:body represented) pipeline/gpu-semantic-post-soa-passes
+                  compiler-options :write-read-fused)
+        :compiler-options compiler-options
+        :projection projection}))))
 
 (defn compile
   "Compile one deftm Var into an immutable equation-first target program.
@@ -697,6 +810,11 @@
              (fail! :equation-first-host-only
                     "equation-first specialization resolved to an explicitly host-only method"
                     {:function (function-symbol resolved-var) :target target :dtype dtype}))
+         ;; Settle original source-only publication before target observations.
+         ;; Actual JVM receiver preparation remains demand-driven at the owned
+         ;; source-action boundary; freezing/walking here executes no source.
+         _ (rcore/prepare-deftm-frontend! resolved-var)
+         _ (rcore/prepare-emission-source-walk! resolved-var)
          function-id (function-symbol resolved-var)
          policy (compilation-policy function-id target options captured-target)
          {:keys [target-descriptor reference-schedule]} policy
@@ -707,25 +825,11 @@
                                                        :target-descriptor target-descriptor)))
          walked (pipeline/get-walked-body resolved-var (:dtype compiler-options))
          source (if (= 1 (count walked)) (first walked) (list* 'do walked))
-         represented-source (pipeline/run-passes
-                             source pipeline/gpu-resident-pre-soa-passes compiler-options)
          representation (parameter-representation f-var (:dtype compiler-options))
-         param-specs (:params representation)
-         represented (soa-lower/soa-lower represented-source param-specs (:soa-env representation))
-         projection (:projection representation)
-         physical-parameters (mapv :sym (:params represented))
-         physical-types (when projection
-                          (opencl-pass/derive-param-types physical-parameters
-                                                         (mapv :tag (:params represented))
-                                                         (:dtype compiler-options) compiler-options))
-         compiler-options (cond-> compiler-options
-                            projection (assoc :active-params physical-parameters
-                                              :public-parameters physical-parameters
-                                              :array-types (:array-types physical-types)
-                                              :scalar-types (:scalar-types physical-types)))
-         semantic-candidate (pipeline/run-passes
-                             (:body represented) pipeline/gpu-semantic-post-soa-passes
-                             compiler-options :write-read-fused)
+         projected-source (project-semantic-source source compiler-options representation)
+         compiler-options (:compiler-options projected-source)
+         projection (:projection projected-source)
+         semantic-candidate (:program projected-source)
          semantic (case (:dialect semantic-candidate)
                     :typed-parallel (if (get-in semantic-candidate [:attributes :invocation-plan])
                                       semantic-candidate
@@ -765,7 +869,21 @@
   (when-not (equation-first-compilation? compilation)
     (fail! :equation-first-compilation "lower requires an EquationFirstCompilation"
            {:actual (type compilation)}))
-  (let [started (System/nanoTime)
+  (let [;; The order query and final lowering consume the SAME immutable
+        ;; checked boundary. Re-deriving it independently in each phase repeats
+        ;; storage projection without supplying any new invocation evidence.
+        retained-validation (or retained-validation
+                                (if (nil? caller-options)
+                                  (emitted-program/validate-with-physical-results! (:emitted compilation))
+                                  (emitted-program/validate-with-physical-results!
+                                   (:emitted compilation) caller-options)))
+        requirement (invocation-link/ordered-preparation-requirement
+                     compilation retained-validation caller-options)
+        _ (when (:required? requirement)
+            (fail! :equation-first-ordered-preparation
+                   "source actions require ordered preparation before numerical execution"
+                   {:function (:function compilation) :barriers (:barriers requirement)}))
+        started (System/nanoTime)
         source-ns (:source-ns compilation)
         invocation-plan (get-in compilation [:semantic :attributes :invocation-plan])
         unsupported-host-evaluation

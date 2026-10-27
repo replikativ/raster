@@ -4,6 +4,7 @@
             [raster.compiler.ir.parallel-program :as program]
             [raster.compiler.ir.soac-dialect :as soac-dialect]
             [raster.compiler.ir.kernel-launch :as launch]
+            [raster.compiler.core.value-completion :as completion]
             [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]))
 
@@ -119,6 +120,15 @@
               positive-program (assoc p :equations [positive-zero])]
           (is (= (list 'identity 0.0) (list 'identity -0.0)))
           (is (nil? (lookup positive-program (list 'identity -0.0)))))
+        (let [owned (completion/complete-value
+                     (completion/bytecode-boxed-parameter-contract Double/TYPE) 'value)
+              changed (completion/complete-value
+                       (completion/bytecode-boxed-parameter-contract Float/TYPE) 'value)
+              owned-equation (assoc equation :source owned)
+              owned-program (assoc p :equations [owned-equation])]
+          (is (= owned-equation (lookup owned-program owned))
+              "private source correspondence preserves the actual completion Class")
+          (is (nil? (lookup owned-program changed))))
         (is (= :semantic-fingerprint-unsupported
                (reason-of #(lookup retained
                                   (with-meta typed-source {:opaque (Object.)})))))))))

@@ -2,7 +2,6 @@
   "Hardware-free transfer doubles; native tests independently exercise original receipt evidence."
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.ir.abstract-value :as av]
-            [raster.compiler.ir.buffer-view :as view]
             [raster.compiler.ir.numerical-state :as state]
             [raster.gpu.compiled :as compiled]
             [raster.gpu.core :as gpu]
@@ -18,17 +17,10 @@
 (defn- with-fixture [n f]
   (let [payloads {:a (MemorySegment/ofArray (float-array (map float (range n))))
                   :b (MemorySegment/ofArray (float-array (repeat n -2.0)))}
-        nodes (into {} (map (fn [[id _]]
-                              [id {:view (view/view
-                                          (view/allocation {:id id :byte-size (* 4 n)
-                                                            :memory-space :device :ownership :owned})
-                                          {:id id :dtype :float :shape [n]})}]) payloads))
-        session (atom {})
-        executable (lifecycle/linked-executable
-                    {:plan {:id :unit :outputs [:a :b] :nodes nodes}
-                     :session session :owns-session? true :node-views {:a :a :b :b}
-                     :output-leases (atom 0) :output-ready? (atom true)
-                     :completed-replays (atom 1)})
+        executable (lifecycle/linked-output-executable
+                    {:id :unit :target :ocl:unit :session-id :resident-state-fixture
+                     :outputs (mapv (fn [[id source]] {:id id :shape [n] :source source}) payloads)})
+        nodes (get-in executable [:plan :nodes])
         leaf (fn [id] (assoc (select-keys (:view (nodes id)) [:dtype :shape :strides :byte-length])
                              :content (content/content-address-of (payloads id))
                              :representation :device-native
@@ -41,20 +33,22 @@
                      :outputs {:a (leaf :a) :b (leaf :b)} :post-state {:b (leaf :b)}}
         reads (atom [])]
     (with-redefs [link/output-values (constantly {})
+                  gpu/replay! (fn [& _] nil)
                   compiled/completed-storage-description
                   (fn [receipt _]
                     (when-not (compiled/completed-evidence? receipt) (throw (ex-info "forged" {})))
                     @(:lease receipt)
                     description)
                   gpu/download-range!
-                  (fn [_ id ^MemorySegment destination {:keys [src-element elements]}]
-                    (swap! reads conj [id src-element elements])
-                    (MemorySegment/copy (payloads id) (* 4 src-element) destination 0 (* 4 elements))
-                    destination)]
-      (with-open [receipt (#'compiled/seal-artifact
-                           (compiled/->CompletedEvidence
-                            {:bound-schedules [{:strategy :unit}] :parent "execution-parent"}
-                            (link/output-lease! executable) executable 0 {} (atom false) nil))]
+                  (fn [_ resident ^MemorySegment destination {:keys [src-element elements]}]
+                    (let [id (:key resident)]
+                      (swap! reads conj [id src-element elements])
+                      (MemorySegment/copy (payloads id) (* 4 src-element) destination 0 (* 4 elements))
+                      destination))]
+      (link/run! executable)
+      (with-open [receipt (lifecycle/completed-evidence
+                           executable
+                           {:bound-schedules [{:strategy :unit}] :parent "execution-parent"})]
         (f {:receipt receipt :description description :executable executable :payloads payloads
             :reads reads
             :opts {:id :step-2 :parents [:state-1] :logical-coordinate {:step 2}

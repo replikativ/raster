@@ -13,7 +13,11 @@
   (let [c (#'fixture/owner)]
     (#'fixture/simulated c {}
       (fn [trace session]
-        (let [observed (storage/observe! session :f32)]
+        (let [executable (:executable c)
+              original-buffers (:buffers @session)
+              original-state @(:execution-state executable)
+              original-ready? @(:output-ready? executable)
+              observed (storage/observe! session :f32)]
           (is (= :float (:dtype observed)))
           (is (= :little-endian (:byte-order observed)))
           (is (= (:session-id @session) (:session-id observed)))
@@ -22,10 +26,11 @@
           (is (not (compiled/representation-evidence? observed)))
           (is (nil? (:program-fingerprint observed)))
           (is (= [:allocate :bind :run :download :classify :release-graph :free] @trace))
-          (is (empty? (:buffers @session)))
+          (is (= original-buffers (:buffers @session)))
           (is (empty? (:kernel-graphs @session)))
-          (is (zero? (:value-epoch @(:execution-state (:executable c)))))
-          (is (true? @(:output-ready? (:executable c)))))))))
+          (is (= original-state @(:execution-state executable)))
+          (is (zero? (:value-epoch @(:execution-state executable))))
+          (is (= original-ready? @(:output-ready? executable))))))))
 
 (deftest admission-precedes-owner-mutation-wrapper
   (doseq [scenario [:unsupported :events]]
@@ -48,7 +53,8 @@
         (fn [trace session]
           (let [run! gpu/run-kernel-graph!
                 device-info gpu/execution-device-info
-                changed? (atom false)]
+                changed? (atom false)
+                original-buffers (:buffers @session)]
             (with-redefs [gpu/run-kernel-graph!
                           (fn [& args]
                             (reset! changed? true)
@@ -63,14 +69,15 @@
               (is (= :storage-representation-device-changed
                      (reason #(storage/observe! session :float)))))
             (is (= [:release-graph :free] (vec (take-last 2 @trace))))
-            (is (empty? (:buffers @session)))
+            (is (= original-buffers (:buffers @session)))
             (is (empty? (:kernel-graphs @session)))))))))
 
 (deftest owner-thunk-is-synchronous-one-shot-and-cannot-escape
   (let [c (#'fixture/owner)]
     (#'fixture/simulated c {}
       (fn [trace session]
-        (let [retained (atom nil)]
+        (let [retained (atom nil)
+              original-buffers (:buffers @session)]
           (is (= :storage-representation-wrapper
                  (reason #(storage/observe! session :float nil))))
           (is (= :storage-representation-not-observed
@@ -91,7 +98,7 @@
                        result))))))
           (is (= :storage-representation-scope (reason #(@retained))))
           (is (= 1 (count (filter #{:allocate} @trace))))
-          (is (empty? (:buffers @session)))
+          (is (= original-buffers (:buffers @session)))
           (is (empty? (:kernel-graphs @session))))))))
 
 (deftest wrapper-cannot-submit-async-work-before-invoking-the-probe

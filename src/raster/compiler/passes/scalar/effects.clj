@@ -6,23 +6,36 @@
    effectful (:io). Only expressions beichte proves pure get :pure.
 
    Source operations may additionally carry semantic obligations which are not
-   external effects. In particular, op-descriptor's checked integral casts can
-   throw. Such expressions retain Beichte's effect level but carry a flag so
+   external effects. Checked integral casts and array constructors can throw.
+   Such expressions retain Beichte's effect level but carry a flag so
    DCE, CSE and algebraic simplification cannot erase or duplicate the possible
    exceptional control transfer.
 
-   The raster context pre-registers raster.numeric and raster.math vars
-   as :pure so beichte doesn't need to analyze their source each time."
+   The Raster context registers declared contracts but disables unowned source
+   lookup. Reading a Var's file/line does not authenticate its current root;
+   expanding type/protocol declarations can also mutate JVM class identity."
   (:require [beichte.core :as b]
             [beichte.registry :as beichte-registry]
             [clojure.walk :as walk]
             [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.intrinsic-source :as intrinsic-source]
+            [raster.compiler.core.method-entry :as method-entry]
             [raster.compiler.core.numeric-constant :as numeric-constant]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.scalar-conversion :as scalar-conversion]
             [raster.compiler.core.types :as types]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.form :as form]))
+
+(defn- declared-context [registry]
+  (let [context (b/make-context {:registry registry :source-resolver nil})]
+    ;; Older Beichte versions silently ignored unknown options. Never silently
+    ;; re-enable source expansion when this compiler boundary requests none.
+    (when-not (and (contains? context :source-resolver)
+                   (nil? (:source-resolver context)))
+      (throw (ex-info "Effect analysis requires source lookup to be disabled"
+                      {:reason :unowned-effect-source-analysis})))
+    context))
 
 (defonce ^:private raster-context
   (delay
@@ -96,7 +109,7 @@
               {}))
           raster-entries (merge pure-entries array-entries loss-entries ad-entries)
           reg (b/extend-registry (b/default-registry) raster-entries)]
-      (b/make-context {:registry reg}))))
+      (declared-context reg))))
 
 (defn init-raster-context!
   "Force initialization of the shared Raster Beichte context."
@@ -110,11 +123,17 @@
   []
   @raster-context)
 
+(defn- quoted-form? [expression]
+  (and (seq? expression) (= 2 (count expression))
+       (contains? '#{quote clojure.core/quote} (first expression))))
+
 (defn- collect-locals
   "Collect free non-operator symbols from an expression for beichte's :locals.
    Excludes call-position symbols (they should resolve as vars, not locals)."
   [expr]
   (cond
+    (quoted-form? expr) #{}
+
     (symbol? expr)
     (when (and (not (namespace expr))
                (not (contains? form/known-form-heads expr)))
@@ -122,8 +141,9 @@
     (seq? expr)
     ;; Skip head (operator position) — only collect from args
     (apply clojure.set/union #{} (map collect-locals (rest expr)))
-    (vector? expr)
-    (apply clojure.set/union #{} (map collect-locals expr))
+    (coll? expr)
+    (apply clojure.set/union #{}
+           (map collect-locals (if (map? expr) (mapcat identity expr) expr)))
     :else #{}))
 
 (declare descriptor)
@@ -134,9 +154,9 @@
   (:effect (descriptor expr)))
 
 (defn analyze-var-effect
-  "Analyze a var and return its effect level using fresh source evidence."
+  "Return the declared effect of a Var; unknown source is not compiler evidence."
   [v]
-  (b/analyze-var v (b/make-context {:registry (:registry @raster-context)})))
+  (b/analyze-var v (declared-context (:registry @raster-context))))
 
 (defn- semantic-calls
   "Restore walker-devirtualized calls to the source-level operation recorded in
@@ -165,38 +185,90 @@
                          dtype/dtype-for-scalar-tag)
           target (some-> (descriptor/semantic-op expression) descriptor/cast-result-tag
                          dtype/dtype-for-scalar-tag)]
-      (or (some? (numeric-constant/value expression))
+      (or (some? (when-let [operation (descriptor/semantic-op expression)]
+                   (when (descriptor/cast-op? operation)
+                     (numeric-constant/source-value
+                      (apply list (symbol "clojure.core" (name operation))
+                             (descriptor/call-args expression))))))
           (and source target
                (= [:exact :exact] (scalar-conversion/policy source target)))))))
 
-(defn- source-cast-flags
-  "Evaluation obligations for source casts derived from the shared descriptor.
+(defn- bounded-source-allocation?
+  "Discharge deterministic size checks only for an exact core constructor.
+   Only raw integral literals are admitted: neither a type tag nor a nested
+   conversion's numeric value authenticates its source implementation. A
+   one-argument constructor may instead consume initializer data.
+   As with existing dead-allocation elimination, resource exhaustion is outside
+   this permission: a valid count is not a proof that allocation can succeed."
+  [expression]
+  (when-let [size (descriptor/array-allocation-size expression)]
+    (when (and (integer? size) (<= 0 size Integer/MAX_VALUE))
+      (let [lookup (first expression)
+            operation (symbol "clojure.core" (name lookup))]
+        (try
+          (intrinsic-source/assert-original! (resolve lookup) operation
+                                             :source-constructor-definition-mismatch)
+          (when method-entry/*emission-inputs*
+            (intrinsic-source/observe-original! *ns* lookup operation))
+          true
+          (catch clojure.lang.ExceptionInfo _ false))))))
 
-   This deliberately derives from op-descriptor's closed conversion contract;
+(defn- source-evaluation-flags
+  "Checked conversion/constructor obligations and explicit source-owner denials.
+
+   This deliberately derives from op-descriptor's existing operation contracts;
    it is not another function registry. Without retained operand dtypes here,
-   checked integral casts remain conservatively non-removable. Local product
+   checked integral casts remain conservatively non-removable. This reader does
+   not globally reinterpret arithmetic purity as source totality. New local
+   product rewrites retain their actual evaluations explicitly; migration of
+   ordinary arithmetic classification requires its target consumers too. Local product
    lowering additionally retains its generic factory's reference conversion
    obligation explicitly. Untyped scoped binders require their own type evidence;
    this does not globally reinterpret their casts as reference conversions."
   [expr]
   (into #{}
    (mapcat (fn [node]
-           (when (seq? node)
-             (let [operation (descriptor/semantic-op node)]
-               (when (descriptor/cast-op? operation)
+             (let [operation (when (seq? node) (descriptor/semantic-op node))]
                     (cond-> []
-                        (and (not (proven-total-cast? node))
+                        (and (seq? node) (not (proven-total-cast? node))
+                             (descriptor/cast-op? operation)
                              (= :reject (descriptor/cast-integral-narrowing operation))
                              (contains? '#{byte int long} (descriptor/cast-result-tag operation)))
                         (conj :checked-source-cast)
+                        ;; Allocation purity says nothing about a negative/overflowing
+                        ;; count, unsupported initializer overload or helper failure.
+                        ;; Nominal allocation recognition is denial-only; only the
+                        ;; exact constructor/count proof above discharges it.
+                        (and (seq? node)
+                             (descriptor/alloc-op? (form/effective-op node))
+                             (not (bounded-source-allocation? node)))
+                        (conj :source-allocation-evaluation)
                         ;; This is denial-only evidence from the source factory:
                         ;; no optimizer may erase its conversion merely because
                         ;; the projected field is not otherwise used.
                         (true? (:raster.effect/source-reference-cast (meta node)))
-                        (conj :source-reference-cast))))))
-         (tree-seq coll? seq expr))))
+                        (conj :source-reference-cast)
+                        ;; A value proof consumed by simplification is not a
+                        ;; proof that its original evaluation can disappear.
+                        ;; This obligation is independent of numeric width,
+                        ;; external purity, and actual primitive/Object storage.
+                        (true? (:raster.effect/preserve-evaluation (meta node)))
+                        (conj :preserve-source-evaluation))))
+         (tree-seq #(and (coll? %) (not (quoted-form? %)))
+                   seq expr))))
 
 (def ^:private descriptor-cache-capacity 65536)
+
+(defn ^:no-doc source-obligation-flags
+  "Read only retained source-evaluation obligations, not effects or totality.
+   A consumer must independently close the expression grammar before using
+   this instead of the full descriptor. In particular, an empty result says
+   nothing about callbacks, exceptions or randomness in an arbitrary call."
+  [expression]
+  (try
+    (source-evaluation-flags expression)
+    (catch Exception _ #{:unclosed-source-obligations})
+    (catch StackOverflowError _ #{:unclosed-source-obligations})))
 
 (def ^:private descriptor-cache
   "Descriptors by expression key, least recently used evicted first. Scalar
@@ -259,11 +331,17 @@
    exact resolved operation identities. Open expressions use a fresh Beichte
    context; cached source analysis must not survive helper redefinition."
   [expr]
-  (if (not (seq? expr))
-    {:effect :pure :flags #{}}
+  (if (or (not (coll? expr)) (quoted-form? expr))
+    ;; A leaf performs no nested evaluation. Collection initializers, unlike
+    ;; leaves, can execute calls in their elements/keys/values and must use the
+    ;; same effect authority as ordinary call forms. Quote stays opaque there.
+    {:effect :pure :flags (source-evaluation-flags expr)}
     (if-let [k (try
                  (when-let [proof (closed-registry-proof expr)]
-                   [(descriptor-key expr) proof])
+                   ;; Revalidate source obligations even on cache hits. Core
+                   ;; Var identity alone survives root/inline replacement and
+                   ;; must not preserve yesterday's constructor permission.
+                   [(descriptor-key expr) proof (source-evaluation-flags expr)])
                  (catch Exception _ nil)
                  (catch StackOverflowError _ nil))]
       (or (.get ^java.util.Map descriptor-cache k)
@@ -274,21 +352,32 @@
 
 (defn- analyze-descriptor
   [expr]
+  ;; A failed optional purity analysis cannot discharge independently retained
+  ;; source obligations. Read those from original syntax, not its Beichte-only
+  ;; call projection, and merge them even when that analysis abstains.
   (try
-    (let [semantic-expr (semantic-calls expr)
-          locals (collect-locals semantic-expr)
-          context (b/make-context {:registry (:registry @raster-context)})
-          result (b/analyze-full semantic-expr context locals)
-          result (if (map? result)
-                   (update result :flags #(or % #{}))
-                   {:effect (or result :io) :flags #{}})]
-      (update result :flags into (source-cast-flags semantic-expr)))
-    (catch Exception _
-      ;; Conservative: unknown = effectful
-      {:effect :io :flags #{}})
-    (catch StackOverflowError _
-      ;; Deep expressions overflow tools.analyzer — assume effectful
-      {:effect :io :flags #{}})))
+   (let [obligations (source-evaluation-flags expr)
+        result
+        (try
+          (let [semantic-expr (semantic-calls expr)
+                locals (collect-locals semantic-expr)
+                context (declared-context (:registry @raster-context))
+                result (b/analyze-full semantic-expr context locals)]
+            (if (map? result)
+              (update result :flags #(or % #{}))
+              {:effect (or result :io) :flags #{}}))
+          (catch Exception _
+            ;; Conservative: unknown = effectful, not obligation-free.
+            {:effect :io :flags #{}})
+          (catch StackOverflowError _
+            ;; Deep expressions overflow tools.analyzer — assume effectful.
+            {:effect :io :flags #{}}))]
+    (update result :flags into obligations))
+   ;; Obligation discovery is optional analysis too. If it cannot complete,
+   ;; retain a NON-WAIVABLE unknown obligation, not a preservation-only marker
+   ;; whose ordering could be relaxed by an independent total-value proof.
+   (catch Exception _ {:effect :io :flags #{:unclosed-source-obligations}})
+   (catch StackOverflowError _ {:effect :io :flags #{:unclosed-source-obligations}})))
 
 (defn removable-expr?
   "True if an unused expression can be dropped without changing semantics."
@@ -297,26 +386,44 @@
     (and (= :pure effect)
          (empty? flags))))
 
-(defn cse-safe-expr?
-  "True if an expression is safe to common-subexpression eliminate.
+(defn cse-properties
+  "Project sharing eligibility and observation invalidation from one effect query.
 
-   External purity is necessary but not sufficient: an allocator is removable
-   when its result is dead, yet two live allocations have distinct mutable
+   External purity is necessary but not sufficient: an allocator may be removable
+   when its result is dead and its checks discharged, yet two live allocations have distinct mutable
    identities and must never be coalesced.  Keep that distinction here rather
    than teaching individual compiler markers or consumers to protect their
    operands. Declared storage writes, mutation and allocation also rule out CSE
    without reanalyzing the callee body. These contracts only deny sharing;
-   their absence never substitutes for Beichte's purity proof."
+   their absence never substitutes for Beichte's purity proof.
+
+   A local or external effect invalidates prior observations even when that
+   expression is not itself a sharing candidate. Source obligations are barriers
+   too: this pass has no successful-return/actual-carrier proof discharging them.
+   This conservative source epoch is not alias analysis or a fusion boundary."
   [expr]
-  (and (seq? expr)
-       (symbol? (first expr))
-       (not (descriptor/alloc-op? (form/effective-op expr)))
-       (not (when-let [op (descriptor/semantic-op expr)]
-              (let [[contract] (descriptor/resolve-op-descriptor op)]
-                (or (:buffer-write contract)
-                    (true? (get-in contract [:effects :mutating?]))
-                    (true? (get-in contract [:buffer :allocates?]))))))
-       (removable-expr? expr)))
+  (let [call? (and (seq? expr) (symbol? (first expr)))
+        contract (when call?
+                   (when-let [op (descriptor/semantic-op expr)]
+                     (first (descriptor/resolve-op-descriptor op))))
+        writes? (or (:buffer-write contract)
+                    (true? (get-in contract [:effects :mutating?])))
+        allocates? (or (and call? (descriptor/alloc-op? (form/effective-op expr)))
+                       (true? (get-in contract [:buffer :allocates?])))]
+    (if (or writes? allocates?)
+      ;; Storage contracts may deny sharing without inspecting the callee.
+      ;; Fresh-output identity alone does not prove an allocator's arguments or
+      ;; helper body cannot affect earlier observations: start a new epoch.
+      {:shareable? false :invalidates-observations? true}
+      (let [{:keys [effect flags]} (descriptor expr)]
+        {:shareable? (boolean (and call? (= :pure effect) (empty? flags)))
+         :invalidates-observations? (boolean (or (not= :pure effect) (seq flags)))}))))
+
+(defn cse-safe-expr?
+  "Whether the expression is eligible for sharing in an unchanged source epoch.
+   Consumers must also honor `cse-properties` observation barriers."
+  [expr]
+  (:shareable? (cse-properties expr)))
 
 (defn replay-safe-value?
   "Stable scalar/identity operands safe to repeat or omit during substitution.

@@ -15,8 +15,12 @@
             [raster.dl.loss :as loss]
             [raster.arrays :as ra]
             [raster.ad.reverse :as rev]
-            [raster.compiler.pipeline :as pipeline]
-            [raster.dl.gpu-grad-parity :as gp]))
+            [raster.dl.gpu-grad-parity :as gp]
+            [raster.gpu.compiled :as compiled]
+            [raster.gpu.core :as gpu]
+            [raster.gpu.device-probe :as opencl]
+            [raster.gpu.link :as link]
+            [raster.gpu.value :as value]))
 
 ;; ── input builders ──────────────────────────────────────────────────────────────
 (defn- da ^doubles [n seed]
@@ -187,13 +191,86 @@
         copied (gp/copy-into! gradient out (ra/alength gradient))]
     out))
 
+(defn- rmsn-public-inputs [variant]
+  (let [rows 2 feat 8]
+    {:x (fa (* rows feat) (+ 731 variant)) :w (fa feat 732)
+     :tgt (fa (* rows feat) (+ 733 variant)) :out (float-array (* rows feat))
+     :rows (long rows) :feat (long feat) :eps 1.0e-6 :go 1.0}))
+
+(defn- rmsn-public-arguments [{:keys [x w tgt rows feat eps go out]}]
+  [x w tgt rows feat eps go out])
+
+(defn- prepare-public-rmsn-gradient [target input]
+  (with-redefs [gpu/make-session (fn [& _] (throw (AssertionError. "lower opened a session")))
+                gpu/alloc! (fn [& _] (throw (AssertionError. "lower allocated")))
+                link/instantiate! (fn [& _] (throw (AssertionError. "lower instantiated")))]
+    (compiled/lower #'rmsn-parity-gradient-x! (rmsn-public-arguments input)
+                    {:compiler :equation-first :target target :dtype :float
+                     :roles {'out :output} :outputs '[out]})))
+
 (deftest rms-norm-gradient-allocation-shapes-compile-without-a-device
   (doseq [target [:ocl:0 :ze:0]]
-    (let [descriptor (pipeline/compile-gpu-program #'rmsn-parity-gradient-x! target
-                                                  :dtype :float :on-non-resident :nil
-                                                  :gemm-precision :f32-scalar)]
-      (is (some? descriptor))
-      (is (seq (:steps descriptor))))))
+    (let [input (rmsn-public-inputs 0)
+          before (mapv #(vec (get input %)) [:x :w :tgt :out])
+          prepared (prepare-public-rmsn-gradient target input)]
+      (is (compiled/prepared? prepared))
+      (is (seq (:out-tree prepared)))
+      (is (= [16] (:shape (first (filter #(= :out (:key %)) (:in-tree prepared))))))
+      (is (every? #(and (= :float (:dtype %)) (= 1 (count (:shape %)))) (:out-tree prepared)))
+      (is (= before (mapv #(vec (get input %)) [:x :w :tgt :out]))))))
+
+(defn- rmsn-gradient-oracle [{:keys [x w tgt rows feat eps go]}]
+  ;; Independent real-arithmetic chain rule for MSE(RMSNorm(x)), not an AD/kernel replay.
+  (let [x (double-array x) w (double-array w) tgt (double-array tgt)
+        count (* rows feat) dy (double-array count)]
+    (dotimes [row rows]
+      (let [offset (* row feat)
+            mean-square (/ (reduce + 0.0 (map (fn [i] (let [v (aget x (+ offset i))] (* v v)))
+                                              (range feat)))
+                           (double feat))
+            inv (/ 1.0 (Math/sqrt (+ mean-square eps)))]
+        (dotimes [column feat]
+          (let [i (+ offset column)
+                y (* (aget x i) inv (+ go (aget w column)))]
+            (aset dy i (* (/ 2.0 count) (- y (aget tgt i))))))))
+    (ref-rmsn-dx dy x w rows feat eps go)))
+
+(defn- check-public-rmsn-gradient! [target]
+  (let [input (rmsn-public-inputs 0)
+        before (mapv #(vec (get input %)) [:x :w :tgt :out])
+        prepared (prepare-public-rmsn-gradient target input)
+        artifact (compiled/instantiate! prepared)
+        latest (atom nil)]
+    (try
+      (doseq [variant [0 1]]
+        (let [current (rmsn-public-inputs variant)
+              expected (rmsn-gradient-oracle current)
+              previous @latest
+              actual (artifact (if (zero? variant) {} {:x (:x current) :tgt (:tgt current)}))
+              output (:out actual)
+              host (vec (value/->host output))]
+          (reset! latest actual)
+          (is (= #{:out} (set (keys actual))))
+          (is (= (count expected) (count host)))
+          (is (every? true? (map (fn [a b]
+                                  (and (Float/isFinite (float a))
+                                       (< (Math/abs (- (double a) b)) (+ 1.0e-5 (* 1.0e-4 (Math/abs b))))))
+                                host expected))
+              "public resident gradient agrees with the independent RMSNorm/MSE chain rule")
+          (is (value/live? output))
+          (when previous (is (every? (complement value/live?) (vals previous))))))
+      (is (= before (mapv #(vec (get input %)) [:x :w :tgt :out])))
+      (compiled/close! artifact)
+      (is (every? (complement value/live?) (vals @latest)))
+      (finally (compiled/close! artifact)))))
+
+(deftest rms-norm-gradient-public-source-owner-replays-against-independent-oracle
+  (if @opencl/opencl-available?
+    (check-public-rmsn-gradient! :ocl:0)
+    (opencl/opencl-skip! "public RMSNorm gradient"))
+  (if @gp/gpu-available?
+    (check-public-rmsn-gradient! :ze:0)
+    (gp/gpu-skip! "public RMSNorm gradient")))
 
 (deftest rms-norm-value+grad-resident-parity
   (if-not @gp/gpu-available?

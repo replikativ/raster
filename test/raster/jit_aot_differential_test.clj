@@ -26,6 +26,37 @@
 ;; test-local deftms — cover patterns beyond library ops
 ;; ---------------------------------------------------------------------------
 
+;; AOT must not reuse a mutable read across an intervening source write.
+(deftm d-read-around-write [input :- (Array double)] :- Double
+  (let [before (clojure.core/aget input 0)
+        write (clojure.core/aset input 0 9.0)
+        after (clojure.core/aget input 0)]
+    (- after before)))
+
+(deftest aot-preserves-observations-before-and-after-a-write
+  (let [compiled (pl/compile-aot #'d-read-around-write :dtype :double)]
+    (doseq [initial [7.0 -2.5]]
+      (let [expected (clojure.core/- 9.0 initial)]
+        (is (= expected (d-read-around-write (double-array [initial]))))
+        (is (= expected (compiled (double-array [initial]))))))))
+
+(deftm d-unused-constructor [output :- (Array double) n :- Long] :- (Array double)
+  (let [before (clojure.core/aset output 0 7.0)
+        unused (clojure.core/double-array n)
+        after (clojure.core/aset output 1 9.0)]
+    output))
+
+(deftest aot-preserves-unused-constructor-failure-at-its-source-position
+  (let [compiled (pl/compile-aot #'d-unused-constructor :dtype :double)]
+    (doseq [f [d-unused-constructor compiled]]
+      (let [output (double-array 2)]
+        (is (thrown? NegativeArraySizeException (f output -1)))
+        (is (= [7.0 0.0] (vec output)))))
+    (doseq [n [0 3]]
+      (let [output (double-array 2)]
+        (is (identical? output (compiled output n)))
+        (is (= [7.0 9.0] (vec output)))))))
+
 ;; elementwise with an element-typed literal (2.0 must narrow to T)
 (deftm d-scale-add (All [T] [x :- (Array T) y :- (Array T) n :- Long] :- (Array T)
                         (let [out (alloc-like x n)]

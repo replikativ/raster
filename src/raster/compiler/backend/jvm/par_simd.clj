@@ -20,6 +20,7 @@
   For dynamic sizes, emit both paths with runtime branch on n."
   (:require [raster.compiler.core.macroexpand :as macroexpand]
             [raster.compiler.core.util :as util]
+            [raster.compiler.core.source-declaration :as source-declaration]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.backend.jvm.segop-simd :as segop-simd]
             [raster.compiler.backend.jvm.bytecode :as bc]
@@ -466,6 +467,23 @@
    S-expression callers. Consumption is dtype-guarded."
   nil)
 
+(defn- gather-array-storage-types [program explicit-array-types]
+  (if program
+    (into {} (keep (fn [[id value]]
+                     (when (and (= :tensor (:kind value)) (seq (:shape value))
+                                ;; AbstractValue dtype is logical. Only this
+                                ;; exact plain host representation has the same
+                                ;; Java-array element storage. Extra format or
+                                ;; layout fields cannot silently override it.
+                                (= {:kind :plain} (:representation value))
+                                (nil? (:logical-layout value))
+                                (contains? #{nil :host} (:memory-space value))
+                                (nil? (:placement value)) (nil? (:sharding value))
+                                (empty? (:attributes value)))
+                       [id (:dtype value)])))
+          (:values program))
+    explicit-array-types))
+
 (defn simd-pass
   "Pipeline pass: walk an S-expression, replace raster.par/* forms with SIMD code.
 
@@ -479,11 +497,15 @@
     :array-types/:scalar-types/:values — optional retained compiler facts for that scheduling"
   [form & {:keys [simd? min-elements dtype scalar-types array-types values abstract-machine]
            :or {simd? true min-elements nil}}]
-  (if-not simd?
+  (let [source (if (parallel-program/parallel-program? form) (:source form) form)
+        declaration-refusal (when simd? (source-declaration/array-declaration-violation source :simd))]
+  (if (or (not simd?) declaration-refusal)
     (let [p (when (parallel-program/parallel-program? form)
               (parallel-program/validate! form segop/segop-node?))
           source (if p (parallel-program/source-form p) form)]
-      {:form (par/expand-par-forms source) :stats {:simd? false}})
+      {:form (par/expand-par-forms source)
+       :stats (cond-> {:simd? false}
+                declaration-refusal (assoc :fallback 1 :fallback-reason (:reason declaration-refusal)))})
     (let [supplied-program (when (parallel-program/parallel-program? form)
                              (parallel-program/validate! form segop/segop-node?))
           direct-schedule
@@ -503,6 +525,12 @@
                {:target-device :cpu:0 :dtype dtype
                 :scalar-types scalar-types :array-types array-types})))
           parallel-program (or supplied-program (:program direct-schedule))
+          ;; Gather's VectorAPI overload requires concrete backing storage,
+          ;; not the SegMap result dtype or an occurrence hint. A validated
+          ;; enclosing program owns these facts; raw entries may supply their
+          ;; existing explicit parameter storage contracts instead.
+          array-storage-types
+          (gather-array-storage-types parallel-program array-types)
           source-form (if parallel-program (parallel-program/source-form parallel-program) form)
           min-elements (or min-elements (effective-min-elements))
           stats (atom (cond-> {:simd-maps 0 :simd-reduces 0 :fallback 0
@@ -568,7 +596,8 @@
                       (transform (par/expand-par-map! form)))
                   (if-let [segmap (par->segmap form)]
                     (if-let [simd-form (segop-simd/compile-segmap segmap out cast
-                                                                  :store-offset offset)]
+                                                                  :store-offset offset
+                                                                  :array-types array-storage-types)]
                       (do (swap! stats update :simd-maps inc)
                           simd-form)
                       (do (swap! stats update :fallback inc)
@@ -625,7 +654,8 @@
                 (if (= 4 (count args))
                   (let [[out src index n] args
                         elem-type (or (out-sym->elem-type out) :double)]
-                    (if-let [simd-form (segop-simd/compile-par-gather out src index n elem-type)]
+                    (if-let [simd-form (segop-simd/compile-par-gather
+                                       out src index n elem-type array-storage-types)]
                       (do (swap! stats update :simd-gathers (fnil inc 0))
                           simd-form)
                       (do (swap! stats update :fallback inc)
@@ -707,4 +737,4 @@
               (vector? form) (mapv transform form)
               :else form))]
       {:form (transform source-form)
-       :stats @stats})))
+       :stats @stats}))))

@@ -1,5 +1,6 @@
 (ns raster.compiler.passes.parallel.map-read-requirements-test
-  (:require [clojure.test :refer [deftest is]]
+  (:require [clojure.set :as set]
+            [clojure.test :refer [deftest is]]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.ir.index-algebra :as algebra]
             [raster.compiler.ir.kernel-launch :as launch]
@@ -26,6 +27,17 @@
                       [{:expression 'capacity :op :<= :value 'n}]
                       [{:expression 'capacity :op :>= :value 'other}]]]
     (is (not (requirements/graph-capacity-covers? 'capacity 'n conditions)))))
+
+(deftest read-span-aggregation-keeps-dominance-without-inventing-order
+  (let [join (ns-resolve 'raster.compiler.passes.parallel.map-read-requirements
+                         'join-read-spans)
+        equivalent (launch/product 1 'rows)
+        incomparable (join 'rows 'columns)]
+    (is (= 4 (join 4 3)))
+    (is (= 4 (join 3 4)))
+    (is (= 'rows (join 'rows equivalent)))
+    (is (= (launch/maximum 'rows 'columns) incomparable))
+    (is (not (requirements/capacity-covers? 'rows 'columns)))))
 
 (deftest source-read-rewriting-keeps-embedded-compiler-records-opaque
   (let [certificate (scan/->AssociativeScan 'acc 0.0 '+ '(aget input i) 0.0 :float)
@@ -124,6 +136,90 @@
            (:scalar-definitions certificate)))
     (is (= (get-in (packed-head-map coordinate) [:scalar-region :locals])
            (:source-locals certificate)))))
+
+(defn- quotient-read-map
+  [coordinate locals extent]
+  (segop/map->SegMap
+   {:id :quotient-read-proof
+    :space (segop/make-seg-space 'i extent)
+    :inputs #{'input} :outputs #{'output}
+    :scalars '#{rows heads width extent}
+    :dtype :float :out-sym 'output
+    :scalar-region {:locals locals :result (list 'aget 'input coordinate)}}))
+
+(deftest inline-index-divisions-share-the-explicit-local-read-proof
+  (let [definitions {'extent (launch/product 'rows 'width)}
+        inline (requirements/symbolic-read-certificate
+                (quotient-read-map '(quot i width) [] 'extent)
+                {:scalar-definitions definitions})
+        explicit (requirements/symbolic-read-certificate
+                  (quotient-read-map 'row
+                                     '[{:id row :dtype :long :init (quot i width)}]
+                                     'extent)
+                  {:scalar-definitions definitions})
+        unused-host-name
+        (requirements/symbolic-read-certificate
+         (quotient-read-map '(quot (quot i width) heads) [] 'extent)
+         {:scalar-definitions {'extent (launch/product 'rows 'heads 'width)
+                               'rstr_proof_div_0 7}})]
+    (is (= {'input 'rows} (:requirements inline) (:requirements explicit)))
+    (is (= {'input 'rows} (:requirements unused-host-name))
+        "later host substitution cannot capture a proof-local identity")
+    (is (= '(quot i width) (get-in inline [:reads 0 :source-coordinate])))
+    (is (= [] (:source-locals inline))
+        "proof-only locals never become retained source locals")
+    (is (= '[{:id row :dtype :long :init (quot i width)}]
+           (:source-locals explicit)))))
+
+(deftest nested-inline-index-divisions-normalize-child-before-parent
+  (let [certificate
+        (requirements/symbolic-read-certificate
+         (quotient-read-map '(quot (quot i width) heads) [] 'extent)
+         {:scalar-definitions {'extent (launch/product 'rows 'heads 'width)}})
+        remainder
+        (requirements/symbolic-read-certificate
+         (quotient-read-map '(rem (quot i width) heads) [] 'extent)
+         {:scalar-definitions {'extent (launch/product 'rows 'heads 'width)}})]
+    (is (= {'input 'rows} (:requirements certificate)))
+    (is (= {'input 'heads} (:requirements remainder)))
+    (is (= '(quot (quot i width) heads)
+           (get-in certificate [:reads 0 :source-coordinate])))
+    (is (empty? (set/intersection
+                 (set (launch/expression-references (get-in certificate
+                                                            [:requirements 'input])))
+                 '#{rstr_proof_div_0 rstr_proof_div_1}))
+        "proof-local digit names never escape into the required capacity")))
+
+(deftest proof-index-division-normalization-is-scoped-deduplicated-and-collision-free
+  (let [normalize (ns-resolve 'raster.compiler.passes.parallel.map-read-requirements
+                              'proof-index-coordinate)
+        repeated (normalize '(+ (quot i width) (quot i width)) 'i
+                            '(clojure.core/* rows width) [] {})
+        collision (normalize '(+ rstr_proof_div_0 (quot i width)) 'i
+                             '(clojure.core/* rows width)
+                             '[{:id rstr_proof_div_0 :dtype :long :init 0}] {})
+        alias (normalize '(quot alias width) 'i '(clojure.core/* rows width)
+                         '[{:id alias :dtype :long :init (+ i 0)}] {})]
+    (is (= 1 (count (:synthetic repeated))))
+    (is (= 1 (- (count (:locals repeated)) 0)))
+    (is (= '#{rstr_proof_div_1} (:synthetic collision)))
+    (is (= '#{rstr_proof_div_0} (:synthetic alias))
+        "dependency demand follows preceding local aliases, without granting a proof")))
+
+(deftest proof-index-division-normalization-does-not-admit-unsupported-addresses
+  (let [definitions {'extent (launch/product 'rows 'width)}]
+    (doseq [coordinate ['(quot i (+ i 1))
+                        '(quot (mystery i) width)
+                        '(mystery (quot i width))
+                        '(quote (quot i width))
+                        '(if flag (quot i width) 0)
+                        '(+ i (quot rows 2))]]
+      (is (nil? (requirements/symbolic-read-certificate
+                 (quotient-read-map coordinate [] 'extent)
+                 {:scalar-definitions definitions}))))
+    (is (nil? (requirements/symbolic-read-certificate
+               (quotient-read-map '(quot i 2) [] 5) {}))
+        "a non-divisible source extent remains unproved")))
 
 (deftest symbolic-read-proof-declines-padding-translation-and-indirection
   (doseq [coordinate ['(+ base (* row (* heads width)) (+ (* head width) column))

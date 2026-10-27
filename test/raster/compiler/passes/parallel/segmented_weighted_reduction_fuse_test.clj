@@ -3,9 +3,11 @@
             [clojure.walk :as walk]
             [raster.compiler.equation-first :as equation-first]
             [raster.compiler.equation-artifact :as equation-artifact]
+            [raster.compiler.backend.jvm.typed-scalar :as scalar]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.emitted-parallel-equation :as emitted-equation]
             [raster.compiler.ir.emitted-parallel-program :as emitted-program]
+            [raster.compiler.ir.emitted-parallel-program-call :as program-call]
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-call :as kcall]
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
@@ -16,10 +18,12 @@
             [raster.compiler.passes.parallel.segmented-weighted-reduction-fuse :as fuse]
             [raster.compiler.passes.parallel.structured-control-route :as structured-route]
             [raster.compiler.passes.parallel.typed-soac-route :as typed-route]
+            [raster.compiler.passes.parallel.typed-soac-frontend :as typed-frontend]
             [raster.compiler.pipeline :as pipeline]
             [raster.compiler.reference.segmented-weighted-reduction :as reference]
             [raster.core :refer [deftm]]
             [raster.dl.array-ops :as array-ops]
+            [raster.dl.attention :as attention]
             [raster.dl.gsdm :as gsdm]
             [raster.gpu.core :as gpu]
             [raster.gpu.test-lifecycle]
@@ -136,6 +140,53 @@
                                   (filter symbol? (swr/runtime-parameter-values plan)))))
            (:operands plan-equation)))
     (is (= '[normalized] (:results plan-equation)))
+    (let [index (.indexOf ^java.util.List (:equations program) plan-equation)
+          project (fn [candidate]
+                    (swr/source-buffer-return candidate (nth (:equations candidate) index)))
+          expected {:entries [['normalized (first (get-in plan-equation
+                                                         [:attributes :result-storage]))]]
+                    :host-binding 'normalized}
+          pairs (mapv vec (partition 2 (second (:source program))))
+          binding-index (first (keep-indexed (fn [i [binding _]]
+                                              (when (= 'normalized binding) i)) pairs))
+          change-source (fn [candidate update-expression]
+                          (update-in candidate [:source]
+                                     (fn [[head bindings & body :as source]]
+                                       (with-meta
+                                         (list* head
+                                                (update bindings (inc (* 2 binding-index))
+                                                        update-expression)
+                                                body)
+                                         (meta source)))))]
+      (is (= expected (project program)))
+      (doseq [candidate [(assoc-in program [:equations index :site] [:binding 'other])
+                         (assoc-in program [:equations index :results] '[other])
+                         (assoc-in program [:equations index :attributes :host-binding] 'other)
+                         (assoc-in program [:equations index :attributes :result-storage 0
+                                            :destination] 'other-storage)
+                         (update program :equations conj plan-equation)
+                         (update program :source
+                                 (fn [[head bindings & body]]
+                                   (list* head (into bindings ['normalized 'other-storage]) body)))
+                         (change-source program #(vary-meta % dissoc swr/protected-marker-plan-key))
+                         (change-source program #(vary-meta % assoc :raster.op/original 'user/other))
+                         (assoc-in program [:equations index :algorithm :normalization :epsilon] 0.125)
+                         (assoc-in program [:equations index :algorithm :accumulator-dtype] :double)]]
+        (is (nil? (project candidate))
+            "outer storage and source spelling cannot manufacture protected return authority"))
+      (let [proofless (change-source program #(vary-meta % dissoc swr/protected-marker-plan-key))
+            expression (nth (second (:source proofless)) (inc (* 2 binding-index)))
+            proofless (-> proofless
+                          (assoc-in [:equations index :source] expression)
+                          (assoc-in [:equations index :algorithm :source-operation :form] expression))]
+        (is (nil? (project proofless))
+            "agreement among replaceable source fields cannot substitute for marker proof"))
+      (let [[head bindings & body :as source] (:source program)
+            inserted (assoc program :source
+                            (with-meta (list* head (into ['inserted-before-realization 1] bindings)
+                                              body) (meta source)))]
+        (is (= expected (project inserted))
+            "inserted realization bindings do not turn historical ordinals into raw positions")))
     (is (identical? program (structured-route/validate-typed-program! program)))
     (is (= [plan] (:operations plan-equation)))
     (let [source (get (into {} (map vec) (partition 2 (second (:source program))))
@@ -226,6 +277,14 @@
     (is (= :typed-soac (get-in descriptor-attempt [:stats :route])))
     (is (some fuse/marker? (tree-seq coll? seq (get-in descriptor-attempt [:program :source])))
         "descriptor compilation keeps the protected binding between its typed SOAC islands")
+    (is (= 1 (count (filter fuse/marker?
+                           (tree-seq coll? seq (get-in descriptor-attempt [:program :source]))))))
+    (is (not-any? #(swr/plan? (:algorithm %))
+                  (get-in descriptor-attempt [:program :equations]))
+        "retaining host source does not grant protected-plan execution capability")
+    (is (nil? (typed-frontend/coverage-decline source {:dtype :float :array-types array-types
+                                                     :scalar-types scalar-types :values values}))
+        "coverage uses the same consumer view as successful typed-island admission")
     (is (soac/program-form? (first algorithms)))
     (is (= plan (second algorithms)))
     (is (soac/program-form? (last algorithms)))
@@ -286,6 +345,19 @@
                                 :operations 0 :attributes :strategy])))
     (is (= :none (get-in compilation [:stats :fallback])))
     (is (= 1 (count (:kernels compilation))))))
+
+(deftest protected-buffer-return-feeds-a-later-public-allocation-and-contraction
+  ;; Graph attention allocates its final projection using zeros-like of the protected
+  ;; reduction's returned buffer. Both frontend and promotion capacity analyses must retain
+  ;; the earlier physical destination; final logical shape facts cannot stand in for it.
+  (let [compilation (equation-first/compile
+                     #'attention/graph-attention {:target :ze:0 :dtype :double})
+        semantic (:semantic compilation)
+        reductions (filterv #(swr/plan? (:algorithm %)) (:equations semantic))]
+    (is (= 1 (count reductions)))
+    (is (some? (swr/source-buffer-return semantic (first reductions))))
+    (is (= :none (get-in compilation [:stats :fallback])))
+    (is (seq (:kernels compilation)))))
 
 (deftest public-equation-first-selects-only-explicit-subgroup-policy
   (let [compilation (equation-first/compile
@@ -361,6 +433,68 @@
            (reason #(emitted-program/validate!
                      (assoc-in emitted [:attributes :allocations 0 :initialization] :unspecified)))))))
 
+(deftest ordered-plan-fragment-retains-independent-parent-allocation-context
+  (let [compilation (equation-first/compile
+                     #'resident-structured-reduction-probe {:target :ze:0 :dtype :float})
+        emitted (:emitted compilation)
+        equation (last (:equations emitted))
+        results (set (mapcat :results (:equations emitted)))
+        ;; Logical results are derived by the checked binder from physical
+        ;; storage; distinct tokens here deliberately model no driver resources.
+        buffers (into {} (for [[id value] (:values emitted)
+                               :when (and (seq (:shape value))
+                                          (not (contains? results id)))]
+                           [id [:storage id]]))
+        scalars {'n-nodes {:type :long :value 3} 'n-edges {:type :long :value 4}
+                 'emb-dim {:type :long :value 5} 'n-heads {:type :long :value 2}
+                 ;; This is an already completed source binding, not authority
+                 ;; for the numerical fragment to execute the original helper.
+                 'dk {:type :long :value 2}}
+        whole-call (program-call/make
+                    emitted buffers scalars {}
+                    (partial scalar/evaluate-host-equation
+                             (the-ns 'raster.compiler.passes.parallel.segmented-weighted-reduction-fuse-test)))
+        bindings {:buffers (:entry-buffers whole-call)
+                  :scalar-values (:scalar-values whole-call)
+                  :host-steps (into {} (for [step (:steps whole-call)
+                                             :when (program-call/evaluated-host-equation? step)]
+                                         [(get-in step [:equation :id]) step]))}
+        make-stage #(-> (program-call/make-equation-program-call
+                         % (:id equation) bindings nil nil) :call :program)
+        fragment (make-stage emitted)
+        body-allocations #(get-in (last (:equations %))
+                                  [:operations 0 :body :attributes :allocations])
+        allocations (get-in emitted [:attributes :allocations])
+        allocation (first allocations)
+        reason #(try (make-stage %) nil
+                     (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))]
+    (is (= 1 (count allocations)))
+    (is (nil? (:source fragment)))
+    (is (= #{:allocations} (set (keys (:attributes fragment))))
+        "transport allocation context, not source/completion authority")
+    (is (identical? allocations (get-in fragment [:attributes :allocations])))
+    (is (fingerprint/equivalent? allocations (body-allocations fragment)))
+    (is (= :zero (:initialization allocation)))
+    (let [unrelated (assoc allocation :destination 'Q :source-binding-id 900
+                          :source-expression '(clojure.core/float-array 15)
+                          :extent 15 :initialization :unspecified)
+          with-unrelated (assoc-in emitted [:attributes :allocations]
+                                   (conj allocations unrelated))]
+      (is (fingerprint/equivalent? allocations (body-allocations (make-stage with-unrelated))))
+      (is (= 2 (count (get-in (make-stage with-unrelated) [:attributes :allocations])))))
+    ;; The candidate's retained allocation cannot justify itself when the
+    ;; independently validated enclosing contract is missing or has changed.
+    (doseq [[expected changed]
+            [[:emitted-reduction-outer-slice []]
+             [:segmented-plan-output-allocation [allocation allocation]]
+             [:segmented-plan-output-allocation [(assoc allocation :dtype :double)]]
+             [:segmented-plan-output-allocation [(assoc allocation :extent 0)]]
+             [:emitted-reduction-outer-slice [(update allocation :source-binding-id inc)]]
+             [:emitted-reduction-outer-slice [(assoc allocation :initialization :unspecified)]]
+             [:emitted-reduction-outer-slice
+              [(assoc allocation :source-expression '(clojure.core/float-array 99))]]]]
+      (is (= expected (reason (assoc-in emitted [:attributes :allocations] changed)))))))
+
 (deftest mixed-components-initialize-shared-scratch-only-once
   (let [{:keys [form]} (fuse/fuse (chain) :float)
         [[storage allocation] [result marker]] (mapv vec (partition 2 (second form)))
@@ -385,6 +519,45 @@
       (is (= 1 (count (fills before))))
       (is (empty? (fills after))
           "the suffix must observe the prefix update, not reset the allocation"))))
+
+(deftest reference-alias-before-a-protected-plan-does-not-initialize-scratch
+  (let [{:keys [form]} (fuse/fuse (chain) :float)
+        [[storage allocation] [result marker]] (mapv vec (partition 2 (second form)))
+        plan (fuse/marker-plan marker :float)
+        source (list 'let* ['scratch '(clojure.core/float-array 1)
+                           'alias 'scratch
+                           'before '(raster.par/pmap i 1 float (clojure.core/aget Q i))
+                           storage allocation result marker
+                           'observe '(clojure.core/println before)
+                           'after '(raster.par/map-void! i 1
+                                     (raster.par/atomic-add! scratch 0 (float 1.0)))]
+                     [result 'scratch 'alias])
+        options {:segmented-plans? true :resident-initialization? true
+                 :scalar-types (zipmap (:runtime-parameters plan) (repeat :long))
+                 :values (into {} (map (fn [{:keys [id dtype elements]}]
+                                        [id (av/tensor {:dtype dtype :shape [elements]})]))
+                               (:operands plan))}
+        arrays (into {} (map (juxt :id :dtype)) (:operands plan))
+        analyzed (typed-frontend/form->program-components
+                  source (assoc options :dtype :float :array-types arrays))
+        alias-entry (some #(when (= 'alias (get-in % [:description :sym])) %)
+                          (:entries analyzed))
+        attempt (typed-route/attempt source :float arrays options)
+        program (:program attempt)
+        [before [_ & after]] (split-with #(not (swr/plan? (:algorithm %)))
+                                        (:equations program))
+        fills #(filter (fn [equation] (= :zero (get-in equation [:attributes :initialization]))) %)]
+    (is (= :source-action (:kind alias-entry)))
+    (is (= #{'scratch} (set (:source-reads alias-entry))))
+    (is (some #(some #{'before} (:results %)) before)
+        "a later source action keeps the preceding numerical producer live")
+    (is (not-any? #(some #{'observe} (:results %)) (:equations program))
+        "the host action does not acquire a numerical equation")
+    (is (some? program) (pr-str (:declined attempt)))
+    (is (empty? (fills before)))
+    (is (= 1 (count (fills after)))
+        "a reference alias is a dependency, not evidence of an earlier content access")
+    (is (= 1 (get-in attempt [:stats :initialization-fills])))))
 
 (deftest protected-source-admission-does-not-infer-missing-or-conflicting-types
   (let [{:keys [form]} (fuse/fuse (chain) :float)

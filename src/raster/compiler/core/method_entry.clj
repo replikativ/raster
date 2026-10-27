@@ -17,7 +17,10 @@
   Previously a defrecord, now a plain map to avoid classloader conflicts.
   Maps use value equality across classloaders, eliminating ClassCastException
   when compiled (eval'd) code calls back into dispatch."
-  (:require [raster.compiler.core.types :as types]))
+  (:require [raster.compiler.core.types :as types]
+            [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.support.mangled :as mangled]
+            [raster.compiler.core.source-policy :as source-policy]))
 
 (defn var-snapshot
   "Observe an existing Var's effective value and retained definition metadata.
@@ -37,10 +40,11 @@
        (= (:metadata a) (:metadata b))))
 
 (defn emission-definition-snapshot
-  "Observe definition inputs, excluding only this emitter's static cache output.
+  "Observe definition inputs, excluding only static cache and pipeline diagnostic outputs.
    Actually consumed static artifacts are retained separately by the emitter."
   [v]
-  (assoc (update (var-snapshot v) :metadata dissoc :raster.core/deftm-bytecode)
+  (assoc (update (var-snapshot v) :metadata dissoc :raster.core/deftm-bytecode
+                 :raster.compiler.pipeline/compiled-diagnostics)
          :snapshot-kind :emission-definition))
 
 (def ^:dynamic *emission-inputs*
@@ -50,6 +54,58 @@
    for dynamic execution). This is neither a registry nor a cache."
   nil)
 
+(def ^:dynamic ^:private *definition-analysis-session* nil)
+(def ^:dynamic ^:private *definition-query-frame* nil)
+(def ^:dynamic ^:private *definition-observation-baselines* nil)
+(def ^:dynamic ^:private *definition-observation-owner* nil)
+
+(defn- active-definition-query-owner? []
+  (let [session *definition-analysis-session* frame *definition-query-frame*]
+    (and session @(:active? session) frame @(:active? frame)
+         (identical? (:session-token frame) (:token session))
+         (identical? (:owner frame) *emission-inputs*))))
+
+(defn- active-definition-observation-owner? []
+  (or (active-definition-query-owner?)
+      (let [session *definition-analysis-session* frame *definition-query-frame*]
+        (and session @(:active? session) frame @(:active? frame)
+             (identical? (:session-token frame) (:token session))
+             *definition-observation-owner*
+             (identical? *definition-observation-owner* *emission-inputs*)))))
+
+(defprotocol RetainedProducerInput
+  "Process-local compiler dependency, separate from portable IR and Var snapshots.
+   Validate this immutable producer's own freshness. Transitive dependencies are
+   flattened into the enclosing collector, not recursively rediscovered."
+  (assert-producer-current! [producer]))
+
+(defn- assert-producer-inputs-current! [inputs]
+  (doseq [producer (:producer-inputs inputs)]
+    (when-not (satisfies? RetainedProducerInput producer)
+      (throw (ex-info "compiler input has no retained producer guard"
+                      {:reason :unowned-producer-input})))
+    (assert-producer-current! producer))
+  true)
+
+(defn- retain-producer-inputs [inputs producers]
+  (reduce (fn [inputs producer]
+            (if (some #(identical? producer %) (:producer-inputs inputs))
+              inputs
+              (update inputs :producer-inputs (fnil conj []) producer)))
+          inputs producers))
+
+(defn- canonical-var-intern-current?
+  [v source-ns source-name]
+  (and (var? v) (instance? clojure.lang.Namespace source-ns) (symbol? source-name)
+       (identical? source-ns (find-ns (ns-name source-ns)))
+       (identical? v (.findInternedVar ^clojure.lang.Namespace source-ns source-name))))
+
+(defn- original-var-lookup-current?
+  [v lookup-ns lookup-symbol]
+  (and (instance? clojure.lang.Namespace lookup-ns) (symbol? lookup-symbol)
+       (identical? lookup-ns (find-ns (ns-name lookup-ns)))
+       (identical? v (ns-resolve lookup-ns lookup-symbol))))
+
 (defn- var-reference-current?
   "Match historical Var identity and original lookup sites.
    A detached Var can retain its old root after ns-unmap/reintern or namespace
@@ -57,28 +113,23 @@
   [{:keys [var metadata lookups]}]
   (let [source-ns (:ns metadata)
         source-name (:name metadata)]
-    (and (var? var) (instance? clojure.lang.Namespace source-ns)
-         (symbol? source-name)
-         (identical? source-ns (find-ns (ns-name source-ns)))
-         (identical? var (.findInternedVar ^clojure.lang.Namespace source-ns source-name))
+    (and (canonical-var-intern-current? var source-ns source-name)
          (every? (fn [[lookup-ns lookup-symbol]]
-                   (and (instance? clojure.lang.Namespace lookup-ns)
-                        (symbol? lookup-symbol)
-                        (identical? lookup-ns (find-ns (ns-name lookup-ns)))
-                        (identical? var (ns-resolve lookup-ns lookup-symbol)))) lookups))))
+                   (original-var-lookup-current? var lookup-ns lookup-symbol)) lookups))))
 
 (defn var-value-current?
   "Compare a historical observation directly to the effective live Var value.
    Equivalent to same-var-snapshot? against a fresh observation, without building
    that temporary map. Name/lookup identity remains the caller's responsibility.
-   Definition observations exclude only this emitter's static cache output."
+   Definition observations exclude only static cache and pipeline diagnostic outputs."
   [{:keys [var value metadata snapshot-kind] :as snapshot}]
   (and (var? var)
        (let [is-bound (bound? var)]
          (and (= (:bound? snapshot) is-bound)
               (identical? value (when is-bound (var-get var)))
               (= metadata (if (= :emission-definition snapshot-kind)
-                            (dissoc (meta var) :raster.core/deftm-bytecode)
+                            (dissoc (meta var) :raster.core/deftm-bytecode
+                                    :raster.compiler.pipeline/compiled-diagnostics)
                             (meta var)))))))
 
 (defn var-snapshot-current?
@@ -86,6 +137,52 @@
   [snapshot]
   (and (var-reference-current? snapshot)
        (var-value-current? snapshot)))
+
+(defn- analysis-definition-observation
+  "A pure query may isolate work, never refresh a touched historical definition or lookup."
+  [inputs v snapshot]
+  (if-not (and *definition-observation-baselines* (active-definition-observation-owner?))
+    snapshot
+    (let [historical (into [] (keep #(get-in % [:definition-proofs v]))
+                           *definition-observation-baselines*)
+          historical (cond-> historical (get-in inputs [:definition-proofs v])
+                       (conj (get-in inputs [:definition-proofs v])))
+          first-observation (or (first historical) snapshot)]
+      (doseq [prior historical]
+        (when-not (same-var-snapshot? prior snapshot)
+          (throw (ex-info "definition changed inside an isolated semantic query"
+                          {:reason :unstable-definition-proof-input :source v})))
+        ;; Check old aliases even when this query uses a new, still-valid lookup
+        ;; and eventually declines. Only this touched Var's edges are inspected.
+        (when-not (var-snapshot-current? prior)
+          (throw (ex-info "historical semantic-query lookup is no longer current"
+                          {:reason :stale-definition-proof-input :source v}))))
+      (let [lookups (reduce #(into %1 (:lookups %2))
+                            (or (:lookups first-observation) #{})
+                            (conj historical snapshot))]
+        (if (= lookups (:lookups first-observation)) first-observation
+            (assoc first-observation :lookups lookups))))))
+
+(defn- retain-definition-observation [inputs v observed]
+  (let [snapshot (analysis-definition-observation inputs v observed)]
+  (if-let [prior (get-in inputs [:definition-proofs v])]
+    (do
+      (when-not (same-var-snapshot? prior snapshot)
+        (throw (ex-info "definition changed while deriving a compiler proof"
+                        {:reason :unstable-definition-proof-input :source v})))
+      (if (every? #(contains? (:lookups prior) %) (:lookups snapshot))
+        inputs
+        (let [updated (update prior :lookups into (:lookups snapshot))]
+          (-> inputs
+              (assoc-in [:definition-proofs v] updated)
+              ;; Emission artifacts serialize :values, not the request-local
+              ;; proof index. Preserve unrelated entries and every lookup edge.
+              (update :values
+                      (fn [values]
+                        (mapv #(if (identical? prior %) updated %) values)))))))
+    (-> inputs
+        (assoc-in [:definition-proofs v] snapshot)
+        (update :values (fnil conj []) snapshot)))))
 
 (defn observe-definition-input!
   "Retain a definition actually consulted by a normalization proof.
@@ -95,25 +192,80 @@
   (when *emission-inputs*
     (let [snapshot (assoc (emission-definition-snapshot v)
                           :lookups #{[lookup-ns lookup-symbol]})]
+      (swap! *emission-inputs* retain-definition-observation v snapshot)
+      true)))
+
+(deftype ^:private SourceResolutionInput [kind source-ns lookup-symbol result]
+  RetainedProducerInput
+  (assert-producer-current! [_]
+    (when-not (and (identical? source-ns (find-ns (ns-name source-ns)))
+                   (or (not (var? result))
+                       ;; Qualification reads immutable Var fields, not editable
+                       ;; metadata or an unconsumed root. No snapshot is needed.
+                       (canonical-var-intern-current?
+                        result (.ns ^clojure.lang.Var result) (.sym ^clojure.lang.Var result)))
+                   (or (not (instance? clojure.lang.Namespace result))
+                       (identical? result (find-ns (ns-name result))))
+                   (case kind
+                     :symbol-resolution
+                     (if (var? result)
+                       (original-var-lookup-current? result source-ns lookup-symbol)
+                       (identical? result (try (ns-resolve source-ns lookup-symbol)
+                                               (catch Exception _ nil))))
+                     :alias-resolution (identical? result (get (ns-aliases source-ns) lookup-symbol))
+                     :namespace-resolution (identical? result (find-ns lookup-symbol))))
+      (throw (ex-info "source qualification lookup changed"
+                      {:reason :stale-source-resolution :kind kind :symbol lookup-symbol})))
+    true))
+
+(defn- same-source-resolution-input? [left right]
+  (and (instance? SourceResolutionInput left) (instance? SourceResolutionInput right)
+       (= (.-kind ^SourceResolutionInput left) (.-kind ^SourceResolutionInput right))
+       (identical? (.-source-ns ^SourceResolutionInput left) (.-source-ns ^SourceResolutionInput right))
+       (= (.-lookup-symbol ^SourceResolutionInput left) (.-lookup-symbol ^SourceResolutionInput right))
+       (identical? (.-result ^SourceResolutionInput left) (.-result ^SourceResolutionInput right))))
+
+(defn- validate-source-resolution!
+  [{:keys [kind source-ns symbol result]}]
+  (when-not (and (instance? clojure.lang.Namespace source-ns) (symbol? symbol)
+                 (case kind
+                   :symbol-resolution (or (nil? result) (var? result) (class? result))
+                   :alias-resolution (or (nil? result) (instance? clojure.lang.Namespace result))
+                   :namespace-resolution (or (nil? result) (instance? clojure.lang.Namespace result))
+                   false))
+    (throw (ex-info "source qualification needs an actual lookup decision"
+                    {:reason :invalid-source-resolution}))))
+
+(defn observe-source-reference!
+  "Retain the actual identity-only lookup used to qualify a source reference.
+   A Var's name/namespace is not its current value or definition metadata. Root
+   rebinding may preserve this reference; alias/intern/namespace drift may not.
+   Consumers of a value, metadata, Method or body must separately observe those
+   inputs. This grants no type, invocation, inlining or code-emission permission."
+  [{:keys [kind source-ns symbol result] :as decision}]
+  (when *emission-inputs*
+    (validate-source-resolution! decision)
+    (let [input (SourceResolutionInput. kind source-ns symbol result)]
+      (assert-producer-current! input)
       (swap! *emission-inputs*
              (fn [inputs]
-               (if-let [prior (get-in inputs [:definition-proofs v])]
-                 (do
-                   (when-not (same-var-snapshot? prior snapshot)
-                     (throw (ex-info "definition changed while deriving a compiler proof"
-                                     {:reason :unstable-definition-proof-input :source v})))
-                   (let [updated (update prior :lookups into (:lookups snapshot))]
-                     (-> inputs
-                         (assoc-in [:definition-proofs v] updated)
-                         ;; Emission artifacts serialize :values, not the
-                         ;; request-local proof index. Retain every lookup edge.
-                         (update :values
-                                 (fn [values]
-                                   (mapv #(if (identical? prior %) updated %) values))))))
-                 (-> inputs
-                     (assoc-in [:definition-proofs v] snapshot)
-                     (update :values (fnil conj []) snapshot)))))
-      true)))
+               (if (some #(same-source-resolution-input? input %)
+                         (:producer-inputs inputs))
+                 inputs
+                 (retain-producer-inputs inputs [input]))))))
+  result)
+
+(defn observe-source-resolution!
+  "Retain a source decision whose consumer also reads a resolved Var definition.
+   Vars retain full value/metadata observations at their ORIGINAL lookup site.
+   Classes/namespaces/misses reuse reference guards. Pure name qualification
+   must use observe-source-reference! instead of pinning an unrelated root."
+  [{:keys [source-ns symbol result] :as decision}]
+  (if (and *emission-inputs* (var? result))
+    (do (validate-source-resolution! decision)
+        (observe-definition-input! result source-ns symbol))
+    (observe-source-reference! decision))
+  result)
 
 (defn assert-definition-inputs-current!
   "Validate normalization's historical definition observations, not a fresh
@@ -123,6 +275,7 @@
     (when-not (var-snapshot-current? snapshot)
       (throw (ex-info "compiler proof inputs changed before publication or execution"
                       {:reason :stale-definition-proof-input :source (:var snapshot)}))))
+  (assert-producer-inputs-current! inputs)
   true)
 
 (defn call-with-optional-definition-inputs
@@ -137,12 +290,55 @@
     (let [owner *emission-inputs*
           historical @owner
           child (atom historical)
-          result (binding [*emission-inputs* child] (prove!))]
+          result (binding [*definition-observation-owner*
+                           (when (active-definition-observation-owner?) child)
+                           *emission-inputs* child]
+                   (prove!))]
       (when result
         (assert-definition-inputs-current! @child)
         (when-not (compare-and-set! owner historical @child)
           (throw (ex-info "compiler proof owner changed during optional analysis"
                           {:reason :unstable-definition-proof-input}))))
+      result)))
+
+(defn adopt-definition-inputs!
+  "Import a producer's retained observations into an enclosing compiler owner.
+   Caller authenticates the producer; this map alone is not a certificate.
+   Never reobserve definitions or replace an earlier observation. Preserve all
+   lookup edges and unclosed imports. Without a collector, abstain."
+  [historical]
+  (when *emission-inputs*
+    (let [owner *emission-inputs*
+          prior-inputs @owner
+          _ (assert-definition-inputs-current! historical)
+          _ (assert-definition-inputs-current! prior-inputs)
+          merged
+          (reduce-kv retain-definition-observation
+                     prior-inputs (or (:definition-proofs historical) {}))
+          merged (retain-producer-inputs merged (:producer-inputs historical))]
+      (assert-definition-inputs-current! merged)
+      (when-not (compare-and-set! owner prior-inputs merged)
+        (throw (ex-info "compiler proof owner changed during historical adoption"
+                        {:reason :unstable-definition-proof-input})))
+      true)))
+
+(defn call-with-independent-definition-inputs
+  "Construct nested compiler source under fresh local history, then adopt it.
+   Parent observations remain historical; they are not the child's preparation
+   candidates. Without a collector, construct without inventing an owner."
+  [construct]
+  (if-not *emission-inputs*
+    (construct)
+    (let [parent *emission-inputs* historical @parent
+          local (atom {:static [] :values []})
+          _ (assert-definition-inputs-current! historical)
+          result (binding [*emission-inputs* local] (construct))]
+      (when-not (identical? historical @parent)
+        (throw (ex-info "source transformation's enclosing owner changed during construction"
+                        {:reason :unstable-definition-proof-input})))
+      (assert-definition-inputs-current! historical)
+      (assert-definition-inputs-current! @local)
+      (adopt-definition-inputs! @local)
       result)))
 
 (defn- prepare-observed-definition-inputs! [prepare! receivers pending-only?]
@@ -198,6 +394,29 @@
   [prepare! receivers]
   (prepare-observed-definition-inputs! prepare! receivers false))
 
+(def ^:dynamic ^:private *source-prerequisite-scope* nil)
+
+(def ^:private selected-source-preparation-authority (Object.))
+
+(defn- seal-selected-source-preparation [data]
+  (fn [authority]
+    (when (identical? authority selected-source-preparation-authority) data)))
+
+(def ^:private selected-source-preparation-class
+  ;; Bootstrap the brand from the compiler-owned factory without invoking a
+  ;; request. Validation compares this Class BEFORE calling the known closure,
+  ;; so an arbitrary IFn is never a compiler callback.
+  (class (seal-selected-source-preparation nil)))
+
+(declare fulfill-source-prerequisite!)
+
+(defn- pending-source-prerequisite? [scope failure]
+  (when (instance? clojure.lang.IAtom scope)
+    (let [pending (:pending @scope)]
+      (and pending (identical? failure (:failure pending))
+           (identical? (:token @scope) (:owner pending))
+           (identical? (:request pending) (::source-prerequisite (ex-data failure)))))))
+
 (defn call-with-definition-inputs
   "Own normalization and emission together for a static compiled artifact.
    Dynamic executables additionally retain these observations in their existing
@@ -211,6 +430,11 @@
   (let [attempt! (fn []
                    (let [result (compile!)]
                      (try
+                       ;; A caller cannot swallow an authentic demand and publish the
+                       ;; abandoned discovery result instead of preparing its prerequisite.
+                       (when (instance? clojure.lang.IAtom *source-prerequisite-scope*)
+                         (when-let [pending (:pending @*source-prerequisite-scope*)]
+                           (throw (:failure pending))))
                        (assert-definition-inputs-current! @*emission-inputs*)
                        result
                        (catch Throwable failure
@@ -226,19 +450,135 @@
       ;; An enclosing compilation must restart from its own earliest proof,
       ;; not keep its stale observations while an inner owner retries.
       (attempt!)
-      (loop [attempt 0]
+      (let [handle-prerequisites? (nil? *source-prerequisite-scope*)
+            scope (if handle-prerequisites?
+                    (atom {:token (Object.) :ready {} :pending nil})
+                    *source-prerequisite-scope*)]
+       (binding [*source-prerequisite-scope* scope]
+        (loop [attempt 0]
         (let [outcome (try
                         {:result (binding [*emission-inputs* (atom {:static [] :values []})]
                                    (attempt!))}
                         (catch clojure.lang.ExceptionInfo failure {:failure failure}))]
           (if-let [failure (:failure outcome)]
-            (if (and (< attempt 2)
+            (cond
+              (and handle-prerequisites? (pending-source-prerequisite? scope failure))
+              (do (fulfill-source-prerequisite! scope failure)
+                  ;; This is a new phase with fresh observations, not an extra
+                  ;; generic staleness retry. Keep the original retry counter.
+                  (recur attempt))
+
+              (and handle-prerequisites? (:pending @scope))
+              (throw failure)
+
+              (and (< attempt 2)
                      (contains? #{:stale-definition-proof-input
                                   :unstable-definition-proof-input}
                                 (:reason (ex-data failure))))
               (recur (inc attempt))
-              (throw failure))
-            (:result outcome))))))))
+
+              :else (throw failure))
+            (:result outcome))))))))))
+
+(defn ^:no-doc call-with-definition-analysis
+  "Own one unpublished source-normalization analysis under the existing complete fences.
+   Only explicit semantic queries on this exact collector (or active query children) isolate
+   their work. General independent/optional/preparation children retain ordinary full behavior."
+  [construct]
+  (if-not *emission-inputs*
+    (construct)
+    (let [historical @*emission-inputs*
+          enclosing *definition-analysis-session*
+          admitted? (and enclosing @(:active? enclosing)
+                         (or (identical? (:owner enclosing) *emission-inputs*)
+                             (active-definition-query-owner?)))
+          inherited (if admitted?
+                      (or *definition-observation-baselines* (:baselines enclosing) [])
+                      [])
+          baselines (cond-> (vec inherited)
+                      admitted? (conj @(:owner enclosing)))
+          baselines (conj baselines historical)]
+      (call-with-independent-definition-inputs
+       (fn []
+         (let [session {:owner *emission-inputs* :token (Object.)
+                        :active? (volatile! true) :baselines baselines}]
+           (try
+             (binding [*definition-analysis-session* session
+                       *definition-query-frame* nil
+                       *definition-observation-owner* nil
+                       *definition-observation-baselines* nil]
+               (construct))
+             (finally (vreset! (:active? session) false)))))))))
+
+(defn- isolated-definition-query-owner?
+  []
+  (let [session *definition-analysis-session*]
+    (and session @(:active? session) *emission-inputs*
+         (or (identical? (:owner session) *emission-inputs*)
+             (active-definition-query-owner?)))))
+
+(declare semantic-query-producer? canonical-analysis-producers)
+
+(defn- assert-definition-query-state! [inputs]
+  (let [proofs (or (:definition-proofs inputs) {}) values (:values inputs)]
+    (when-not (and (every? #{:static :values :definition-proofs :producer-inputs} (keys inputs))
+                   (empty? (:static inputs)) (map? proofs) (vector? values)
+                   (= (count proofs) (count values))
+                   (every? semantic-query-producer? (:producer-inputs inputs))
+                   (every? (fn [[v snapshot]] (and (var? v) (identical? v (:var snapshot)))) proofs)
+                   (every? #(identical? % (get proofs (:var %))) values))
+      (throw (ex-info "isolated semantic analysis produced non-query compiler state"
+                      {:reason :invalid-definition-query-state}))))
+  true)
+
+(defn- assert-no-analysis-prerequisite! []
+  (when (instance? clojure.lang.IAtom *source-prerequisite-scope*)
+    (when-let [pending (:pending @*source-prerequisite-scope*)]
+      ;; The enclosing owner authenticates this EXACT Throwable. Never replace
+      ;; a genuine demand with a generic stale/unstable exception.
+      (throw (:failure pending)))))
+
+(defn ^:no-doc call-with-isolated-definition-query
+  "Conditional adoption for eager normal-return lattice analysis, not an executable proof.
+   Outside an admitted analysis owner, optional queries keep the original optional behavior;
+   required queries call directly, preserving result-fact's standalone fence semantics.
+   No results are cached. A positive query validates its entire footprint, then merges original
+   snapshots/lookup edges with an exact-owner CAS; the enclosing source scope fences all history."
+  ([prove!] (call-with-isolated-definition-query prove! true))
+  ([prove! optional?]
+   (if-not (isolated-definition-query-owner?)
+     (if optional? (call-with-optional-definition-inputs prove!) (prove!))
+     (let [parent *emission-inputs* historical @parent
+           session *definition-analysis-session*
+           baselines (into (conj (vec (:baselines session)) @(:owner session))
+                           (concat *definition-observation-baselines* [historical]))
+           local (atom {:static [] :values []})
+           frame {:owner local :session-token (:token session) :active? (volatile! true)}]
+       (assert-no-analysis-prerequisite!)
+       (try
+         (let [result (binding [*emission-inputs* local *definition-query-frame* frame
+                                *definition-observation-baselines* baselines]
+                        (prove!))]
+           (assert-no-analysis-prerequisite!)
+           (when-not (identical? historical @parent)
+             (throw (ex-info "semantic-query owner changed during construction"
+                             {:reason :unstable-definition-proof-input})))
+           (assert-definition-query-state! @local)
+           (when (or result (not optional?))
+             (assert-definition-inputs-current! @local)
+             (let [merged (reduce-kv retain-definition-observation historical
+                                     (or (:definition-proofs @local) {}))
+                   merged (retain-producer-inputs
+                           merged (canonical-analysis-producers (:producer-inputs @local)
+                                                                (conj baselines historical)))]
+               (when-not (compare-and-set! parent historical merged)
+                 (throw (ex-info "semantic-query owner changed before adoption"
+                                 {:reason :unstable-definition-proof-input})))))
+           result)
+         (catch Throwable failure
+           (assert-no-analysis-prerequisite!)
+           (throw failure))
+         (finally (vreset! (:active? frame) false)))))))
 
 (declare validate-static-emission!)
 
@@ -280,6 +620,7 @@
                                                      (str (:name (meta var))))) changed)}))))
   (doseq [{:keys [source-var artifact]} static-inputs]
     (validate-static-emission! source-var artifact seen))
+  (assert-producer-inputs-current! emission)
   emission)
 
 (defn- validate-static-emission!
@@ -325,6 +666,10 @@
               (let [snapshots (:dependency-snapshots inputs)]
                 (swap! checks conj
                        (fn [] (every? var-snapshot-current? snapshots))))
+              (let [producers (:producer-inputs inputs)]
+                (when (seq producers)
+                  (swap! checks conj
+                         (fn [] (assert-producer-inputs-current! {:producer-inputs producers})))))
               (doseq [{:keys [source-var artifact]} (:static-inputs inputs)]
                 (let [nested (:raster.compiler/emission-inputs artifact)
                       snapshot (:source-snapshot nested)]
@@ -397,6 +742,23 @@
 
 (declare direct-selected-definition)
 
+(defn- source-entry-corresponds?
+  "Compare original definition fields without constructing a new lineage or refreshing history."
+  [metadata {:keys [params tags annotations source-body source-ns typed-interface return-tag
+                    clojure-body] :as source}]
+  (and (:raster.core/deftm metadata)
+       (source-policy/valid? (:source-policy source))
+       (= (:source-policy source) (:raster.core/source-policy metadata))
+       (identical? source-ns (:ns metadata))
+       (= (ns-name source-ns) (:raster.core/deftm-source-ns metadata))
+       (= params (:raster.core/deftm-params metadata))
+       (= tags (:raster.core/deftm-tags metadata))
+       (= annotations (:raster.core/deftm-annotations metadata))
+       (= return-tag (or (:raster.core/return-tag metadata) 'Object))
+       (some? source-body)
+       (identical? source-body (:raster.core/deftm-source-body metadata))
+       (or (some? typed-interface) (vector? clojure-body))))
+
 (defn capture-source-entry
   "Capture ORIGINAL inputs at the actual compiler producer, before publication.
    This owner-private lineage is not a portable certificate or a type registry.
@@ -404,23 +766,19 @@
    A plain Clojure producer may additionally freeze its exact compiled body.
    Nil means the supplied plan does not correspond to this retained definition."
   [source-var {:keys [params tags annotations source-body source-ns typed-interface return-tag
-                     clojure-body]}]
+                     clojure-body] :as source}]
   (when (and (var? source-var) (bound? source-var)
              (instance? clojure.lang.Namespace source-ns))
     (let [{:keys [value metadata]} (var-snapshot source-var)]
-      (when (and (:raster.core/deftm metadata)
-                 (identical? source-ns (:ns metadata))
-                 (= (ns-name source-ns) (:raster.core/deftm-source-ns metadata))
-                 (= params (:raster.core/deftm-params metadata))
-                 (= tags (:raster.core/deftm-tags metadata))
-                 (= annotations (:raster.core/deftm-annotations metadata))
-                 (= return-tag (or (:raster.core/return-tag metadata) 'Object))
-                 (some? source-body)
-                 (identical? source-body (:raster.core/deftm-source-body metadata))
-                 (or (some? typed-interface) (vector? clojure-body)))
+      (when (source-entry-corresponds? metadata source)
         (cond-> {:source-var source-var :source-root value :source-name (:name metadata)
                  :params params :tags tags :annotations annotations :source-body source-body
-                 :source-ns source-ns :typed-interface typed-interface :return-tag return-tag}
+                 :source-policy (:source-policy source)
+                 ;; Interface spelling is nominal, not a physical Class proof.
+                 ;; Pending specs use Symbols while emission callers may use
+                 ;; Strings. Keep one representation in frozen source identity;
+                 ;; selected receiver/Class correspondence is checked separately.
+                 :source-ns source-ns :typed-interface (some-> typed-interface str) :return-tag return-tag}
           (vector? clojure-body) (assoc :clojure-body clojure-body))))))
 
 (defn source-entry-current?
@@ -434,10 +792,9 @@
        (and (var? source-var) (bound? source-var)
             (instance? clojure.lang.Namespace source-ns)
             (symbol? source-name) (nil? (namespace source-name))
-            (identical? source-ns (find-ns (ns-name source-ns)))
-            (identical? source-var (.findInternedVar ^clojure.lang.Namespace source-ns source-name))
+            (canonical-var-intern-current? source-var source-ns source-name)
             (identical? source-root (var-get source-var))
-            (some? (capture-source-entry source-var lineage)))))))
+            (source-entry-corresponds? (meta source-var) lineage))))))
 
 (defn assert-source-entry-current!
   "Fence publication of an actual captured source entry; sequential, not ABA-safe."
@@ -472,6 +829,39 @@
                              [:generic-var :receiver-var :source-var]))
             definition))))))
 
+(defn live-selected-parameter-carriers
+  "Check the actual interface of a currently selected registered typed invk.
+   This live correspondence query supplies NO historical definition ownership or
+   operand-completion proof. A compiler consumer must retain its own observations;
+   a replay consumer must recheck its retained recipe. Never generates or invokes code."
+  [operation implementation-op argument-count]
+  (when-let [{:keys [entry tags parameters] :as definition}
+             (selected-definition operation implementation-op argument-count)]
+    (let [{:keys [iface-name iface-class param-tags]}
+          (get @types/fn-interface-by-name (:typed-iface entry))
+          expected-tags (mapv types/tag->iface-type tags)
+          expected-carriers (mapv types/tag->java-class expected-tags)]
+      (when (and (= iface-name (:typed-iface entry))
+                 (= expected-tags param-tags)
+                 (class? iface-class) (.isInterface ^Class iface-class)
+                 (.isInstance ^Class iface-class (:typed-impl entry))
+                 (every? class? expected-carriers))
+        (let [methods (filter #(= "invk" (.getName ^java.lang.reflect.Method %))
+                              (.getDeclaredMethods ^Class iface-class))]
+          (when (= 1 (count methods))
+            (let [^java.lang.reflect.Method method (first methods)
+                  carriers (vec (.getParameterTypes method))]
+              (when (and (= expected-carriers carriers)
+                         (= argument-count (count parameters) (count carriers))
+                         (not (.isVarArgs method))
+                         (not (java.lang.reflect.Modifier/isStatic (.getModifiers method))))
+                (when (let [current (selected-definition operation implementation-op argument-count)]
+                        (every? #(identical? (get definition %) (get current %))
+                                [:entry :generic-var :receiver-var :source-var]))
+                  {:definition definition :invocation-method method
+                   :parameters parameters :parameter-carriers carriers
+                   :result-carrier (.getReturnType method)})))))))))
+
 (defn selected-parameter-carriers
   "Observe the actual JVM interface of an already selected, registered invk.
 
@@ -484,32 +874,13 @@
    No interface is generated, method invoked or registry added."
   [operation implementation-op argument-count]
   (when *emission-inputs*
-    (when-let [{:keys [entry tags parameters] :as definition}
-               (observed-selected-definition :typed operation implementation-op argument-count)]
-      (let [{:keys [iface-name iface-class param-tags]}
-            (get @types/fn-interface-by-name (:typed-iface entry))
-            expected-tags (mapv types/tag->iface-type tags)
-            expected-carriers (mapv types/tag->java-class expected-tags)]
-        (when (and (= iface-name (:typed-iface entry))
-                   (= expected-tags param-tags)
-                   (class? iface-class) (.isInterface ^Class iface-class)
-                   (.isInstance ^Class iface-class (:typed-impl entry))
-                   (every? class? expected-carriers))
-          (let [methods (filter #(= "invk" (.getName ^java.lang.reflect.Method %))
-                                (.getDeclaredMethods ^Class iface-class))]
-            (when (= 1 (count methods))
-              (let [^java.lang.reflect.Method method (first methods)
-                    carriers (vec (.getParameterTypes method))]
-                (when (and (= expected-carriers carriers)
-                           (= argument-count (count parameters) (count carriers))
-                           (not (.isVarArgs method))
-                           (not (java.lang.reflect.Modifier/isStatic (.getModifiers method))))
-                  (assert-definition-inputs-current! @*emission-inputs*)
-                  (when (identical? entry
-                                    (:entry (selected-definition operation implementation-op argument-count)))
-                    {:definition definition :invocation-method method
-                     :parameters parameters :parameter-carriers carriers
-                     :result-carrier (.getReturnType method)}))))))))))
+    (when-let [definition (observed-selected-definition :typed operation implementation-op argument-count)]
+      (let [projection (live-selected-parameter-carriers operation implementation-op argument-count)]
+        (assert-definition-inputs-current! @*emission-inputs*)
+        (when (and projection
+                   (every? #(identical? (get definition %) (get (:definition projection) %))
+                           [:entry :generic-var :receiver-var :source-var]))
+          projection)))))
 
 (defn- usable-emission?
   "Optional analyses may abstain on unavailable historical evidence. Execution
@@ -524,10 +895,17 @@
         false
         (throw failure)))))
 
+(defn- source-entry-matches-selection?
+  [lineage {:keys [source-var parameters tags entry]} expected-source-var]
+  (and lineage (identical? expected-source-var source-var)
+       (identical? source-var (:source-var lineage))
+       (= parameters (:params lineage)) (= tags (:tags lineage))
+       (= (str (:typed-iface entry)) (str (:typed-interface lineage)))))
+
 (defn selected-source-entry-carriers
   "Project primitive formal facts INSIDE an exact retained typed source entry.
    Cold jit-spec and warm owned emission must correspond to the same source Var
-   supplied by the frontend. Never compile/invoke merely to acquire evidence.
+   supplied by the frontend. Never compile or invoke merely to acquire evidence.
    Original argument completion stays outside these facts; reference formals
    remain nullable and the interface's Object result remains Object. Requires
    the existing enclosing definition owner and its final publication guard."
@@ -553,11 +931,10 @@
                          (= parameters (:params emission)) (= tags (:tags emission))
                          (= (str (:typed-iface entry)) (str (:typed-interface emission))))
                 (when (and (source-entry-current? (:source-entry emission))
+                           (source-entry-matches-selection? (:source-entry emission) definition expected-source-var)
                            (usable-emission? emission))
                   (:source-entry emission)))))]
-      (when (and lineage (identical? source-var (:source-var lineage))
-                 (= parameters (:params lineage)) (= tags (:tags lineage))
-                 (= (str (:typed-iface entry)) (str (:typed-interface lineage))))
+      (when (source-entry-matches-selection? lineage definition expected-source-var)
         (assert-definition-inputs-current! @*emission-inputs*)
         (assoc projection :scope :typed-source-body-entry :source-entry lineage
                :pending-source? (boolean spec) :emission (when-not spec emission)
@@ -567,33 +944,800 @@
                                {:carrier carrier :presence (if (.isPrimitive carrier) :present :unknown)})
                              parameter-carriers)))))))
 
-(defn selected-definition-body
-  "Historical body for an already observed selected definition, never current
-   walked metadata. Typed methods retain actual receiver/emission correspondence.
-   Plain deftm declarations freeze the exact Clojure body at their producer.
-   Missing historical evidence abstains without compiling or invoking anything."
+(defn ^:no-doc selected-source-preparation-request
+  "Describe one exact selected source prerequisite without preparing it.
+
+   The opaque request is process-local work selection, never source or emission
+   authority. Its SourceEntry comes from selected-source-entry-carriers, including
+   the pending JitSpec path; callers cannot construct it from metadata maps."
+  [mode operation implementation-op argument-count expected-source-var]
+  (when-not (contains? #{:semantic :physical} mode)
+    (throw (ex-info "selected source preparation has an unknown work mode"
+                    {:reason :invalid-source-preparation-mode :mode mode})))
+  (when-let [{:keys [definition source-entry pending-source? invocation-method
+                     parameters parameter-carriers result-carrier]}
+             (selected-source-entry-carriers
+              operation implementation-op argument-count expected-source-var)]
+    ;; A ready physical producer that still cannot satisfy the caller's proof is
+    ;; unsupported, not permission to rebuild that producer until it happens to
+    ;; fit. Both bounded work phases originate only from the authenticated pending
+    ;; JitSpec captured by selected-source-entry-carriers.
+    (when pending-source?
+      (let [{:keys [source-var generic-var receiver-var entry tags]} definition]
+        (seal-selected-source-preparation
+         {:mode mode :source-var source-var :lineage source-entry :operation operation
+          :implementation-op implementation-op :argument-count argument-count
+          :generic-var generic-var :receiver-var receiver-var :entry entry :tags tags
+          :parameters parameters :parameter-carriers parameter-carriers
+          :result-carrier result-carrier :invocation-method invocation-method})))))
+
+(def ^:private selected-source-preparation-keys
+  #{:mode :source-var :lineage :operation :implementation-op :argument-count
+    :generic-var :receiver-var :entry :tags :parameters :parameter-carriers
+    :result-carrier :invocation-method})
+
+(defn- selected-source-preparation-corresponds?
+  [selected current phase]
+  (let [{:keys [source-var lineage generic-var receiver-var entry tags parameters
+                parameter-carriers result-carrier invocation-method mode]} selected
+        definition (:definition current)]
+    (and current (source-entry-current? lineage) (= lineage (:source-entry current))
+         (identical? source-var (:source-var definition))
+         (identical? generic-var (:generic-var definition))
+         (identical? receiver-var (:receiver-var definition))
+         (= tags (:tags definition)) (= parameters (:parameters current))
+         (= parameter-carriers (:parameter-carriers current))
+         (identical? result-carrier (:result-carrier current))
+         (= invocation-method (:invocation-method current))
+         (case phase
+           :pending (and (:pending-source? current) (identical? entry (:entry definition)))
+           :completed (= (:pending-source? current) (= :semantic mode))
+           false))))
+
+(defn- selected-source-preparation-current!
+  [request]
+  (when-not (identical? selected-source-preparation-class (class request))
+    (throw (ex-info "source preparation requires its selected work request"
+                    {:reason :invalid-source-preparation-request})))
+  (let [{:keys [source-var operation implementation-op argument-count] :as selected}
+        (request selected-source-preparation-authority)
+        current (selected-source-entry-carriers
+                 operation implementation-op argument-count source-var)]
+    (when-not (and (= selected-source-preparation-keys (set (keys selected)))
+                   (contains? #{:semantic :physical} (:mode selected))
+                   (selected-source-preparation-corresponds? selected current :pending))
+      (throw (ex-info "selected source preparation no longer names its original declaration"
+                      {:reason :changed-source-prerequisite :source source-var})))
+    selected))
+
+(defn- selected-source-preparation-completed!
+  [selected]
+  (let [{:keys [source-var operation implementation-op argument-count mode]} selected
+        current (selected-source-entry-carriers
+                 operation implementation-op argument-count source-var)]
+    (when-not (selected-source-preparation-corresponds? selected current :completed)
+      (throw (ex-info "selected source preparation changed its original declaration"
+                      {:reason :changed-source-prerequisite :source source-var :mode mode})))
+    current))
+
+(deftype ^:private SourceFrontend [lineage body context preparation-inputs])
+(deftype ^:private FrontendSourceOwner [frontend implementation])
+
+(defn freeze-source-frontend
+  "Original producer: freeze semantic source before choosing a target module.
+   Preparation inputs fence publication, not later macro redefinition: the
+   already-expanded body retains its meaning just like compiled Clojure code."
+  [lineage body context preparation-inputs]
+  (assert-source-entry-current! lineage)
+  (assert-definition-inputs-current! preparation-inputs)
+  (when-not (and (vector? body) (map? preparation-inputs)
+                 (= #{:element-dtype :parameter-dtype} (set (keys context))))
+    (throw (ex-info "frontend producer needs its original body and context"
+                    {:reason :unclosed-original-frontend})))
+  (SourceFrontend. lineage body context preparation-inputs))
+
+(defn bind-source-frontend
+  "Producer-owned correspondence, separate from the frozen semantic frontend.
+   A pending binding identifies its stub/spec, not an executed numerical body."
+  [frontend implementation]
+  (when-not (and (instance? SourceFrontend frontend) implementation)
+    (throw (ex-info "frontend binding requires an original producer"
+                    {:reason :unclosed-original-frontend})))
+  (assert-source-entry-current! (.-lineage ^SourceFrontend frontend))
+  (FrontendSourceOwner. frontend implementation))
+
+(defn own-frontend-source
+  "Original producer boundary: bind pre-backend source to its actual implementation.
+   The opaque owner is not reconstructed from a later emission-metadata map."
+  [lineage implementation body context]
+  (bind-source-frontend (freeze-source-frontend lineage body context {}) implementation))
+
+(defn frontend-source-input!
+  "Read immutable producer inputs for this exact pending/published implementation."
+  [owner implementation]
+  (when-not (and (instance? FrontendSourceOwner owner)
+                 (identical? implementation (.-implementation ^FrontendSourceOwner owner)))
+    (throw (ex-info "frontend source is not owned by this original implementation"
+                    {:reason :retained-frontend-owner-mismatch})))
+  (let [frontend (.-frontend ^FrontendSourceOwner owner)
+        lineage (.-lineage ^SourceFrontend frontend)]
+    (assert-source-entry-current! lineage)
+    {:source-frontend frontend :source-entry lineage :source-owner owner
+     :implementation implementation :body (.-body ^SourceFrontend frontend)
+     :frontend-context (.-context ^SourceFrontend frontend)}))
+
+(defn- original-frontend [owner lineage implementation expected-dtype]
+  (when owner
+    (let [original (frontend-source-input! owner implementation)]
+      (when-not (identical? lineage (:source-entry original))
+        (throw (ex-info "frontend source is not owned by this original implementation"
+                        {:reason :retained-frontend-owner-mismatch})))
+      (let [context (:frontend-context original)]
+        (when-not (or (nil? (:parameter-dtype context))
+                      (= expected-dtype (:parameter-dtype context)))
+          (throw (ex-info "retained source specialization cannot be retyped for this request"
+                          {:reason :retained-frontend-dtype-mismatch
+                           :source (:source-var lineage) :requested-dtype expected-dtype
+                           :source-dtype (:parameter-dtype context)})))
+        original))))
+
+(defn assert-frontend-source!
+  "Check original producer identity, not asserted body/context fields in a map."
+  [frontend source-var]
+  (let [{:keys [source-owner source-entry implementation frontend-context body]} frontend
+        expected (original-frontend source-owner source-entry implementation
+                                    (:parameter-dtype frontend-context))]
+    (when-not (and expected (identical? source-var (:source-var source-entry))
+                   (identical? (:source-frontend frontend) (:source-frontend expected))
+                   (identical? body (:body expected))
+                   (= frontend-context (:frontend-context expected)))
+      (throw (ex-info "checked source requires its original frontend producer"
+                      {:reason :unowned-checked-result-frontend})))
+    frontend))
+
+(defn- typed-frontend-binding
+  "Read an actual selected implementation's source binding, not its code facts."
+  [{:keys [source-var receiver-var entry] :as definition}]
+  (when (and source-var receiver-var)
+    (let [metadata (meta receiver-var)
+          spec (:raster.core/jit-spec metadata)
+          emission (when-not spec (:raster.core/bytecode-emission metadata))
+          owner (if spec (:frontend-source-owner spec) (:frontend-source-owner emission))
+          implementation (:typed-impl entry)
+          interface (get @types/fn-interface-by-name (:typed-iface entry))
+          interface-class (:iface-class interface)]
+      ;; Source ownership is not an excuse for an impossible public binding.
+      ;; This checks the actual registry Class, not parameter Classes from tags.
+      (when (and owner implementation
+                 (= (:typed-iface entry) (:iface-name interface))
+                 (= (mapv types/tag->iface-type (:tags definition)) (:param-tags interface))
+                 (class? interface-class)
+                 (.isInterface ^Class interface-class)
+                 (.isInstance ^Class interface-class implementation))
+        (let [original (frontend-source-input! owner implementation)
+              lineage (:source-entry original)
+              source-ns (.ns ^clojure.lang.Var source-var)
+              envelope? (if spec
+                          (and (= (:source-ns-name spec) (ns-name source-ns))
+                               (identical? source-var (ns-resolve source-ns (:mangled-sym spec)))
+                               (= lineage (capture-source-entry
+                                           source-var (assoc spec :source-ns source-ns
+                                                                  :typed-interface (:typed-iface-name spec)))))
+                          (and (= :jvm-bytecode (:backend emission))
+                               (identical? implementation (:implementation emission))
+                               (identical? lineage (:source-entry emission))))]
+          (when (and envelope?
+                     (source-entry-matches-selection? lineage definition source-var))
+            (assoc original :emission emission)))))))
+
+(defn- assert-semantic-frontend-selection!
+  [lineage {:keys [operation implementation-op argument-count source-var generic-var
+                   receiver-var parameters tags frontend receiver-reference receiver-policy]}]
+  (let [current (selected-definition operation implementation-op argument-count)
+        binding (when current (typed-frontend-binding current))]
+    (when-not (and (var-reference-current? receiver-reference)
+                   (= receiver-policy (select-keys (meta receiver-var)
+                                                   [:no-inline :raster.compiler/host-only]))
+                   (identical? source-var (:source-var current))
+                   (identical? generic-var (:generic-var current))
+                   (identical? receiver-var (:receiver-var current))
+                   (= parameters (:parameters current)) (= tags (:tags current))
+                   (identical? lineage (:source-entry binding))
+                   (identical? frontend (:source-frontend binding)))
+      (throw (ex-info "semantic frontend no longer has its original source selection"
+                      {:reason :stale-semantic-frontend-selection :source source-var})))
+    true))
+
+(deftype ^:private FrontendSourceIdentityInput [lineage selection]
+  RetainedProducerInput
+  (assert-producer-current! [_]
+    (assert-source-entry-current! lineage)
+    (when selection (assert-semantic-frontend-selection! lineage selection))
+    true))
+
+(defn- same-frontend-source-input? [left right]
+  (and (instance? FrontendSourceIdentityInput left) (instance? FrontendSourceIdentityInput right)
+       (identical? (.-lineage ^FrontendSourceIdentityInput left) (.-lineage ^FrontendSourceIdentityInput right))
+       (= (.-selection ^FrontendSourceIdentityInput left) (.-selection ^FrontendSourceIdentityInput right))))
+
+(defn- semantic-query-producer? [producer]
+  (or (instance? SourceResolutionInput producer) (instance? FrontendSourceIdentityInput producer)))
+
+(defn- canonical-analysis-producers
+  "Reuse original semantic guards only AFTER validating the query's actual guard observations.
+   These are the observers' exact equivalences, not cached freshness or general producer equality."
+  [producers baselines]
+  (let [historical (mapcat :producer-inputs baselines)]
+    (mapv (fn [producer]
+            (or (some #(when (or (same-source-resolution-input? producer %)
+                                 (same-frontend-source-input? producer %)) %)
+                      historical)
+                producer)) producers)))
+
+(defn observe-frontend-source-identity!
+  "Retain exact source-entry identity after authenticating its opaque frontend.
+   This lightweight guard also catches equal-but-copied raw source metadata.
+   It retains no transformed bodies and grants no emission or execution rights."
+  [frontend]
+  (when *emission-inputs*
+    (assert-frontend-source! frontend (get-in frontend [:source-entry :source-var]))
+    (let [lineage (:source-entry frontend)
+          input (FrontendSourceIdentityInput. lineage nil)]
+      (swap! *emission-inputs*
+             (fn [inputs]
+               (if (some #(same-frontend-source-input? input %)
+                         (:producer-inputs inputs))
+                 inputs
+                 (retain-producer-inputs inputs [input])))))
+    true))
+
+(defn- retain-semantic-frontend-selection!
+  [definition original operation implementation-op argument-count]
+  (let [{:keys [source-var generic-var receiver-var parameters tags]} definition
+        lineage (:source-entry original)
+        receiver-ns (.ns ^clojure.lang.Var receiver-var)
+        selection {:operation operation :implementation-op implementation-op :argument-count argument-count
+                   :source-var source-var :generic-var generic-var :receiver-var receiver-var
+                   :parameters parameters :tags tags :frontend (:source-frontend original)
+                   :receiver-reference {:var receiver-var
+                                        :metadata (select-keys (meta receiver-var) [:ns :name])
+                                        :lookups #{[receiver-ns implementation-op]}}
+                   :receiver-policy (select-keys (meta receiver-var)
+                                                 [:no-inline :raster.compiler/host-only])}
+        input (FrontendSourceIdentityInput. lineage selection)]
+    (assert-producer-current! input)
+    (when-not (some #(same-frontend-source-input? input %)
+                   (:producer-inputs @*emission-inputs*))
+      (adopt-definition-inputs! {:producer-inputs [input]}))))
+
+(defn selected-frontend-source
+  "Original typed frontend of an exactly selected specialization.
+   Its opaque original owner authenticates source independently of any transformed
+   module's freshness. Semantic selection retains the frozen frontend across a
+   legitimate implementation rebind; it does not retain receiver-root facts.
+   This permits new source compilation, not invocation of an
+   old module or observed-bytecode analysis. Optional :emission is an unvalidated
+   observation; every emission consumer must check its own historical guard.
+   Missing cold/legacy ownership abstains without walking or emitting code."
+  [operation implementation-op argument-count source-var expected-dtype]
+  (call-with-optional-definition-inputs
+   (fn []
+     (let [initial (when *emission-inputs*
+                     (selected-definition operation implementation-op argument-count))
+           ;; Semantic source selection consumes the source and dispatcher, not
+           ;; the replaceable receiver's root/JIT metadata. Physical queries
+           ;; separately retain that exact receiver before deriving code facts.
+           _ (when initial
+               (observe-definition-input! (:generic-var initial)
+                                          (.ns ^clojure.lang.Var (:generic-var initial)) operation)
+               (observe-definition-input! (:source-var initial)
+                                          (.ns ^clojure.lang.Var (:source-var initial))
+                                          (.sym ^clojure.lang.Var (:source-var initial))))
+           definition (when initial
+                        (assert-definition-inputs-current! @*emission-inputs*)
+                        (selected-definition operation implementation-op argument-count))
+           direct-op (symbol (str (:ns (meta source-var))) (str (:name (meta source-var))))
+           direct (when-not definition
+                    (observed-selected-definition :direct operation direct-op argument-count))
+           typed-original (when definition (typed-frontend-binding definition))
+           owner (if definition (:source-owner typed-original)
+                     (:raster.core/frontend-source-owner (meta source-var)))
+           ;; Authenticate against the actual selected receiver, never an
+           ;; implementation identity asserted by an editable emission map.
+           implementation (if definition (get-in definition [:entry :typed-impl])
+                              (when direct (var-get source-var)))
+           original (or typed-original (when (and owner implementation)
+                                        (frontend-source-input! owner implementation)))
+           lineage (if definition (:source-entry original)
+                       (when (identical? source-var (:source-var direct))
+                         (:raster.core/clojure-source-entry (meta source-var))))]
+       (when (and lineage
+                  (or (not definition)
+                      (source-entry-matches-selection? lineage definition source-var)))
+         (when-let [frontend (original-frontend owner lineage implementation expected-dtype)]
+           (observe-definition-input! source-var (:ns (meta source-var)) (:name (meta source-var)))
+           (when definition
+             (retain-semantic-frontend-selection! definition original operation implementation-op argument-count))
+           (assert-definition-inputs-current! @*emission-inputs*)
+           (merge {:source-entry lineage :definition (or definition direct)
+                   :source-owner owner :implementation implementation
+                   :emission (:emission typed-original)} frontend)))))))
+
+(declare original-source-frontend)
+
+(defn assert-frontend-semantic-selection!
+  "Authenticate current selection of the same opaque original source frontend.
+   Returns its CURRENT source binding, not physical Method/carrier facts. A
+   legitimate JIT rebind of identical source may change implementation/owner;
+   existing physical observations retain their separate strict guards."
+  [frontend source-var]
+  (assert-frontend-source! frontend source-var)
+  (let [current (original-source-frontend source-var)]
+    (when-not (and current
+                   (identical? (:source-frontend frontend) (:source-frontend current))
+                   (identical? (:source-entry frontend) (:source-entry current)))
+      (throw (ex-info "frontend selection differs from its original semantic producer"
+                      {:reason :retained-frontend-entry-mismatch})))
+    (assert-definition-inputs-current! @*emission-inputs*)
+    current))
+
+(defn prepare-frontend-source!
+  "Explicitly prepare an authentic selected source BEFORE acquiring physical facts.
+   `prepare!` is a non-evaluating receiver compiler, not a numerical invocation.
+   Reacquire the current binding of the SAME opaque frontend after preparation.
+   Existing enclosing observations remain historical: neither physical captures
+   nor earlier source/definition inputs are refreshed or exempted from checks.
+   Returns the current same-source binding, or nil when it has no typed receiver."
+  [frontend source-var prepare!]
+  (let [current (assert-frontend-semantic-selection! frontend source-var)]
+    (when-let [receiver (get-in current [:definition :receiver-var])]
+      (let [owner *emission-inputs*
+            historical @owner]
+        (binding [*emission-inputs* nil]
+          (prepare! receiver))
+        (when-not (identical? historical @owner)
+          (throw (ex-info "source preparation changed its enclosing compiler owner"
+                          {:reason :unstable-definition-proof-input})))
+        (assert-definition-inputs-current! historical)
+        (assert-frontend-semantic-selection! frontend source-var)))))
+
+(defn assert-frontend-selection!
+  "Authenticate and observe an original frontend's exact physical receiver entry.
+   Producer preparation may use this before acquiring an emitted-module guard.
+   This grants neither emission freshness nor original invocation completion;
+   physical occurrence consumers must still use their owned observation queries."
+  [frontend source-var]
+  (assert-frontend-source! frontend source-var)
+  (let [current (original-source-frontend source-var)
+        current-definition (:definition current)
+        physical (when (:receiver-var current-definition)
+                   (selected-parameter-carriers (:operation current-definition)
+                                                (:implementation-op current-definition)
+                                                (count (:parameters current-definition))))
+        selected (if (:receiver-var current-definition) (:definition physical) current-definition)
+        claimed (:definition frontend)]
+    (when-not (and current selected
+                   (every? #(identical? (get frontend %) (get current %))
+                           [:source-frontend :source-owner :implementation :source-entry])
+                   (= (select-keys claimed [:operation :implementation-op :parameters :tags])
+                      (select-keys selected [:operation :implementation-op :parameters :tags]))
+                   (every? #(identical? (get claimed %) (get selected %))
+                           [:source-var :generic-var :receiver-var :entry]))
+      (throw (ex-info "frontend physical entry differs from its original producer"
+                      {:reason :retained-frontend-entry-mismatch})))
+    selected))
+
+(defn- frontend-emission
+  "Authenticate the whole historical emission before any occurrence query."
+  [frontend]
+  (let [{:keys [emission implementation source-owner source-entry]} frontend
+        _ (assert-frontend-source! frontend (:source-var source-entry))
+        definition (when *emission-inputs*
+                     (assert-frontend-selection! frontend (:source-var source-entry)))
+        ;; The opaque origin relation seals bodies, not editable observation maps.
+        ;; Reuse the ALREADY observed receiver metadata, never refresh it around
+        ;; a caller-supplied emission or an older materialized implementation.
+        historical (when *emission-inputs*
+                     (get-in @*emission-inputs*
+                             [:definition-proofs (:receiver-var definition)
+                              :metadata :raster.core/bytecode-emission]))]
+    (when (and emission (identical? emission historical)
+               (identical? implementation (:implementation emission))
+               (identical? source-owner (:frontend-source-owner emission))
+               (identical? source-entry (:source-entry emission)))
+      ;; Source availability did not attest this transformed module. Actual
+      ;; instruction/occurrence consumers still owe its complete input history.
+      (assert-emission-inputs-current! emission)
+      (assert-definition-inputs-current! @*emission-inputs*)
+      emission)))
+
+(deftype ^:private FrontendEmissionInput [emission guard]
+  RetainedProducerInput
+  (assert-producer-current! [this]
+    (guard)
+    this))
+
+(defn retain-emission-input-history!
+  "Retain an exact module's complete historical inputs in the current owner.
+   The caller must FIRST authenticate the actual module at its emitter/receiver
+   boundary. This supplies freshness only, not body, Class or invocation rights.
+   Reuse the original immutable history; never reconstruct it from current Vars."
+  [emission]
+  (assert-emission-inputs-current! emission)
+  ;; Deduplicate by module identity, never by equal code or dependency maps.
+  (when-not (some #(and (instance? FrontendEmissionInput %)
+                       (identical? emission (.-emission ^FrontendEmissionInput %)))
+                  (:producer-inputs @*emission-inputs*))
+    (adopt-definition-inputs!
+     {:producer-inputs [(FrontendEmissionInput.
+                         emission (prepare-emission-input-guard! emission))]})))
+
+(defn- frontend-emission-observation [frontend observe!]
+  (call-with-optional-definition-inputs
+   (fn []
+     (when-let [emission (frontend-emission frontend)]
+       (when-let [observed (observe! emission)]
+         ;; Physical facts may outlive this query. Retain their entire historical
+         ;; module lineage, not just the currently selected caller's definition.
+         ;; This proves freshness only: source-import closure and execution
+         ;; permission still belong to their separate original producers.
+         (retain-emission-input-history! emission)
+         (assert-definition-inputs-current! @*emission-inputs*)
+         observed)))))
+
+(defn ^:no-doc observed-frontend-emission
+  "Observe the exact receiver-owned module and retain its ORIGINAL history.
+   This grants freshness/module identity only, not source occurrence, numerical
+   equivalence or permission to execute/import an arbitrary transformed body."
+  [frontend]
+  (when *emission-inputs*
+    (frontend-emission-observation frontend identity)))
+
+(defn frontend-primitive-body-return-bridge
+  "Observe the owned primitive body return, allowing primitive-array parameters.
+   This query checks actual primitive completion, including array-taking helpers.
+   This retains the original module history, not source-import/placement proof."
+  [frontend]
+  (frontend-emission-observation
+   frontend #((requiring-resolve 'raster.compiler.backend.jvm.bytecode/retained-primitive-body-return-bridge) %)))
+
+(defn frontend-boxed-entry-bridge
+  "Observe the actual public Object-input plans and wrapper/compute return edge.
+   Unlike the primitive-body query this retains a possible body-return coercion;
+   it does NOT discharge that coercion or establish a numerical payload. The
+   consumer must join its independently constructed source result to the exact
+   recorded context before using a primitive target return."
+  [frontend]
+  (frontend-emission-observation
+   frontend #((requiring-resolve 'raster.compiler.backend.jvm.bytecode/retained-boxed-entry-bridge) %)))
+
+(defn frontend-reference-return-bridge
+  "Observe the exact owned implementation's reference→Object pass-through.
+   Preserve its whole body context and actual Method-return CHECKCAST. This grants
+   neither non-nullness nor source expansion/placement. Queries never compile;
+   successful observations retain the complete original module history."
+  [frontend]
+  (frontend-emission-observation
+   frontend #((requiring-resolve 'raster.compiler.backend.jvm.bytecode/retained-reference-return-bridge) %)))
+
+(defn- source-var-selection-request
+  [source-var]
+  (when (and *emission-inputs* (var? source-var))
+    (let [metadata (meta source-var)
+          source-op (symbol (str (:ns metadata)) (str (:name metadata)))
+          operation (mangled/impl->op source-op)]
+      (when operation
+        {:operation operation
+         :implementation-op (symbol (namespace source-op) (str (name source-op) "-impl"))
+         :arity (count (:raster.core/deftm-params metadata))
+         :parameter-dtype (dtype/infer-dtype-from-tags (:raster.core/deftm-tags metadata))}))))
+
+(defn original-source-frontend
+  "Optional original frontend for an exact already-resolved deftm source Var.
+   Shared mangling only discovers the operation; selected correspondence proves it."
+  [source-var]
+  (when-let [{:keys [operation implementation-op arity parameter-dtype]}
+             (source-var-selection-request source-var)]
+    (selected-frontend-source operation implementation-op arity source-var parameter-dtype)))
+
+(defn- source-prerequisite-scope! []
+  (when-not (and *emission-inputs* (instance? clojure.lang.IAtom *source-prerequisite-scope*))
+    (throw (ex-info "source readiness requires an actual outer definition-input owner"
+                    {:reason :missing-source-prerequisite-owner})))
+  *source-prerequisite-scope*)
+
+(defn- consume-source-prerequisite! [scope source-var]
+  (let [{:keys [frontend inputs] :as ready} (get-in @scope [:ready source-var])]
+    (when-not ready
+      (throw (ex-info "source adapters require readiness before target scheduling/emission"
+                      {:reason :missing-source-prerequisite :source source-var})))
+    (try
+      (assert-definition-inputs-current! inputs)
+      (assert-frontend-source! frontend source-var)
+      (assert-frontend-selection! frontend source-var)
+      (assert-emission-inputs-current! (:emission frontend))
+      (adopt-definition-inputs! inputs)
+      frontend
+      (catch clojure.lang.ExceptionInfo failure
+        ;; A satisfied prerequisite is immutable history, not permission to
+        ;; request a replacement and restamp an already derived target artifact.
+        (throw (ex-info "prepared source readiness changed during the owning request"
+                        {:reason :stale-source-prerequisite :source source-var} failure))))))
+
+(defn prepared-original-source-frontend!
+  "Consume only a satisfied request-local source prerequisite. Never prepare or issue a demand."
+  [source-var]
+  (consume-source-prerequisite! (source-prerequisite-scope!) source-var))
+
+(defn demand-original-source-frontend!
+  "Demand the one closed original-source readiness operation before target emission.
+   Discovery unwinds the actual outer compiler owner. No callback or portable receipt is accepted;
+   successful readiness is validated/adopted only by the following fresh whole-source attempt."
+  [source-var]
+  (let [scope (source-prerequisite-scope!)]
+    (if (contains? (:ready @scope) source-var)
+      (consume-source-prerequisite! scope source-var)
+      (do
+        (when (or (:pending @scope) (:preparing @scope))
+          (throw (ex-info "source prerequisite demand did not make progress"
+                          {:reason :source-prerequisite-no-progress :source source-var})))
+        (let [frontend (when (var? source-var) (original-source-frontend source-var))]
+          (when-not frontend
+            (throw (ex-info "source readiness requires its authentic original frontend"
+                            {:reason :unowned-source-prerequisite :source source-var})))
+          (assert-frontend-source! frontend source-var)
+          (let [before @scope request (Object.)
+                failure (ex-info "original source preparation must precede target emission"
+                                 {:reason :source-prerequisite-demand :source source-var
+                                  ::source-prerequisite request})
+                pending {:owner (:token before) :request request :failure failure
+                         :source source-var :frontend frontend}]
+            (when-not (compare-and-set! scope before (assoc before :pending pending))
+              (throw (ex-info "source prerequisite owner changed during demand"
+                              {:reason :source-prerequisite-no-progress :source source-var})))
+            (throw failure)))))))
+
+(defn ^:no-doc demand-selected-source-preparation!
+  "Demand one authenticated semantic or physical preparation phase.
+
+   The opaque selected request chooses work only. The independent handler
+   revalidates its original SourceEntry and selected parents before mutation;
+   the following whole attempt must still derive every executable fact anew."
+  [request]
+  (let [scope (source-prerequisite-scope!)]
+    (let [selected (selected-source-preparation-current! request)
+          source (:source-var selected)
+          mode (:mode selected)
+          work-key [source mode]]
+      (when (or (contains? (:ready @scope) work-key)
+                (:pending @scope) (:preparing @scope))
+        (throw (ex-info "source prerequisite demand did not make progress"
+                        {:reason :source-prerequisite-no-progress
+                         :source source :mode mode})))
+      (let [before @scope token (Object.)
+            failure (ex-info "selected source preparation must precede allocation proof"
+                             {:reason :source-prerequisite-demand :source source :mode mode
+                              ::source-prerequisite token})
+            pending {:owner (:token before) :request token :failure failure
+                     :source source :mode mode :work-key work-key
+                     :selected-preparation request}]
+        (when-not (compare-and-set! scope before (assoc before :pending pending))
+          (throw (ex-info "source prerequisite owner changed during demand"
+                          {:reason :source-prerequisite-no-progress
+                           :source source :mode mode})))
+        (throw failure)))))
+
+(defn ^:no-doc demand-selected-source-preparation-if-owned!
+  "Optional semantic analysis may request work only from an actual outer
+   prerequisite owner. An isolated collector is not permission to prepare code;
+   absent that scope, leave the optional fact unavailable."
+  [mode operation implementation-op argument-count source-var]
+  (when (and *emission-inputs*
+             (instance? clojure.lang.IAtom *source-prerequisite-scope*))
+    (when-let [request (selected-source-preparation-request
+                       mode operation implementation-op argument-count source-var)]
+      (demand-selected-source-preparation! request))))
+
+(defn- fulfill-source-prerequisite! [scope failure]
+  (when-not (pending-source-prerequisite? scope failure)
+    (throw failure))
+  (let [{:keys [source frontend mode work-key selected-preparation]} (:pending @scope)
+        ready-key (or work-key source)]
+    (when (contains? (:ready @scope) ready-key)
+      (throw (ex-info "a satisfied source prerequisite cannot be prepared again"
+                      {:reason :source-prerequisite-no-progress :source source :mode mode})))
+    (swap! scope assoc :pending nil :preparing ready-key)
+    ;; False disables demand handling inside this independent fixed operation.
+    ;; Its ordinary preparation retries remain unchanged and cannot adopt the
+    ;; abandoned discovery collector or recursively retain this request's store.
+    (let [ready
+          (binding [*emission-inputs* nil *source-prerequisite-scope* false]
+            (if selected-preparation
+              ;; Pending receiver observations belong to a disposable preflight
+              ;; owner. Physical preparation legitimately promotes that receiver;
+              ;; carrying its old root into the preparation owner would turn valid
+              ;; progress into a generic stale retry and then an invalid re-demand.
+              (let [selected (call-with-definition-inputs
+                              #(selected-source-preparation-current! selected-preparation))
+                    lineage (:lineage selected)]
+                (call-with-definition-inputs
+                 (fn []
+                   (let [prepared
+                         (case mode
+                           :semantic
+                           (do
+                             ((requiring-resolve 'raster.core/prepare-deftm-frontend!) source)
+                             ((requiring-resolve 'raster.core/prepare-emission-source-walk!) source)
+                             (original-source-frontend source))
+
+                           :physical
+                           ((requiring-resolve 'raster.core/prepare-owned-source-frontend!) source))]
+                     (when-not (and prepared (= lineage (:source-entry prepared)))
+                       (throw (ex-info "source prerequisite changed its original declaration"
+                                       {:reason :changed-source-prerequisite
+                                        :source source :mode mode})))
+                     (assert-source-entry-current! lineage)
+                     (assert-frontend-source! prepared source)
+                     (assert-frontend-semantic-selection! prepared source)
+                     (when (= :physical mode)
+                       (assert-frontend-selection! prepared source)
+                       (assert-emission-inputs-current! (:emission prepared)))
+                     (selected-source-preparation-completed! selected)
+                     {:frontend prepared :inputs @*emission-inputs* :mode mode}))))
+              (call-with-definition-inputs
+               (fn []
+                 (assert-frontend-source! frontend source)
+                 (assert-frontend-semantic-selection! frontend source)
+                 (let [prepared ((requiring-resolve 'raster.core/prepare-owned-source-frontend!) source)]
+                   (when-not (and prepared
+                                  (identical? (:source-frontend frontend) (:source-frontend prepared))
+                                  (identical? (:source-entry frontend) (:source-entry prepared)))
+                     (throw (ex-info "source prerequisite changed its original semantic producer"
+                                     {:reason :changed-source-prerequisite :source source})))
+                   (assert-frontend-source! prepared source)
+                   (assert-frontend-selection! prepared source)
+                   (assert-emission-inputs-current! (:emission prepared))
+                   {:frontend prepared :inputs @*emission-inputs*})))))]
+      (swap! scope #(-> % (assoc-in [:ready ready-key] ready) (dissoc :preparing))))))
+
+(defn source-var-body-entry-carriers
+  "Actual registered typed formals for an already-resolved source Var.
+   Mangling and declarations select work only. The existing selected-entry
+   query authenticates the source/receiver/interface and retains its history.
+   No JIT or opaque-frontend construction occurs. Reference facts remain
+   nullable; this supplies no body-import or return-payload permission."
+  [source-var]
+  (when-let [{:keys [operation implementation-op arity]}
+             (source-var-selection-request source-var)]
+    (selected-source-entry-carriers operation implementation-op arity source-var)))
+
+(defn observed-generic-source-definition
+  "Join a generic dispatch's actual source callable to its registered typed
+   entry, if any. The direct query first owns dispatcher/root/table and requires
+   target-fn and typed-target-fn to be the SAME callable. Only then may the
+   live selected-entry query identifies its receiver; names discover work,
+   never establish this routing relation. Consumers must still authenticate the
+   original semantic frontend. No physical carrier, overload or argument facts
+   follow, and this semantic query must not pin a replaceable JIT receiver."
+  [operation source-var argument-count]
+  (when (and *emission-inputs* (var? source-var))
+    (let [source-op (symbol (str (ns-name (.ns ^clojure.lang.Var source-var)))
+                            (str (.sym ^clojure.lang.Var source-var)))]
+      (when-let [direct (observed-selected-definition :direct operation source-op argument-count)]
+        (when (identical? source-var (:source-var direct))
+          (if (some? (get-in direct [:entry :typed-impl]))
+            (when-let [request (source-var-selection-request source-var)]
+              (let [typed (selected-definition (:operation request) (:implementation-op request)
+                                               argument-count)
+                    current (observed-selected-definition :direct operation source-op argument-count)]
+                (when (and current typed
+                           (= operation (:operation typed))
+                           (= argument-count (count (:parameters typed)))
+                           (= (:tags direct) (:tags typed))
+                           (every? #(and (identical? (get direct %) (get typed %))
+                                         (identical? (get direct %) (get current %)))
+                                   [:entry :source-var :generic-var]))
+                  typed)))
+            direct))))))
+
+(defn- retained-body-context!
+  [{:keys [source-var source-body]} lineage body context]
+  (when (and *emission-inputs* (seq body)
+             (identical? source-var (:source-var lineage))
+             (identical? source-body (:source-body lineage))
+             (source-entry-current? lineage))
+    (observe-definition-input! source-var (:ns (meta source-var)) (:name (meta source-var)))
+    (assert-definition-inputs-current! @*emission-inputs*)
+    (merge {:body body :parameters (:params lineage) :tags (:tags lineage)
+            :source-var source-var :source-ns (:source-ns lineage)} context)))
+
+(defn selected-typed-entry-body
+  "Physical typed-entry body for an already observed selection. Pending entries
+   retain their exact source-entry/receiver; published entries retain their actual
+   emitted body and lookup history. Never a semantic-source-only query: deriving
+   code facts here pins this physical binding even across genuine JIT rebinding."
   [{:keys [source-var receiver-var operation implementation-op parameters] :as definition}]
-  (when (and *emission-inputs* definition)
-    (let [projection (when receiver-var
-                       (selected-source-entry-carriers operation implementation-op
-                                                       (count parameters) source-var))
-          lineage (if receiver-var
-                    (:source-entry projection)
-                    (:raster.core/clojure-source-entry (meta source-var)))
-          body (when (and (identical? source-var (:source-var lineage))
-                          (identical? (:source-body definition) (:source-body lineage))
-                          (source-entry-current? lineage))
-                 (if receiver-var
-                   (if (:pending-source? projection)
-                     (:source-body lineage)
-                     (get-in projection [:emission :body]))
-                   (:clojure-body lineage)))]
-      (when (seq body)
-        (assert-definition-inputs-current! @*emission-inputs*)
-        {:body body :parameters (:params lineage) :tags (:tags lineage)
-         :source-var source-var :source-ns (:source-ns lineage)
-         :pending-source? (boolean (:pending-source? projection))
-         :dependency-snapshots (get-in projection [:emission :dependency-snapshots])}))))
+  (when (and *emission-inputs* receiver-var)
+    (when-let [projection (selected-source-entry-carriers
+                          operation implementation-op (count parameters) source-var)]
+      (let [lineage (:source-entry projection)
+            pending? (boolean (:pending-source? projection))]
+        (retained-body-context!
+         definition lineage
+         (if pending? (:source-body lineage) (get-in projection [:emission :body]))
+         {:pending-source? pending?
+          :dependency-snapshots (get-in projection [:emission :dependency-snapshots])})))))
+
+(defn selected-clojure-entry-body
+  "Exact producer-frozen Clojure body of an observed plain entry. This does not
+   borrow a typed receiver's source/emission mode or grant current alias lookup."
+  [{:keys [source-var receiver-var] :as definition}]
+  (when (and *emission-inputs* source-var (not receiver-var))
+    (let [lineage (:raster.core/clojure-source-entry (meta source-var))]
+      (retained-body-context! definition lineage (:clojure-body lineage)
+                              {:pending-source? false :dependency-snapshots nil}))))
+
+(defn original-body-entry-carriers
+  "Actual parameters of the original typed or plain Clojure body entry.
+   Plain invokeStatic signatures come from the historically owned target class,
+   not inferred dtypes. An array source hint on an Object port is an explicit
+   :required-array-class obligation, never an unconditional payload fact: the
+   execution owner must check it before using shape projections or doing work."
+  [operation implementation-op argument-count expected-source-var]
+  (or (selected-source-entry-carriers operation implementation-op argument-count expected-source-var)
+      (call-with-optional-definition-inputs
+       (fn []
+         (when-let [definition (observed-selected-definition :direct operation implementation-op argument-count)]
+           (when (and (identical? expected-source-var (:source-var definition))
+                      (selected-clojure-entry-body definition))
+             (let [lineage (:raster.core/clojure-source-entry (meta expected-source-var))
+                   target (:source-root lineage)
+                   methods (when (and target (source-entry-current? lineage))
+                             (filter (fn [^java.lang.reflect.Method method]
+                                       (and (= "invokeStatic" (.getName method))
+                                            (java.lang.reflect.Modifier/isStatic (.getModifiers method))
+                                            (java.lang.reflect.Modifier/isPublic (.getModifiers method))
+                                            (not (.isVarArgs method))
+                                            (= argument-count (.getParameterCount method))))
+                                     (.getDeclaredMethods (class target))))]
+               (when (= 1 (count methods))
+                 (let [method (first methods)
+                       carriers (vec (.getParameterTypes ^java.lang.reflect.Method method))]
+                   (assert-definition-inputs-current! @*emission-inputs*)
+                   {:scope :clojure-source-body-entry :definition definition
+                    :parameters (:parameters definition) :parameter-carriers carriers
+                    :invocation-method method :result-carrier (.getReturnType ^java.lang.reflect.Method method)
+                    :parameter-facts
+                    (into {} (map (fn [symbol ^Class carrier tag]
+                                    [symbol (cond-> {:carrier carrier
+                                                     :presence (if (.isPrimitive carrier) :present :unknown)}
+                                              (and (= Object carrier) (get types/primitive-array-info tag))
+                                              (assoc :required-array-class (get types/primitive-array-info tag)))])
+                                  (:parameters definition) carriers (:tags definition)))})))))))))
+
+(defn frontend-body-entry-carriers
+  "Actual body-entry carriers for this exact opaque original frontend.
+   Re-observe the registered selection before consulting physical entry facts;
+   the editable frontend :definition is never carrier authority. This query
+   neither emits nor invokes code. Requires the enclosing definition owner. Missing
+   physical evidence abstains; contradictory or changed ownership throws."
+  [frontend source-var]
+  (let [selected (assert-frontend-selection! frontend source-var)]
+    (let [physical (original-body-entry-carriers
+                    (:operation selected) (:implementation-op selected)
+                    (count (:parameters selected)) source-var)
+          definition (:definition physical)
+          actual-implementation (if (:receiver-var definition)
+                                  (get-in definition [:entry :typed-impl])
+                                  (get-in definition [:entry :target-fn]))]
+      (when (and physical
+                 (not (and (source-entry-matches-selection? (:source-entry frontend) definition source-var)
+                           (identical? (:entry selected) (:entry definition))
+                           (identical? (:implementation frontend) actual-implementation))))
+        (throw (ex-info "physical carrier facts belong to another frontend entry"
+                        {:reason :retained-frontend-entry-mismatch})))
+      (assert-definition-inputs-current! @*emission-inputs*)
+      physical)))
 
 (defn observed-body-operation
   "Resolve a nonlexical call only with the selected body's lookup authority.

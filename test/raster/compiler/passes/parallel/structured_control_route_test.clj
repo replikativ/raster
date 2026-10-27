@@ -3,6 +3,7 @@
             [clojure.test :refer [deftest is testing]]
             [clojure.walk :as walk]
             [raster.compiler.backend.gpu.parallel-program-opencl :as program-opencl]
+            [raster.compiler.backend.gpu.parallel-program-c-family :as program-c-family]
             [raster.compiler.backend.gpu.segop-opencl :as segop-opencl]
             [raster.compiler.backend.jvm.typed-scalar :as typed-scalar]
             [raster.compiler.core.value-completion :as completion]
@@ -32,8 +33,11 @@
             [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
             [raster.compiler.passes.parallel.typed-soac-route :as typed-route]
+            [raster.compiler.passes.parallel.typed-soac-frontend :as typed-frontend]
             [raster.compiler.pipeline :as pipeline]
             [raster.compiler.report :as report]
+            [raster.core :refer [deftm]]
+            [raster.par :as par]
             [raster.gpu.core :as gpu]
             [raster.gpu.link :as gpu-link]
             [raster.gpu.parallel-program :as program-runtime]
@@ -58,6 +62,38 @@
 (deftest wrapping-casts-do-not-prove-shape-projections
   (is (= 'xs (invocation-source/shape-projection-source '(clojure.core/long (alength xs)))))
   (is (nil? (invocation-source/shape-projection-source '(clojure.core/unchecked-int (alength xs))))))
+
+(deftest host-scalar-hoisting-preserves-buffer-read-ownership
+  (let [scalar (av/tensor {:dtype :long :shape []})
+        values {'buffer (av/tensor {:dtype :long :shape '[1]}) 'n scalar 'result scalar}
+        equation-for
+        (fn [expression]
+          (let [operation (typed-frontend/scalar-equation
+                           {:id 0 :sym (with-meta 'result {:tag 'long}) :expr expression}
+                           {'n :long} {'n :long})
+                captures (:captures (soac/operation-parts operation))
+                algorithm (soac/make
+                           (soac/default-program-facts
+                            {:values values :inputs captures
+                             :equations {0 (soac/default-equation-facts)}})
+                           [operation] '[result])]
+            (program/->ProgramEquation 0 [:binding 'result] expression captures '[result]
+                                       algorithm [operation] #{} {} {:source-prefix? true})))
+        read-equation (equation-for '(clojure.core/aget buffer 0))
+        shape-equation (equation-for '(clojure.core/alength buffer))
+        scalar-equation (equation-for '(clojure.core/+ n 1))
+        eligible? (fn [equation]
+                    (boolean (#'route/host-invocation-equation?
+                              #{'buffer 'n} values #{} #{'result} true equation)))]
+    (is (not (eligible? read-equation))
+        "an available public buffer does not satisfy ScalarCompute's operand contract")
+    (is (eligible? shape-equation) "exact alength retains the existing ShapeProjection path")
+    (is (eligible? scalar-equation) "ordinary checked scalar prefix computation remains supported")
+    (let [parallel (program/->ParallelProgram :typed-soac nil values '[buffer n]
+                                              [read-equation] [] #{} [] {} {})
+          retained (#'route/hoist-host-invocation-equations parallel #{'buffer 'n})]
+      (is (= [read-equation] (:equations retained)))
+      (is (= '[buffer n] (:inputs retained))))))
 
 (deftest effect-result-refinement-uses-authoritative-inner-storage
   (doseq [[host-return shape expected]
@@ -111,6 +147,12 @@
     {:type (get-in step [:value :dtype])
      :value (evaluate-test-scalar-expression expression operands)}))
 
+(deftm eager-boundary-fixture
+  [x :- (Array double), out :- (Array double), scale :- Double] :- (Array double)
+  (let [count (alength x)
+        factor (/ 1.0 scale)]
+    (par/map! out i count double (* factor (aget x i)))))
+
 (defn- loop-decomposition
   []
   (let [extent (av/tensor {:dtype :int :shape []})
@@ -135,7 +177,8 @@
               [{:initial 'u :parameter 'u-in :result 'u-next :output 'u-final}]
               body
               {'steps index 'n extent 'u tensor 'u-final tensor})]
-    {:loop loop :loop-binding 'time-loop :source '(let* [] nil)}))
+    ;; This fixture constructs an algorithm, not a translation of fabricated source.
+    {:loop loop :loop-binding 'time-loop :source nil}))
 
 (deftest structured-control-uses-the-common-program-equation-spine
   (let [typed (route/program-envelope (loop-decomposition))
@@ -143,6 +186,7 @@
         typed-equation (first (:equations typed))
         scheduled-equation (first (:equations scheduled))]
     (is (program/parallel-program? typed))
+    (is (nil? (:source typed-equation)) "source-free algorithms receive no source execution credit")
     (is (= :typed-parallel (:dialect typed)))
     (is (= '[steps n u] (:inputs typed)))
     (is (= '[u-final] (:outputs typed)))
@@ -210,6 +254,20 @@
   [suffix-bindings result]
   (let [[_ bindings] (mixed-source)]
     (list 'let* (vec (concat (take 8 bindings) suffix-bindings)) result)))
+
+(defn- mixed-algorithm-program
+  "Scheduler/runtime fixture with an externally supplied initialized carry.
+   This is not a whole Clojure source entry: no clone/allocation execution or
+   source-completion credit is claimed. Public source tests use the full constructor."
+  [source options]
+  (let [decomposition (frontend/form->structured-loop source options)]
+    (route/program-envelope
+     {:loop (:loop decomposition) :loop-binding (:loop-binding decomposition)
+      :suffix-bindings (:suffix-bindings decomposition) :outer-body (:outer-body decomposition)
+      :outer-values (:outer-values decomposition)} options)))
+
+(defn- scheduled-mixed-algorithm [source options]
+  (route/schedule-program (mixed-algorithm-program source options) options))
 
 (defn- reason-of
   [thunk]
@@ -360,24 +418,24 @@
                (:plan-id (ex-data exception))))))))
 
 (deftest generic-weighted-reduction-retains-the-common-invocation-boundary
-  (let [typed (assoc (swr-parallel-program)
-                     :source '(let* [out-storage (clojure.core/float-array
-                                                 (clojure.core/* n width))]
-                                out-storage))
-        promoted (route/promote-program
-                  (assoc-in typed [:attributes :allocations]
-                            [{:destination 'out-storage
-                              :source-expression (second (second (:source typed)))}])
-                  {:dtype :float :public-parameters '[x n width]
-                         :array-types {'x :float}
-                         :scalar-types {'n :long 'width :int}})
-        plan (get-in promoted [:attributes :invocation-plan])]
+  (let [typed (swr-parallel-program)
+        ;; This synthetic algorithm has no retained source. Test the common static invocation
+        ;; contract directly; attaching an allocator does not supply its numerical source owner.
+        plan (invocation/from-prefix
+              {:id :source-free-weighted-reduction :parameters '[x n width]
+               :parameter-values (select-keys (:values typed) '[x n width])
+               :bindings [] :binding-values {} :program-values (:values typed)
+               :program-inputs (:inputs typed) :program-outputs (:outputs typed)})
+        promoted (assoc-in typed [:attributes :invocation-plan] plan)]
     (is (= (:equations typed) (:equations promoted)))
     (is (= '[x n width] (mapv :symbol (:parameters plan))))
     (is (= '[x n width] (mapv :program-value (:bindings plan))))
     (is (= '[result] (:program-outputs plan)))
     (is (empty? (:steps plan)) "the device-owned output is not allocated in the host prefix")
-    (is (= plan (invocation/validate-against! plan promoted)))))
+    (is (= plan (invocation/validate-against! plan promoted)))
+    (is (= :invocation-source-order-boundary
+           (reason-of #(invocation/source-order plan promoted)))
+        "a source-free static contract is not whole-source completion evidence")))
 
 (deftest loop-output-feeds-an-ordinary-typed-suffix
   (let [initial (av/tensor {:dtype :double :shape ['extent]
@@ -385,8 +443,7 @@
         options {:dtype :double
                  :values {'u0 initial 'steps (av/tensor {:dtype :long :shape []})}
                  :scalar-types {'steps :long}}
-        decomposition (frontend/form->structured-loop (mixed-source) options)
-        typed (route/program-envelope decomposition options)
+        typed (mixed-algorithm-program (mixed-source) options)
         scheduled (route/schedule-program typed {:target-device :cpu:0 :dtype :double})
         [loop-equation suffix-equation] (:equations typed)
         [scheduled-loop scheduled-suffix] (:equations scheduled)
@@ -394,7 +451,8 @@
     (is (= 2 (count (:equations typed))))
     (is (= [loop-output 'n] (:operands suffix-equation)))
     (is (= '[after] (:outputs typed)))
-    (is (= '[steps n u] (:inputs typed)))
+    (is (= '[steps n scratch u] (:inputs typed))
+        "the source-free numerical fragment receives its external scratch explicitly")
     (is (= true (get-in typed [:attributes :mixed-algorithms])))
     (is (schedule/scheduled-loop? (first (:operations scheduled-loop))))
     (is (segop/segop-node? (first (:operations scheduled-suffix))))
@@ -413,7 +471,7 @@
     (is (= :structured-control-unsupported-suffix
            (reason-of #(route/program-envelope decomposition options))))))
 
-(deftest suffix-shadowing-is-rejected-instead-of-breaking-program-ssa
+(deftest suffix-shadowing-preserves-the-source-scope-with-distinct-program-ssa
   (let [initial (av/tensor {:dtype :double :shape ['extent]
                             :representation {:kind :plain}})
         options {:dtype :double
@@ -423,9 +481,15 @@
                 '[u (raster.par/pmap k n double
                                      (* 2.0 (clojure.core/aget u k)))]
                 'u)
-        decomposition (frontend/form->structured-loop source options)]
-    (is (= :parallel-program-result-redefinition
-           (reason-of #(route/program-envelope decomposition options))))))
+        options (assoc options :public-parameters '[u0 steps] :array-types {'u0 :double})
+        decomposition (frontend/form->structured-loop source options)
+        typed (route/program-envelope decomposition options)
+        loop (some #(when (control/loop-program? (:algorithm %)) %) (:equations typed))
+        suffix (filter #(= :suffix (first (:id %))) (:equations typed))
+        binders (take-nth 2 (second (:source typed)))]
+    (is (= (count binders) (count (distinct binders))))
+    (is (some (set (:results loop)) (mapcat :operands suffix)))
+    (is (not= (:outputs typed) (:results loop)))))
 
 (deftest algorithm-kind-and-operation-kind-must-remain-paired
   (let [initial (av/tensor {:dtype :double :shape ['extent]
@@ -433,8 +497,7 @@
         options {:dtype :double
                  :values {'u0 initial 'steps (av/tensor {:dtype :long :shape []})}
                  :scalar-types {'steps :long}}
-        decomposition (frontend/form->structured-loop (mixed-source) options)
-        typed (route/program-envelope decomposition options)
+        typed (mixed-algorithm-program (mixed-source) options)
         suffix-operation (get-in typed [:equations 1 :operations 0])
         malformed (assoc-in typed [:equations 0 :operations] [suffix-operation])]
     (is (= :parallel-program-algorithm
@@ -444,7 +507,7 @@
 (deftest public-scheduler-selects-the-structured-semantic-program
   (let [initial (av/tensor {:dtype :double :shape ['extent]
                             :representation {:kind :plain}})
-        options {:dtype :double
+        options {:dtype :double :public-parameters '[u0 steps] :array-types {'u0 :double}
                  :target-device :ocl:0
                  :values {'u0 initial 'steps (av/tensor {:dtype :long :shape []})}
                  :scalar-types {'steps :long}}
@@ -456,7 +519,10 @@
     (is (dialects/valid-scheduled-program? (:form scheduled)))
     (is (= :typed-structured-control (get-in scheduled [:stats :source-dialect])))
     (is (= 1 (get-in scheduled [:stats :structured-loops-scheduled])))
-    (is (= 2 (count (:equations (:form scheduled)))))))
+    (is (= 3 (count (remove #(get-in % [:attributes :host-only])
+                           (:equations (:form scheduled)))))
+        "the source copy, loop and suffix all enter the same numerical schedule")
+    (is (some #(= :prefix (first (:id %))) (:equations (:form scheduled))))))
 
 (deftest structured-attempt-exposes-a-coverage-decline
   (let [initial (av/tensor {:dtype :double :shape ['extent]
@@ -489,7 +555,7 @@
                  :target-device :ocl:0
                  :values {'u0 initial 'steps (av/tensor {:dtype :long :shape []})}
                  :scalar-types {'steps :long}}
-        typed (:program (route/attempt (mixed-source) options))
+        typed (mixed-algorithm-program (mixed-source) options)
         algorithm (get-in typed [:equations 1 :algorithm])
         scheduled (:form (segop-lower/segop-lower-pass
                           (typed-route/program-envelope algorithm) options))
@@ -509,7 +575,7 @@
                  :target-device :ocl:0
                  :values {'u0 initial 'steps (av/tensor {:dtype :long :shape []})}
                  :scalar-types {'steps :long}}
-        scheduled (:form (pipeline/schedule-parallel-form (mixed-source) options))
+        scheduled (scheduled-mixed-algorithm (mixed-source) options)
         opaque-source (assoc scheduled :source ::must-not-be-inspected)
         {:keys [program kernels stats]} (program-opencl/emit-program opaque-source options)
         [loop-equation suffix-equation] (:equations program)]
@@ -539,7 +605,7 @@
                  :target-device :ocl:0
                  :values {'u0 initial 'steps (av/tensor {:dtype :long :shape []})}
                  :scalar-types {'steps :long}}
-        scheduled (:form (pipeline/schedule-parallel-form (mixed-source) options))
+        scheduled (scheduled-mixed-algorithm (mixed-source) options)
         scheduled-loop (get-in scheduled [:equations 0 :operations 0])
         calls (atom [])
         emit-graph segop-opencl/generate-kernel-graph]
@@ -555,191 +621,120 @@
              (:scheduled-equation-algorithm iteration-call)))
       (is (= (:body scheduled-loop) (:scheduled-equation-body iteration-call))))))
 
-(deftest real-rk4-pde-reaches-the-equation-first-opencl-vertical
-  (let [arguments [(double-array 8) (double-array 8) 0.1 1.0 0.01 3]
-        compilation (equation-first/compile
-                     #'pde/heat-loss-rk4 {:dtype :double :target :ze:debug})
+(deftest structured-suffix-uses-shared-source-realization-and-allocation-ownership
+  (let [options {:dtype :double :public-parameters '[u0 steps]
+                 :values {'u0 (av/tensor {:dtype :double :shape ['extent]
+                                          :representation {:kind :plain}})
+                          'steps (av/tensor {:dtype :long :shape []})}
+                 :array-types {'u0 :double} :scalar-types {'steps :long}}
+        body (with-meta '(clojure.core/aget u k) {:tag 'double :raster.type/tag 'double})
+        allocated (source-with-suffix
+                   ['out '(clojure.core/double-array n)
+                    'after (list 'raster.par/map! 'out 'k 'n 'double body)] 'after)
+        forbidden (fn [& _] (throw (AssertionError. "producer qualification touched a driver")))]
+    (with-redefs [gpu/make-session forbidden gpu/alloc! forbidden]
+      (doseq [[allocated? source] [[false (mixed-source)] [true allocated]]]
+        (let [semantic (route/program-envelope (frontend/form->structured-loop source options) options)
+              plan (get-in semantic [:attributes :invocation-plan])
+              order (invocation/source-order plan semantic)
+              loop-equation (some #(when (control/loop-program? (:algorithm %)) %) (:equations semantic))
+              suffix (filter #(= :suffix (first (:id %))) (:equations semantic))]
+          (is (some #{'scratch} (map :symbol (:steps plan)))
+              "an observable scratch allocation survives numerical functionalization")
+          (is (not-any? invocation/buffer-clone? (:steps plan))
+              "the initial copy is an ordinary prefix equation, not a second runtime executor")
+          (is (= (mapv :id (:equations semantic)) (vec (keep :equation order))))
+          (is (seq suffix))
+          (is (some (set (:results loop-equation)) (mapcat :operands suffix))
+              "the suffix consumes the loop's actual fresh SSA output")
+          (is (not-any? fn? (tree-seq coll? seq semantic)))
+          (if allocated?
+            (do
+              (is (= 1 (count (filter #(= 'out (:storage %)) order))))
+              (is (= '(clojure.core/double-array n)
+                     (:source-expression (first (filter #(= 'out (:destination %))
+                                                       (get-in semantic [:attributes :allocations])))))))
+            (is (not= (count (second source)) (count (second (:source semantic))))
+                "the actual materialized suffix, not the original binding spine, is retained")))))))
+
+(deftest rk4-source-order-finds-the-original-loop-equation
+  (let [forbidden (fn [& _] (throw (AssertionError. "source correspondence touched a driver")))]
+    (with-redefs [gpu/make-session forbidden gpu/alloc! forbidden]
+      (let [compilation (equation-first/compile #'pde/heat-loss-rk4
+                                               {:target :ze:debug :dtype :double})
+            semantic (:semantic compilation)
+            plan (get-in semantic [:attributes :invocation-plan])
+            equation (first (filter #(control/loop-program? (:algorithm %)) (:equations semantic)))
+            order (invocation/source-order plan semantic)]
+        (is (some? (:source equation)))
+        (is (= equation (program/equation-for-binding semantic (second (:site equation)) (:source equation))))
+        (is (some #(= (:id equation) (:equation %)) order))
+        (is (not-any? fn? (tree-seq coll? seq semantic)))
+        (let [initial (invocation-link/begin-ordered-realization
+                       compilation [(double-array 8) (double-array 8) 0.1 1.0 0.01 3] nil)]
+          (is (identical? initial (invocation-link/validate-ordered-source-actions! initial)))
+          (is (not-any? invocation/buffer-clone? (:steps plan)))
+          (is (empty? (:acquired-storage initial))
+              "source-action coverage grants no native storage or completion")
+          (is (= :emitted-parallel-program-retained-validation
+                 (reason-of #(invocation-link/validate-ordered-source-actions!
+                              (assoc initial :program (assoc (:program initial) :equations [])))))))))))
+
+(deftest real-rk4-pde-retains-the-public-abi-and-typed-emission
+  ;; Runtime materialization and remapping are checked on the completed public
+  ;; owner in ordered-structured-loop-test, not fabricated before source work.
+  (let [compilation (equation-first/compile #'pde/heat-loss-rk4 {:dtype :double :target :ze:debug})
         semantic (:semantic compilation)
         scheduled (:scheduled compilation)
-        emitted {:program (:emitted compilation)
-                 :kernels (:kernels compilation)
-                 :stats (get-in compilation [:stats :emission])}
         emitted-program (:emitted compilation)
         invocation-plan (get-in semantic [:attributes :invocation-plan])
-        materialized
-        (materialization/materialize
-         invocation-plan
-         arguments
-         evaluate-test-scalar)
-        loop-operation (get-in scheduled [:equations 0 :operations 0])
-        loop-equation (first (:equations emitted-program))
+        loop-operation (some #(when (schedule/scheduled-loop? %) %)
+                             (mapcat :operations (:equations scheduled)))
+        loop-equation (some #(when (control/loop-program? (:algorithm %)) %)
+                            (:equations emitted-program))
         trip-count-id (second (control/loop-index (:algorithm loop-equation)))
-        loop-output (-> loop-equation :algorithm control/carried first :output)
-        device-results
-        (set (mapcat :results
-                     (remove #(true? (get-in % [:attributes :host-only]))
-                             (:equations emitted-program))))
-        buffer-ids
-        (into device-results
-              (filter #(seq (:shape (get (:values emitted-program) %)))
-                      (:inputs emitted-program)))
-        buffers (zipmap buffer-ids (map #(keyword (str "rk4-buffer-" (hash %))) buffer-ids))
-        scalar-values
-        (into {}
-              (keep (fn [id]
-                      (when-not (contains? buffer-ids id)
-                        (let [dtype (get-in emitted-program [:values id :dtype])]
-                          [id {:type dtype
-                               :value (case dtype
-                                        :int (if (= id trip-count-id) 2 64)
-                                        :long 2
-                                        :float (float 0.25)
-                                        :double 0.25)}]))))
-              (:inputs emitted-program))
-        host-evaluator
-        (fn [equation {:keys [operands]}]
-          (let [operand-id (first (:operands equation))
-                divisor (double (get-in operands [operand-id :value]))]
-            (into {}
-                  (map (fn [id]
-                         [id {:type (get-in emitted-program [:values id :dtype])
-                              :value (/ 1.0 divisor)}]))
-                  (:results equation))))
-        call (program-call/make emitted-program buffers scalar-values
-                                {loop-output :rk4-carry-scratch} host-evaluator)
-        linked-plan (equation-first/lower compilation arguments)]
+        public-nsteps (:id (first (filter #(= 'nsteps (:symbol %)) (:parameters invocation-plan))))
+        narrowed (first (filter #(some (fn [operand] (= public-nsteps (:value operand))) (:operands %))
+                                (:steps invocation-plan)))]
     (is (equation-first/equation-first-compilation? compilation))
     (is (= :none (get-in compilation [:stats :fallback])))
     (is (= :typed-parallel (:dialect semantic)))
     (is (invocation/invocation-plan? invocation-plan))
-    (is (= '[u0 target alpha inv-dx2 dt nsteps]
-           (mapv :symbol (:parameters invocation-plan))))
+    (is (= '[u0 target alpha inv-dx2 dt nsteps] (mapv :symbol (:parameters invocation-plan))))
     (is (= (:inputs semantic) (mapv :program-value (:bindings invocation-plan))))
-    (is (= 1 (count (filter invocation/shape-projection? (:steps invocation-plan)))))
-    (is (= 1 (count (filter invocation/buffer-clone? (:steps invocation-plan)))))
-    (is (= 4 (count (filter invocation/buffer-allocation? (:steps invocation-plan)))))
-    (let [aliases (filter invocation/value-alias? (:steps invocation-plan))
-          allocation-ids (set (map :id (filter invocation/buffer-allocation?
-                                               (:steps invocation-plan))))
-          input-id (:id (first (:parameters invocation-plan)))]
-      ;; Evaluate-once call frames add aliases of u0. Keep the original
-      ;; four allocation aliases as an independent coverage requirement.
-      (is (= 4 (count (filter #(allocation-ids (:source %)) aliases))))
-      (is (= 4 (count (filter #(= input-id (:source %)) aliases))))
-      (is (= 8 (count aliases))))
+    (is (not-any? invocation/buffer-clone? (:steps invocation-plan))
+        "the initial copy is an ordinary numerical prefix, not a clone executor")
+    (is (= 4 (count (filter invocation/buffer-allocation? (:steps invocation-plan))))
+        "the four retained RK4 scratch constructor intents remain explicit")
+    (is (= 2 (count (filter invocation/shape-projection? (:steps invocation-plan)))))
     (is (= 3 (count (filter invocation/scalar-compute? (:steps invocation-plan)))))
     (is (every? #(not (contains? % :expression)) (:steps invocation-plan)))
-    (is (= (set (:inputs semantic))
-           (set (concat (keys (:program-buffers materialized))
-                        (keys (:program-scalars materialized))))))
-    (is (= 0 (get-in materialized [:attributes :driver-allocations])))
-    (doseq [alias (filter invocation/value-alias? (:steps invocation-plan))]
-      (is (identical? (get-in materialized [:values (:id alias)])
-                      (get-in materialized [:values (:source alias)]))))
-    (let [public-nsteps (:id (first (filter #(= 'nsteps (:symbol %))
-                                            (:parameters invocation-plan))))
-          narrowed (first (filter #(some (fn [operand]
-                                           (= public-nsteps (:value operand)))
-                                         (:operands %))
-                                  (:steps invocation-plan)))
-          bound-nsteps (some (fn [{:keys [invocation-value]}]
-                               (when (= (:id narrowed) invocation-value)
-                                 invocation-value))
-                             (:bindings invocation-plan))]
-      (is (invocation/scalar-compute? narrowed))
-      (is (not= public-nsteps (:id narrowed)))
-      (is (= public-nsteps (-> narrowed :operands first :value)))
-      (is (= (:id narrowed) bound-nsteps)))
+    (is (invocation/scalar-compute? narrowed))
+    (is (not= public-nsteps (:id narrowed)))
+    (is (= :int (get-in narrowed [:value :dtype])))
+    (is (= :int (get-in emitted-program [:values trip-count-id :dtype])))
+    (is (some #(= (:id narrowed) (:invocation-value %)) (:bindings invocation-plan)))
     (is (= :scheduled-parallel (:dialect scheduled)))
-    (is (= 3 (count (:equations scheduled)))
-        "the generic fixpoint, host inv-n, and reduction with a final scalar epilogue represent the RK4 loss")
     (is (= 8 (count (get-in loop-operation [:graph :nodes])))
-        "the loop body is the ordinary stencil/map schedule, not an RK4 primitive")
-    (is (= :opencl-parallel (get-in emitted [:program :dialect])))
-    (is (= 10 (count (:kernels emitted))))
-    (is (= {:structured-loops-emitted 1
-            :typed-equations-emitted 1
-            :host-scalar-equations 1
-            :emission-routes {:kernel-body 10}
-            :kernel-body-declines {}}
-           (:stats emitted)))
-    (let [[partial final] (take-last 2 (:kernels emitted))
+        "ordinary stencil/map scheduling, not an RK4-specific kernel")
+    (is (= :opencl-parallel (:dialect emitted-program)))
+    (is (= 11 (count (:kernels compilation))))
+    (is (= {:structured-loops-emitted 1 :typed-equations-emitted 2 :host-scalar-equations 3
+            :emission-routes {:kernel-body 11} :kernel-body-declines {}}
+           (get-in compilation [:stats :emission])))
+    (let [[partial final] (take-last 2 (:kernels compilation))
           inv-n? #(and (symbol? %) (.startsWith (name %) "inv-n_"))]
       (is (= [:kernel-body :kernel-body]
              (mapv #(get-in % [:attributes :emission-route]) [partial final])))
       (is (not-any? inv-n? (:arguments partial))
           "the pre-combine phase must not apply or even bind the completed-result transform")
       (is (some inv-n? (:arguments final))
-          "only the final reduction phase consumes the scalar epilogue input"))
-    (is (= ["StructuredLoopCall" "EvaluatedHostEquation" "EmittedEquationCall"]
-           (mapv #(-> % class .getSimpleName) (:steps call)))
-        "the real emitted workload must cross the checked runtime-call boundary")
-    (is (= (set (:outputs emitted-program)) (set (keys (:outputs call)))))
-    (is (link/link-plan? linked-plan))
-    (is (link/program-link-instance? (first (:instances linked-plan))))
-    (is (= 2 (count (filter (comp some? :source val) (:nodes linked-plan)))))
-    (is (= 0 (get-in linked-plan [:attributes :driver-allocations])))
-    (is (= 1 (count (:outputs linked-plan))))
-    (let [[compiler-value buffer] (first (:program-buffers materialized))
-          zero-buffer (assoc buffer :source nil :initialization :zero)
-          requires-zero (-> materialized
-                            (assoc-in [:program-buffers compiler-value] zero-buffer)
-                            (assoc-in [:values (:id buffer)] zero-buffer))]
-      (is (= :invocation-link-zero-initializer
-             (reason-of #(invocation-link/lower requires-zero emitted-program
-                                                :ze:debug host-evaluator)))))
-    (let [session (atom {:device-id :ze:debug :closed? false})
-          events (atom [])]
-      (with-redefs [gpu/alloc! (fn [_ specs] (swap! events conj [:allocate (set (keys specs))]))
-                    gpu/buffer-view
-                    (fn [_ key view]
-                      (let [original (first (keep (fn [[_ node]]
-                                                    (when (= (:id view) (get-in node [:view :id]))
-                                                      (:view node)))
-                                                  (:nodes linked-plan)))]
-                        (assert original "mock binding must name a planned physical view")
-                        {:key key :view (bview/view (assoc (:allocation original) :id key) view)}))
-                    gpu/upload-range! (fn [_ view _source spec]
-                                        (swap! events conj [:upload (:key view) spec]))
-                    gpu/bind-kernel-graph! (fn [_ key _graph bindings _scalars _options]
-                                             (swap! events conj [:bind key (set (keys bindings))])
-                                             {:handle key})
-                    gpu/run-kernel-graph! (fn [_ handle]
-                                            (swap! events conj [:run handle]))
-                    gpu/release-kernel-graph! (fn [_ handle]
-                                                (swap! events conj [:release handle]))
-                    gpu/free-buffer! (fn [_ key] (swap! events conj [:free key]))
-                    gpu/record-graph! (fn [& _]
-                                        (throw (AssertionError.
-                                                "program replay must not use descriptor phases")))]
-        (let [executable (gpu-link/instantiate! linked-plan {:session session})]
-          (is (= 4 (count (filter #(= :bind (first %)) @events))))
-          (is (= (set (:outputs linked-plan))
-                 (set (keys (gpu-link/run! executable)))))
-          (is (= 4 (count (filter #(= :run (first %)) @events))))
-          (gpu-link/close! executable)
-          (is (= 4 (count (filter #(= :release (first %)) @events))))
-          (is (= (count (:nodes linked-plan))
-                 (count (filter #(= :free (first %)) @events)))))))
-    (let [sources (program-call/buffer-identities call)
-          mapping (zipmap sources (mapv #(vector :rk4-storage %)
-                                        (range (count sources))))
-          remapped (program-call/map-buffers call mapping)]
-      (is (every? (set (vals mapping)) (vals (:outputs remapped)))
-          "the rank-zero GPU reduction result remains resident storage during remapping"))))
+          "only the final reduction phase consumes the scalar epilogue input"))))
 
-(deftest loop-free-mlp-shares-the-public-equation-first-vertical
-  (let [arguments [(double-array [1.0 0.0 0.0 1.0])
-                   (double-array [0.0 0.0])
-                   (double-array [0.5 0.5])
-                   (double-array [0.25])
-                   (double-array [1.0 -1.0])]
-        compilation (equation-first/compile #'nn/predict-fn {:target :ze:0})
+(deftest mlp-compilation-retains-its-public-typed-abi
+  (let [compilation (equation-first/compile #'nn/predict-fn {:target :ze:0})
         semantic (:semantic compilation)
         invocation-plan (get-in semantic [:attributes :invocation-plan])
-        linked-plan (equation-first/lower compilation arguments)
-        call (get-in linked-plan [:instances 0 :call])
-        staging (program-runtime/staging-plan call :loop-free-mlp)
         first-layer-bias (:id (first (filter #(= 'b1 (:symbol %))
                                             (:parameters invocation-plan))))
         first-layer-rows (:symbol (first (filter #(and (invocation/shape-projection? %)
@@ -747,37 +742,20 @@
                                                    (= 0 (:axis %)))
                                             (:steps invocation-plan))))]
     (is (= :typed-parallel (:dialect semantic)))
-    (let [scope-vars (mapv (fn [[n s]] (ns-resolve n s))
-                           [['raster.compiler.ir.link-plan '*validated-program-instances*]
-                            ['raster.compiler.ir.link-plan '*retained-program-validations*]
-                            ['raster.compiler.ir.link-plan '*caller-options*]
-                            ['raster.compiler.ir.emitted-parallel-program-call '*validated-boundary-projections*]
-                            ['raster.compiler.ir.emitted-parallel-program-call '*validated-projection-policy*]])
-          observed (atom [])
-          observe #(mapv var-get scope-vars)
-          record! (fn [stage] (swap! observed conj [stage (observe)] [stage @(future (observe))]))
-          evaluate-step typed-scalar/evaluate-invocation-step]
-      (with-redefs [typed-scalar/evaluate-invocation-step
-                    (fn [& args] (record! :prefix) (apply evaluate-step args))]
-        (doseq [request [nil {:scalar-math {:overrides {[:tanh :float] :f64-target-library-rte-f32}}}]]
-          (let [proof (emitted-program/validate-with-physical-results! (:emitted compilation) request)
-                projected (with-bindings (assoc (zipmap scope-vars (repeat (Object.)))
-                                               #'equation-first/*lower-observer* (fn [_] (record! :observer)))
-                            (equation-first/lower compilation arguments (fn [p] {:plan p}) proof request))]
-            (is (= (set (:outputs linked-plan)) (set (get-in projected [:plan :outputs]))))
-            (is (link/retained-effect-evidence? (:plan projected) (:effect-evidence projected) request)))))
-      (is (= #{:prefix :observer} (set (map first @observed))))
-      (is (every? #(= (vec (repeat (count scope-vars) nil)) (second %)) @observed)
-          "prefix evaluation and lower observers, including their futures, have no outer proof authority"))
-    (let [request {:scalar-math {:overrides {[:tanh :float] :f64-target-library-rte-f32}}}
-          lower equation-first/lower
-          requests (atom [])]
-      (with-redefs [equation-first/compile (fn [_ options] (is (= request options)) compilation)
-                    equation-first/lower (fn [& args] (swap! requests conj args) (apply lower args))]
-        (is (= (set (:outputs linked-plan))
-               (set (:outputs (equation-first/compile-link-plan #'nn/predict-fn arguments request)))))
-        (is (= [5] (mapv count @requests)))
-        (is (= request (last (first @requests))))))
+    (is (= :none (get-in compilation [:stats :fallback])))
+    (is (= 3 (get-in semantic [:attributes :invocation-shape-equations])))
+    (is (= 4 (get-in semantic [:attributes :invocation-scalar-equations])))
+    (is (= 3 (count (filter invocation/shape-projection? (:steps invocation-plan)))))
+    (is (= 2 (count (get-in compilation [:scheduled :equations])))
+        "pure host scalar/shape equations belong to the typed invocation plan")
+    (is (= 0 (get-in compilation [:stats :emission :host-scalar-equations])))
+    (is (some? first-layer-rows))
+    (is (= '[W1 b1 W2 b2 x] (mapv :symbol (:parameters invocation-plan))))))
+
+(deftest mlp-source-allocation-witnesses-are-exact
+  (let [compilation (equation-first/compile #'nn/predict-fn {:target :ze:0})
+        semantic (:semantic compilation)
+        invocation-plan (get-in semantic [:attributes :invocation-plan])]
     (let [witnesses (mapcat #(get-in % [:attributes :realization-bindings]) (:equations semantic))
           allocation (first (filter #(= :result-allocation (:kind %)) witnesses))]
       (is (some? allocation) "functional map realization certifies its generated allocation")
@@ -824,19 +802,45 @@
                                                      {:public-parameters (mapv :symbol (:parameters invocation-plan))
                                                       :array-types {'W1 :double 'b1 :double 'W2 :double
                                                                     'b2 :double 'x :double}})))
-                "a removable replacement cannot bypass a claimed allocation witness")))))
-    (is (= :none (get-in compilation [:stats :fallback])))
-    (is (= 3 (get-in semantic [:attributes :invocation-shape-equations])))
-    (is (= 4 (get-in semantic [:attributes :invocation-scalar-equations])))
-    (is (= 3 (count (filter invocation/shape-projection? (:steps invocation-plan)))))
-    (is (= 2 (count (get-in compilation [:scheduled :equations])))
-        "pure host scalar/shape equations belong to the typed invocation plan")
-    (is (= 0 (get-in compilation [:stats :emission :host-scalar-equations])))
-    (is (= 2 (count staging)))
-    (is (some? first-layer-rows))
-    (is (every? #(contains? (:scalar-values %) first-layer-rows) staging)
-        "program shape facts remain available when a later kernel has no ABI use for them")
-    (is (= 0 (get-in linked-plan [:attributes :driver-allocations])))
+                "a removable replacement cannot bypass a claimed allocation witness")))))))
+
+(deftest eager-public-boundary-isolates-proof-scopes-and-certifies-independent-intent
+  (let [arguments [(double-array [1.0 -1.0]) (double-array 2) 2.0]
+        compilation (equation-first/compile #'eager-boundary-fixture {:target :ze:0 :dtype :double})
+        semantic (:semantic compilation)
+        invocation-plan (get-in semantic [:attributes :invocation-plan])
+        linked-plan (equation-first/lower compilation arguments)]
+    (let [scope-vars (mapv (fn [[n s]] (ns-resolve n s))
+                           [['raster.compiler.ir.link-plan '*validated-program-instances*]
+                            ['raster.compiler.ir.link-plan '*retained-program-validations*]
+                            ['raster.compiler.ir.link-plan '*caller-options*]
+                            ['raster.compiler.ir.emitted-parallel-program-call '*validated-boundary-projections*]
+                            ['raster.compiler.ir.emitted-parallel-program-call '*validated-projection-policy*]])
+          observed (atom [])
+          observe #(mapv var-get scope-vars)
+          record! (fn [stage] (swap! observed conj [stage (observe)] [stage @(future (observe))]))
+          evaluate-step typed-scalar/evaluate-invocation-step]
+      (with-redefs [typed-scalar/evaluate-invocation-step
+                    (fn [& args] (record! :prefix) (apply evaluate-step args))]
+        (doseq [request [nil {:scalar-math {:overrides {[:tanh :float] :f64-target-library-rte-f32}}}]]
+          (let [proof (emitted-program/validate-with-physical-results! (:emitted compilation) request)
+                projected (with-bindings (assoc (zipmap scope-vars (repeat (Object.)))
+                                               #'equation-first/*lower-observer* (fn [_] (record! :observer)))
+                            (equation-first/lower compilation arguments (fn [p] {:plan p}) proof request))]
+            (is (= (set (:outputs linked-plan)) (set (get-in projected [:plan :outputs]))))
+            (is (link/retained-effect-evidence? (:plan projected) (:effect-evidence projected) request)))))
+      (is (= #{:prefix :observer} (set (map first @observed))))
+      (is (every? #(= (vec (repeat (count scope-vars) nil)) (second %)) @observed)
+          "prefix evaluation and lower observers, including their futures, have no outer proof authority"))
+    (let [request {:scalar-math {:overrides {[:tanh :float] :f64-target-library-rte-f32}}}
+          lower equation-first/lower
+          requests (atom [])]
+      (with-redefs [equation-first/compile (fn [_ options] (is (= request options)) compilation)
+                    equation-first/lower (fn [& args] (swap! requests conj args) (apply lower args))]
+        (is (= (set (:outputs linked-plan))
+               (set (:outputs (equation-first/compile-link-plan #'eager-boundary-fixture arguments request)))))
+        (is (= [5] (mapv count @requests)))
+        (is (= request (last (first @requests))))))
     (let [request {:scalar-math {:overrides {[:tanh :float] :f64-target-library-rte-f32}}}
           emitted (:emitted compilation)
           materialized (materialization/materialize invocation-plan arguments evaluate-test-scalar)
@@ -866,7 +870,16 @@
                    (invocation-link/lower materialized emitted :ze:0 nil
                                           (fn [plan] {:plan plan}) proof)))
       (is (thrown? clojure.lang.ExceptionInfo
-                   (invocation-link/certify (:plan projected) [] request))))))
+                   (invocation-link/certify (:plan projected) [] request))))
+    (let [materialized (materialization/materialize invocation-plan arguments evaluate-test-scalar)
+          buffer (get-in materialized [:program-buffers 'x])
+          uninitialized (assoc buffer :source nil :initialization :zero)
+          changed (-> materialized
+                      (assoc-in [:program-buffers 'x] uninitialized)
+                      (assoc-in [:values (:id buffer)] uninitialized))]
+      (is (= :invocation-link-zero-initializer
+             (reason-of #(invocation-link/lower changed (:emitted compilation) :ze:0 nil)))
+          "a source-free read cannot invent completed initialization for its input"))))
 
 (deftest allocation-shape-definition-remains-an-ordered-host-equation
   (let [source '(let* [size (clojure.core/* nrows width)
@@ -1153,7 +1166,7 @@
         "the logical contraction result is rank zero")
     (is (symbol? host-binding) "the retained source result is the certified host binding")
     (doseq [expression (distinct [host-binding 'out])]
-      (is (= [output] (:outputs (project parallel expression)))
+      (is (= ['out] (:outputs (project parallel expression)))
           "plain result, destination, and certified host-binding returns remain valid")
       (is (= :structured-control-source-result
              (reason-of #(project parallel (retained-core-cast :double expression))))
@@ -1161,7 +1174,7 @@
     (let [bindings (into (vec (second (:source parallel))) ['returned 'out])
           aliased (assoc parallel :source
                          (list (first (:source parallel)) bindings 'returned))]
-      (is (= [output] (:outputs (#'route/validate-source-result! aliased options))))
+      (is (= ['out] (:outputs (#'route/validate-source-result! aliased options))))
       (is (= :structured-control-source-result
              (reason-of #(#'route/validate-source-result!
                           (with-source-return aliased (retained-core-cast :double 'returned))
@@ -1169,7 +1182,7 @@
     (let [bindings (into (vec (second (:source parallel))) [host-binding 'out])
           shadowed (assoc parallel :source
                           (list (first (:source parallel)) bindings host-binding))]
-      (is (= [output] (:outputs (#'route/validate-source-result! shadowed options))))
+      (is (= ['out] (:outputs (#'route/validate-source-result! shadowed options))))
       (is (= :structured-control-source-result
              (reason-of #(#'route/validate-source-result!
                           (with-source-return shadowed (retained-core-cast :double host-binding))
@@ -1183,6 +1196,30 @@
       (is (= :structured-control-source-result
              (reason-of #(project forged 'forged-binding)))
           "a mutable outer host binding cannot manufacture a return projection"))))
+
+(deftest source-buffer-reference-boundaries-require-their-existing-source-owner
+  (let [parallel (rank-zero-contract-program)
+        host-binding (get-in parallel [:equations 0 :attributes :host-binding])
+        source (with-source-return parallel host-binding)
+        options {:source-ns *ns* :public-parameters '[x y out n]
+                 :array-types {'x :double 'y :double 'out :double}}
+        projected (#'route/validate-source-result! source options)
+        without-out (assoc options :public-parameters '[x y n])
+        fake-claim (assoc-in source [:attributes :allocations]
+                             [{:destination 'out :source-expression '(clojure.core/double-array 8)}])
+        shadowed (assoc source :source
+                        (list 'let* (into ['out '(Object.)] (second (:source source))) host-binding))]
+    (is (= ['out] (:outputs projected)))
+    (is (some #{'out} (:inputs projected)))
+    (is (= projected (#'route/validate-source-result! projected options))
+        "re-entry does not duplicate boundary references")
+    (is (= (mapv :operands (:equations source)) (mapv :operands (:equations projected))))
+    (is (= (:effects source) (:effects projected)))
+    (doseq [[candidate request] [[source without-out] [fake-claim without-out] [shadowed options]
+                                [(assoc-in source [:values 'out]
+                                           (av/make {:kind :opaque :dtype :double :shape [8]})) options]]]
+      (is (= :structured-control-source-reference
+             (reason-of #(#'route/validate-source-result! candidate request)))))))
 
 (deftest public-resident-scalar-load-requires-the-inner-reduction-certificate
   (let [source '(let* [left (raster.par/reduce sum (float 0.0) i n
@@ -1267,13 +1304,166 @@
              (reason-of #(validate malformed (retained-aget 0))))
           "malformed inner evidence fails closed at the source-result boundary"))))
 
+(deftest capacity-reference-aliases-respect-source-order-and-conflicts
+  (let [saved (with-meta 'saved {:tag 'java.lang.Object :raster.type/tag 'doubles})
+        identity (completion/complete-value completion/object-input-contract 'x)]
+    (is (= {'saved 'x}
+           (invocation-source/capacity-reference-aliases [[saved identity]] '[x] {'saved 'x})))
+    (is (= :source-capacity-reference-conflict
+           (reason-of #(invocation-source/capacity-reference-aliases
+                        [[saved identity]] '[x y] {'saved 'y}))))
+    (is (= {}
+           (invocation-source/capacity-reference-aliases
+            [['effect '(opaque-call)] ['future '(clojure.core/double-array n)]]
+            '[n] {'effect 'future})))
+    (is (= {}
+           (invocation-source/capacity-reference-aliases
+            [['result '(opaque-call)]] '[n] {'result 'private-destination})))
+    (is (= {'result 'x}
+           (invocation-source/capacity-reference-aliases
+            [['result '(opaque-call)]] '[x] {'result 'x})))
+    (is (= {'saved 'future}
+           (invocation-source/capacity-reference-aliases
+            [[saved (completion/complete-value completion/object-input-contract 'future)]]
+            '[x] {}))
+        "explicit source syntax is retained so the capacity transfer can reject a future operand")))
+
+(deftest allocation-capacity-does-not-borrow-a-later-target-length
+  (let [source '(let* [out (clojure.core/double-array n)
+                       written (raster.par/map! out i n double (clojure.core/aget target i))
+                       later-length (clojure.core/alength target)] out)
+        options {:dtype :double :public-parameters '[target n]
+                 :array-types {'target :double} :scalar-types {'n :long}
+                 :values {'target (av/tensor {:dtype :double :shape ['(extent target)]})}}
+        attempt (:program (typed-route/attempt source :double (:array-types options)
+                                               {:scalar-types (:scalar-types options) :values (:values options)
+                                                :lexical-inputs (:public-parameters options)}))
+        promoted (route/promote-program attempt options)
+        plan (get-in promoted [:attributes :invocation-plan])
+        allocation (first (get-in promoted [:attributes :allocations]))
+        emitted (:program (program-c-family/emit-program
+                           (route/schedule-program promoted options)
+                           (assoc options :target-dialect :opencl-portable)))
+        target (double-array [10.0 20.0 30.0 40.0 50.0 60.0])
+        materialize (fn [n]
+                      (materialization/materialize
+                       plan [target n] #(typed-scalar/evaluate-invocation-step *ns* %1 %2)))]
+    (is (= {:destination 'out :extent 'n :initialization :zero :dtype :double}
+           (select-keys allocation [:destination :extent :initialization :dtype])))
+    (is (= ['n] (get-in promoted [:values 'out :shape])))
+    (is (= {:position 0 :binding 'out :storage 'out
+            :invocation-step (:id (first (:steps plan)))}
+           (first (invocation/source-order plan promoted))))
+    (let [materialized (materialize 2)
+          linked (invocation-link/lower materialized emitted :ocl:0 nil)
+          output-node (get-in linked [:instances 0 :call :buffers 'out])
+          initial (invocation-link/begin-ordered-realization
+                   {:semantic promoted :emitted emitted :target :ocl:0}
+                   [target 2] nil)
+          prepared (invocation-link/prepare-source-allocation
+                    initial
+                    (fn [expression scalars]
+                      (typed-scalar/evaluate-array-size
+                       *ns* (update-vals scalars :value) expression)) nil)]
+      (is (= [2] (get-in linked [:nodes output-node :view :shape])))
+      (is (= 2 (:elements prepared)))
+      (is (= :zero (:initialization prepared)))
+      (is (= :source-allocation (get-in prepared [:state :pending :kind])))
+      (is (empty? (get-in prepared [:state :acquired-storage]))
+          "preparing a source allocation does not claim runtime acquisition or completion")
+      (is (= [6] (get-in materialized [:values (:id (first (:parameters plan))) :shape])))
+      (is (some? (link/validate! linked))))
+    (is (= :program-link-graph-range
+           (reason-of #(invocation-link/lower (materialize 7) emitted :ocl:0 nil)))
+        "inner operation demand remains checked against the unchanged supplied capacity")
+    (is (some? (invocation/source-order plan promoted)))
+    (is (= '(clojure.core/double-array n) (:source-expression allocation))
+        "an unused later capacity read cannot size an earlier source allocation")))
+
+(deftest retained-array-length-observes-capacity-not-the-read-domain
+  (let [source '(let* [out (clojure.core/double-array n)
+                       size (clojure.core/long (clojure.core/alength target))
+                       written (raster.par/map! out i n double
+                                 (+ (clojure.core/aget target i) (double size)))] out)
+        options {:dtype :double :public-parameters '[target n]
+                 :array-types {'target :double} :scalar-types {'n :long}
+                 :values {'target (av/tensor {:dtype :double :shape ['(extent target)]})}}
+        attempt (:program (typed-route/attempt source :double (:array-types options)
+                                               {:scalar-types (:scalar-types options) :values (:values options)
+                                                :lexical-inputs (:public-parameters options)}))
+        promoted (route/promote-program attempt options)
+        plan (get-in promoted [:attributes :invocation-plan])
+        emitted (:program (program-c-family/emit-program
+                           (route/schedule-program promoted options)
+                           (assoc options :target-dialect :opencl-portable)))
+        materialized (materialization/materialize
+                      plan [(double-array 6) 2]
+                      (fn [& _] (throw (ex-info "array length needs no scalar evaluator" {}))))
+        linked (invocation-link/lower materialized emitted :ocl:0 nil)
+        call (get-in linked [:instances 0 :call])]
+    (is (= ['n] (get-in promoted [:values 'out :shape])))
+    (is (= 'n (get-in promoted [:attributes :allocations 0 :extent])))
+    (is (= {:position 0 :binding 'out :storage 'out
+            :invocation-step (:id (first (:steps plan)))}
+           (first (invocation/source-order plan promoted))))
+    (is (= {:type :long :value 6} (get-in call [:scalar-values 'size])))
+    (is (= {:type :long :value 2} (get-in call [:scalar-values 'n])))
+    (is (= [2] (get-in linked [:nodes (get-in call [:buffers 'out]) :view :shape])))
+    (is (= [6] (get-in linked [:nodes (get-in call [:buffers 'target]) :view :shape])))
+    (is (some? (link/validate! linked)))))
+
+(deftest preserved-reference-identities-remain-prefix-roots-when-numerically-dead
+  (let [binder (with-meta 'saved {:tag 'java.lang.Object :raster.type/tag 'doubles})
+        chained (with-meta 'chained {:tag 'java.lang.Object :raster.type/tag 'doubles})
+        identity (vary-meta (completion/complete-value completion/object-input-contract 'x)
+                            assoc :raster.effect/preserve-evaluation true)
+        chained-identity (vary-meta (completion/complete-value completion/object-input-contract binder)
+                                    assoc :raster.effect/preserve-evaluation true)
+        source (list 'let* [binder identity
+                            chained chained-identity
+                            'y '(raster.par/map! out i n double (clojure.core/aget x i))] 'y)
+        options {:dtype :double :public-parameters '[x out n]
+                 :array-types {'x :double 'out :double} :scalar-types {'n :long}}
+        attempt (:program (typed-route/attempt source :double (:array-types options)
+                                               {:scalar-types (:scalar-types options)
+                                                :lexical-inputs (:public-parameters options)}))
+        promoted (route/promote-program attempt options)
+        plan (get-in promoted [:attributes :invocation-plan])
+        alias (first (filter #(= binder (:symbol %)) (:steps plan)))]
+    (is (some? attempt))
+    (is (not (some #{binder} (:inputs promoted))) "no numerical kernel needs the snapshot")
+    (is (invocation/value-alias? alias))
+    (is (= (meta identity) (meta (:source-expression alias))))
+    (is (some #(= (:id alias) (:invocation-step %)) (invocation/source-order plan promoted)))
+    (let [second-alias (first (filter #(= chained (:symbol %)) (:steps plan)))]
+      (is (invocation/value-alias? second-alias))
+      (is (= (:id alias) (:source second-alias)))
+      (is (= (:value alias) (:value second-alias))))
+    (let [future-source (list 'let* [chained chained-identity binder identity
+                                     'y '(raster.par/map! out i n double (clojure.core/aget x i))] 'y)]
+      (is (= :host-abstract-value-reference-alias
+             (reason-of #(route/promote-program
+                          (:program (typed-route/attempt future-source :double (:array-types options)
+                                                          {:scalar-types (:scalar-types options)
+                                                           :lexical-inputs (:public-parameters options)})) options)))
+          "a later definition cannot populate an earlier invocation identity"))
+    (let [ordinary-source (list 'let* [binder (vary-meta identity dissoc :raster.effect/preserve-evaluation)
+                                      'y '(raster.par/map! out i n double (clojure.core/aget x i))] 'y)
+          ordinary (:program (typed-route/attempt ordinary-source :double (:array-types options)
+                                                   {:scalar-types (:scalar-types options)
+                                                    :lexical-inputs (:public-parameters options)}))]
+      (is (not-any? #(= binder (:symbol %))
+                    (get-in (route/promote-program ordinary options) [:attributes :invocation-plan :steps]))
+          "ordinary dead aliases do not acquire evaluation roots"))))
+
 (deftest island-live-outs-do-not-prove-whole-source-completion
   (let [options {:dtype :double :public-parameters '[x out n]
                  :array-types {'x :double 'out :double}
                  :scalar-types {'n :long}}
         attempt (fn [source]
                   (:program (typed-route/attempt source :double (:array-types options)
-                                                 {:scalar-types (:scalar-types options)})))
+                                                 {:scalar-types (:scalar-types options)
+                                                  :lexical-inputs (:public-parameters options)})))
         partial (attempt '(let* [y (raster.par/map! out i n double (clojure.core/aget x i))
                                  loss (opaque-loss y)] loss))]
     (is (= '[y] (:outputs partial)) "the island must still materialize its host consumer's input")
@@ -1288,31 +1478,32 @@
     (doseq [result ['y 'out '[y]]]
       (let [source (list 'let* '[y (raster.par/map! out i n double (clojure.core/aget x i))]
                          result)]
-        (is (= '[y] (:outputs (route/promote-program (attempt source) options))))))
-    (doseq [aliased ['y 'out]]
+        (is (= '[out] (:outputs (route/promote-program (attempt source) options))))))
+    (doseq [aliased ['y 'out]
+            wrap [identity #(completion/complete-value completion/object-input-contract %)]]
       (let [source (list 'let* (into '[y (raster.par/map! out i n double (clojure.core/aget x i))]
-                                   ['returned aliased 'final-result 'returned])
+                                   ['returned (wrap aliased) 'final-result (wrap 'returned)])
                          'final-result)]
-        (is (= '[y] (:outputs (route/promote-program (attempt source) options)))
+        (is (= '[out] (:outputs (route/promote-program (attempt source) options)))
             "exact lexical aliases preserve logical/physical return identity")))
     (let [complete (attempt '(let* [y (raster.par/map! out i n double (clojure.core/aget x i))
                                     z (raster.par/map! x i n double (clojure.core/aget out i))]
                                    [z y]))]
-      (is (= '[z y] (:outputs (route/promote-program complete options)))
+      (is (= '[x out] (:outputs (route/promote-program complete options)))
           "public unique leaves retain source traversal order rather than island sorting"))
     (let [partial (attempt '(let* [y (raster.par/map! out i n double (clojure.core/aget x i))
                                    logged (clojure.core/println y)] y))]
-      (is (= :structured-control-host-continuation
+      (is (= :structured-control-prefix-value
              (reason-of #(route/promote-program partial options)))
           "return coverage alone cannot justify dropping an intervening host effect")
-      (is (= :structured-control-host-continuation
+      (is (= :structured-control-prefix-value
              (reason-of #(route/promote-program
                           (assoc-in partial [:attributes :host-binding-ids] []) options)))
           "deleting advisory host IDs cannot make an unexecuted effect disappear"))
     (let [complete (attempt '(let* [y (raster.par/map! out i n double (clojure.core/aget x i))]
                                    y))
           extra-output (assoc complete :outputs (conj (:outputs complete) 'x))]
-      (is (= '[y] (:outputs (route/promote-program extra-output options)))
+      (is (= '[out] (:outputs (route/promote-program extra-output options)))
           "the public projection must not expose an unrelated island live-out")
       (is (= (:equations extra-output) (:equations (route/promote-program extra-output options)))
           "output projection retains internal equations and effects for explicit physical escapes")
@@ -1335,6 +1526,34 @@
                (reason-of #(route/promote-program
                             (assoc complete :source (list 'let* ['y replacement] 'y)) options)))
             "removability cannot authorize a stale equation for a claimed binding")))))
+
+(deftest used-buffer-completion-keeps-the-original-kernel-dependency
+  (let [options {:dtype :double :public-parameters '[x out n]
+                 :array-types {'x :double 'out :double} :scalar-types {'n :long}}
+        prepare (fn [wrap]
+                  (let [source (list 'let*
+                                     (into '[y (raster.par/map! out i n double
+                                                               (clojure.core/aget x i))]
+                                           ['returned (wrap 'y)
+                                            'z '(raster.par/map! x i n double
+                                                                 (clojure.core/aget returned i))])
+                                     'z)
+                        result (typed-route/attempt
+                                source :double (:array-types options)
+                                {:scalar-types (:scalar-types options)
+                                 :lexical-inputs (:public-parameters options)})]
+                    (route/promote-program (:program result) options)))
+        plain (prepare identity)
+        completed (prepare #(completion/complete-value completion/object-input-contract %))]
+    (is (= 2 (count (:equations completed))))
+    (is (= (mapv #(select-keys % [:operands :results :effects :algorithm]) (:equations plain))
+           (mapv #(select-keys % [:operands :results :effects :algorithm]) (:equations completed)))
+        "completion must not disconnect the second kernel from the first writer")
+    (is (= (:inputs plain) (:inputs completed)))
+    (is (not-any? #{'returned} (:inputs completed))
+        "a result alias is not a new public device input")
+    (is (= '[x] (:outputs completed))
+        "the source returns the destination, not the second kernel's traversal view")))
 
 (deftest checked-prefix-equations-are-not-pruned-into-the-invocation-prefix
   (let [source '(let* [checked (clojure.core/int n)
@@ -1426,7 +1645,7 @@
                   :target-device :ocl:0
                   :values {'u0 initial 'steps (av/tensor {:dtype :long :shape []})}
                   :scalar-types {'steps :long}}
-         scheduled (:form (pipeline/schedule-parallel-form source options))
+         scheduled (scheduled-mixed-algorithm source options)
          emitted (:program (program-opencl/emit-program
                             (assoc scheduled :source ::must-not-be-inspected) options))
          loop-equation (first (:equations emitted))
@@ -1951,12 +2170,113 @@
 
 (deftest scheduled-loop-consumers-read-physical-result-storage
   (let [graph (-> (prepared-mixed-call 1) :call :steps first :graph)
-        [producer consumer] (:nodes graph)]
+        [producer consumer] (:nodes graph)
+        temporary-ids (mapv :id (:temporaries graph))
+        temporary-id (first temporary-ids)]
     (is (= '[rstr_loop_carry_4] (mapv :id (:inputs graph))))
-    (is (= '[scratch] (mapv :id (:temporaries graph))))
-    (is (some #(and (= 'scratch (:buffer %)) (= :read (:access %))) (:uses consumer)))
+    (is (= 1 (count temporary-ids)))
+    (is (some #(and (= temporary-id (:buffer %)) (= :write (:access %))) (:uses producer)))
+    (is (some #(and (= temporary-id (:buffer %)) (= :read (:access %))) (:uses consumer)))
     (is (= [(:id producer)] (:dependencies consumer)))
     (is (not-any? #(= 'rstr_loop_value_0 (:buffer %)) (:uses consumer)))))
+
+(deftest loop-boundary-accesses-use-outer-identities-not-inner-port-names
+  (let [step (-> (prepared-mixed-call 1) :call :steps first)
+        algorithm (get-in step [:schedule :algorithm])
+        {:keys [initial parameter output]} (first (control/carried algorithm))
+        boundary {:operation (emitted-loop/make (:schedule step) (:graph step))
+                  :graph (:graph step)}
+        access #(#'invocation-link/boundary-buffer-access boundary %)]
+    (is (= :read (access initial)) "out-of-place repetition preserves the initial buffer")
+    (is (= :write (access output)) "the logical carry result names its physical output port")
+    (is (nil? (access parameter)) "an inner binder is not a public outer input")
+    (is (nil? (access 'scratch))
+        "a lowered compiler-private temporary is not an external scratch write")
+    (is (nil? (access 'n)) "an invariant scalar is not a buffer access")))
+
+(deftest selected-loop-stage-is-a-fresh-numerical-fragment-with-bounded-replay
+  (doseq [trips [0 1 2 5 6]]
+    (let [original (:call (prepared-mixed-call trips))
+          program (:program original)
+          equation (first (:equations program))
+          {:keys [call buffers]}
+          (program-call/make-equation-program-call
+           program (:id equation) {:buffers (:entry-buffers original)
+                                   :scalar-values (:scalar-values original)
+                                   :loop-scratch (:loop-scratch original)} nil nil)
+          events (atom [])
+          prepared (program-runtime/prepare-with!
+                    call
+                    {:bind! (fn [_ _ bindings _]
+                              (swap! events conj [:bind bindings]) bindings)
+                     :run! #(swap! events conj [:run %])
+                     :release! #(swap! events conj [:release %])})]
+      (is (nil? (get-in call [:program :source])))
+      (is (= [equation] (get-in call [:program :equations])))
+      (is (= (first (:steps original)) (first (:steps call))))
+      (is (= buffers (:buffers call)))
+      (is (= (:outputs (first (:steps original))) (:outputs call)))
+      (is (= (:outputs call) (program-runtime/run-prepared! prepared)))
+      (program-runtime/release-prepared! prepared)
+      (is (= trips (count (filter #(= :run (first %)) @events))))
+      (is (= (min trips 3) (count (filter #(= :bind (first %)) @events))))
+      (is (= (min trips 3) (count (filter #(= :release (first %)) @events)))))))
+
+(deftest in-place-loop-access-keeps-readonly-and-initialized-read-obligations
+  (let [original (:loop (loop-decomposition))
+        body (control/body original)
+        facts (-> (soac/facts body)
+                  (assoc :effects #{:memory/write})
+                  (assoc-in [:equations 'advance :effects] #{:memory/write})
+                  (assoc-in [:equations 'advance :aliases] {'u-next 'u-in})
+                  (assoc-in [:equations 'advance :attributes :result-storage]
+                            [{:destination 'u-in :access :read-write :host-return :buffer}]))
+        body (soac/make facts (soac/equations body) (soac/outputs body))
+        algorithm (control/make (assoc (control/facts original) :effects #{:memory/write})
+                                (control/loop-index original) (control/invariants original)
+                                (control/carried original) body (control/outer-values original))
+        options {:dtype :float :target-device :ocl:0}
+        program (:program (program-opencl/emit-program
+                           (route/schedule-program (route/program-envelope {:loop algorithm}) options)
+                           options))
+        operation (get-in program [:equations 0 :operations 0])
+        boundary {:operation operation :graph (:graph operation)}
+        call (program-call/make program {'u :state 'u-final :state}
+                                {'steps {:type :long :value 3} 'n {:type :int :value 64}} {} nil)
+        instance (link/program-instance {:id :in-place-loop :call call})
+        request (fn [role source]
+                  {:id :in-place-plan :target :ocl:0
+                   :nodes [(link/node {:id :state :dtype :float :shape [64] :device :ocl:0
+                                       :role role :source source})]
+                   :values [(link/value {:id :state :abstract (av/tensor {:dtype :float :shape [64]})
+                                         :leaves [{:name :value :node :state}]})]
+                   :instances [instance] :outputs [:state]})]
+    (is (= :read-write (#'invocation-link/boundary-buffer-access boundary 'u)))
+    (is (= :read-write (#'invocation-link/boundary-buffer-access boundary 'u-final)))
+    (is (= :link-write-read-only (reason-of #(link/make (request :input (float-array 64))))))
+    (is (= :link-read-before-write (reason-of #(link/make (request :internal nil)))))
+    (let [{:keys [plan effect-evidence]} (link/make-with-effect-evidence (request :state (float-array 64)))
+          contract (first (link/relative-entry-contracts! plan effect-evidence [[:in-place-loop]]))]
+      (is (= #{:state} (:requires contract)) "a complete overwrite cannot erase the preceding read")
+      (is (= #{:state} (:full-produces contract))))))
+
+(deftest selected-loop-stage-does-not-admit-a-different-equation-or-frozen-induction
+  (let [original (:call (prepared-mixed-call 3 (mixed-source)))
+        program (:program original)
+        [loop-equation suffix] (:equations program)
+        make-stage #(program-call/make-equation-program-call
+                     program % {:buffers (:entry-buffers original)
+                                :scalar-values (:scalar-values original)
+                                :loop-scratch (:loop-scratch original)} nil nil)]
+    (is (= [suffix] (get-in (make-stage (:id suffix)) [:call :program :equations]))
+        "flat and loop equations use the same numerical stage constructor")
+    (is (= :emitted-program-ready-equation (reason-of #(make-stage :absent))))
+    (is (= :parallel-program-dynamic-loop-binding
+           (reason-of #(program-runtime/prepare-with!
+                        (:call (make-stage (:id loop-equation)))
+                        {:bind! (fn [& _] (throw (AssertionError. "changing induction was bound")))
+                         :run! (fn [& _] (throw (AssertionError. "changing induction was run")))
+                         :release! (fn [& _] nil)}))))))
 
 (deftest structured-loop-staging-is-bounded-by-carry-rotation-not-trip-count
   (let [{:keys [call]} (prepared-mixed-call 9)
@@ -2156,8 +2476,7 @@
                  :target-device :ocl:0
                  :values {'u0 initial 'steps (av/tensor {:dtype :long :shape []})}
                  :scalar-types {'steps :long}}
-        scheduled (:form (pipeline/schedule-parallel-form
-                          (mixed-source-without-induction) options))
+        scheduled (scheduled-mixed-algorithm (mixed-source-without-induction) options)
         base (:program (program-opencl/emit-program
                         (assoc scheduled :source ::must-not-be-inspected) options))
         loop-equation (first (:equations base))

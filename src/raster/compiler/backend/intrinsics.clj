@@ -152,7 +152,8 @@
            ;; Source overloads are not homogeneous FP intrinsics. Typed lowering expands
            ;; these into ordinary SSA before target emission; raw legacy :round is separate.
            :typed-expansion :java-round :source-signatures {:float :int :double :long}}
-   :neg   {:arity 1 :kind :fn :wasm (vt3 :f64.neg :f32.neg nil) :c {:prefix "-"} :wgsl {:prefix "-"}}
+   :neg   {:arity 1 :kind :fn :primitive-fp-total true
+           :wasm (vt3 :f64.neg :f32.neg nil) :c {:prefix "-"} :wgsl {:prefix "-"}}
    ;; math — binary
    :min {:arity 2 :kind :fn :wasm (vt3 :f64.min :f32.min nil) :c {:fn "fmin" :glsl "min"} :wgsl {:fn "min"}
          :native-c (native-extremum :min)}

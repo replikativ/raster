@@ -8,6 +8,7 @@
             [raster.compiler.ir.emitted-equation-dispatch :as equation-dispatch]
             [raster.compiler.ir.emitted-parallel-equation :as emitted-equation]
             [raster.compiler.ir.emitted-structured-loop :as emitted-loop]
+            [raster.compiler.ir.invocation-plan :as invocation]
             [raster.compiler.ir.kernel-artifact :as artifact]
             [raster.compiler.ir.numerical-contract :as numerics]
             [raster.compiler.ir.parallel-program :as program]
@@ -115,6 +116,95 @@
   (filterv #(not (true? (get-in % [:attributes :host-only])))
            (get-in candidate [:body :equations])))
 
+(defn equation-fragment
+  "Construct an exact equation view without execution, retaining revalidatable parent provenance.
+   No source, InvocationPlan, completion authority or validation seal is transferred."
+  [parallel-program equation-id]
+  (program/validate! parallel-program)
+  (when (contains? (:attributes parallel-program) ::equation-origin)
+    (throw (ex-info "nested emitted equation origins are not supported"
+                    {:reason :emitted-parallel-program-fragment-origin})))
+  (let [equation (some #(when (= equation-id (:id %)) %) (:equations parallel-program))]
+    (when-not (and equation (not (true? (get-in equation [:attributes :host-only]))))
+      (throw (ex-info "an emitted fragment requires an existing numerical equation"
+                      {:reason :emitted-parallel-program-fragment-equation
+                       :equation equation-id})))
+    (let [prefix (if (emitted-loop/emitted-loop? (first (:operations equation))) []
+                    (filterv #(true? (get-in % [:attributes :host-only]))
+                             (take-while #(not= equation-id (:id %))
+                                         (:equations parallel-program))))
+          equations (conj prefix equation)]
+      (program/make
+       {:dialect (:dialect parallel-program) :values (:values parallel-program)
+        :inputs (program/infer-inputs equations) :outputs (:results equation)
+        :equations equations :effects (reduce set/union #{} (map :effects equations))
+        :source nil :provenance {:source :ordered-numerical-fragment :equation equation-id}
+        :attributes (assoc (select-keys (:attributes parallel-program) [:allocations])
+                           ::equation-origin {:program parallel-program :equation-id equation-id})}))))
+
+(defn- canonical-candidate-source-region!
+  "Recover one exact scheduled source region from already validated emitted alternatives."
+  [equation candidates]
+  (let [regions (mapv candidate-numerical-equations candidates)
+        canonical (first regions)
+        source-equations (get-in equation [:attributes :emitted-source-equations])
+        exact-region?
+        (if source-equations
+          #(= source-equations (mapv :id %))
+          #(and (= 1 (count %))
+                (= (scheduled-equation-view equation)
+                   (scheduled-equation-view (first %)))))]
+    (when-not (and (seq regions)
+                   (every? exact-region? regions)
+                   ;; Each candidate already validates its own target schedule. Distinct
+                   ;; reference/subgroup operations must retain the same semantic source,
+                   ;; not the same independently certified physical schedule.
+                   (every? #(semantic-fingerprint/equivalent?
+                             (mapv scheduled-equation-view canonical)
+                             (mapv scheduled-equation-view %))
+                           (next regions)))
+      (throw (ex-info "emitted alternatives differ from their retained scheduled source region"
+                      {:reason :emitted-parallel-program-source-region
+                       :outer-equation (:id equation)
+                       :expected-source-equations source-equations
+                       :actual-source-equations (mapv #(mapv :id %) regions)
+                       :ir :emitted-parallel-program})))
+    canonical))
+
+(defn- expanded-source-program!
+  "Reconstruct the exact scheduled equation spine retained inside validated emitted candidates.
+
+   Compound emission replaces constituent IDs on the outer spine. The candidate body deliberately
+   retains those scheduled constituents, so validation expands them here without reparsing source
+   or trusting `:emitted-source-equations` alone. The original InvocationPlan remains the boundary
+   owner and must match the expanded dataflow before it can contribute scalar constraints."
+  [parallel-program candidates-for]
+  (let [{:keys [equations regions]}
+        (reduce
+         (fn [{:keys [equations regions]} equation]
+           (let [candidates (when-let [operation (first (:operations equation))]
+                              (seq (candidates-for operation)))
+                 region (if candidates
+                          (canonical-candidate-source-region! equation (vec candidates))
+                          [equation])]
+             {:equations (into equations region)
+              :regions (assoc regions (:id equation) region)}))
+         {:equations [] :regions {}} (:equations parallel-program))
+        plan (get-in parallel-program [:attributes :invocation-plan])
+        plan (when plan (invocation/validate! plan))
+        source-inputs (if plan (:program-inputs plan) (:inputs parallel-program))
+        source-outputs (if plan (:program-outputs plan) (:outputs parallel-program))]
+    (when-not (= source-outputs (:outputs parallel-program))
+      (throw (ex-info "expanded emitted constituents differ from the retained invocation boundary"
+                      {:reason :emitted-parallel-program-source-boundary
+                       :expected-outputs source-outputs
+                       :actual-outputs (:outputs parallel-program)
+                       :ir :emitted-parallel-program})))
+    {:program (program/validate!
+               (assoc parallel-program :inputs source-inputs :equations (vec equations)
+                      :outputs source-outputs))
+     :regions regions}))
+
 (defn- validate-host-prefix-slices!
   "Bind every narrowed emitted body to its exact enclosing host-scalar execution prefix.
 
@@ -123,6 +213,24 @@
    substituting a different (though locally valid) prefix: its host equations, terminal numerical
    equation, inferred inputs, outputs, and effects must be the exact slice of this program."
   [parallel-program candidates-for]
+  (let [;; validate-program! has independently checked this exact parent/view relation.
+        ;; The origin is ordinary provenance, never a stored guard or validation capability.
+        source-context (or (get-in parallel-program [:attributes ::equation-origin :program])
+                           parallel-program)
+        {source-program :program source-regions :regions}
+        (when (equation-graph/invocation-scalar-proof-demand-for-regions?
+               source-context
+               (for [equation (:equations parallel-program)
+                     candidate (candidates-for (first (:operations equation)))]
+                 (candidate-numerical-equations candidate)))
+          (expanded-source-program! source-context candidates-for))
+        numerical-equations (filterv #(not (true? (get-in % [:attributes :host-only])))
+                                     (:equations parallel-program))
+        expected-by-equation
+        (when source-program
+          (zipmap (mapv :id numerical-equations)
+                  (equation-graph/invocation-scalar-preconditions-for-regions
+                   source-program (mapv #(get source-regions (:id %)) numerical-equations))))]
   (loop [host-prefix [] remaining (:equations parallel-program)]
     (when-let [equation (first remaining)]
       (if (true? (get-in equation [:attributes :host-only]))
@@ -135,6 +243,10 @@
                                          body-equations)
                   numerical-body (candidate-numerical-equations candidate)
                   source-equations (get-in equation [:attributes :emitted-source-equations])
+                  expected-invocation-preconditions
+                  (get expected-by-equation (:id equation) [])
+                  actual-invocation-preconditions
+                  (equation-graph/body-invocation-scalar-preconditions body)
                   exact-source?
                   (if source-equations
                     (= source-equations (mapv :id numerical-body))
@@ -158,6 +270,8 @@
                                     {:reason :emitted-reduction-outer-slice
                                      :equation (:id equation)})))))
               (when-not (and (= host-prefix actual-prefix)
+                             (= expected-invocation-preconditions
+                                actual-invocation-preconditions)
                              exact-source?
                              (= expected-inputs (:inputs body))
                              (= (:results equation) (:outputs body))
@@ -169,9 +283,13 @@
                                  :actual-prefix (mapv :id actual-prefix)
                                  :expected-source-equations source-equations
                                  :actual-source-equations (mapv :id numerical-body)
+                                 :expected-invocation-scalar-preconditions
+                                 expected-invocation-preconditions
+                                 :actual-invocation-scalar-preconditions
+                                 actual-invocation-preconditions
                                  :expected-inputs expected-inputs :actual-inputs (:inputs body)
                                  :ir :emitted-parallel-program})))))
-          (recur host-prefix (next remaining)))))))
+          (recur host-prefix (next remaining))))))))
 
 (defn- validate-program!
   [parallel-program candidates-fn caller-options]
@@ -182,7 +300,20 @@
                      :dialect (:dialect parallel-program)
                      :supported (set (keys dialect-targets))
                      :ir :emitted-parallel-program})))
-  (let [candidate-cache (java.util.IdentityHashMap.)
+  (let [origin (get-in parallel-program [:attributes ::equation-origin])
+        _ (when (contains? (:attributes parallel-program) ::equation-origin)
+            (when-not (and (map? origin) (= #{:program :equation-id} (set (keys origin))))
+              (throw (ex-info "emitted equation origin requires an exact parent and equation"
+                              {:reason :emitted-parallel-program-fragment-origin})))
+            ;; Revalidate under CURRENT caller intent. A copied seal or embedded guard vector
+            ;; is never authority, and equation-fragment rejects nested origins before recursion.
+            (let [expected (equation-fragment (:program origin) (:equation-id origin))]
+              (validate-program! (:program origin) #(equation-candidates % caller-options)
+                                 caller-options)
+              (when-not (= expected parallel-program)
+                (throw (ex-info "emitted fragment differs from its exact parent equation view"
+                                {:reason :emitted-parallel-program-fragment-origin})))))
+        candidate-cache (java.util.IdentityHashMap.)
         candidates-for (fn [operation]
                          ;; A validation invocation checks an immutable operation repeatedly:
                          ;; semantic boundary, enclosing host prefix, and target membership.
@@ -240,7 +371,9 @@
    Nested control remains in its enclosing equation's algorithm; this does not flatten loops.
    Every dispatch alternative must preserve the same semantic projection. This is structural
    provenance, not a proof of an application's mathematical interpretation of these equations."
-  [parallel-program caller-options]
+  ([parallel-program caller-options]
+   (numerical-equations-for-request parallel-program caller-options false))
+  ([parallel-program caller-options include-host?]
   (if (nil? caller-options)
     (validate! parallel-program)
     (validate! parallel-program caller-options))
@@ -249,7 +382,8 @@
          (mapcat
           (fn [equation]
             (cond
-              (true? (get-in equation [:attributes :host-only])) []
+              (true? (get-in equation [:attributes :host-only]))
+              (if include-host? [(scheduled-equation-view equation)] [])
               (seq (get-in equation [:attributes :emitted-source-equations]))
               (let [expected (get-in equation [:attributes :emitted-source-equations])
                     projections
@@ -270,13 +404,85 @@
     (when-not (= (count equations) (count (distinct (map :id equations))))
       (throw (ex-info "retained semantic equations require distinct identities"
                       {:reason :emitted-program-semantic-identities})))
-    equations))
+    equations)))
 
 (defn retained-numerical-equations
   "Project retained numerical equations only after independent validation under caller intent."
   ([parallel-program] (numerical-equations-for-request parallel-program nil))
   ([parallel-program caller-options]
    (numerical-equations-for-request parallel-program caller-options)))
+
+(defn emission-inputs
+  "Physical inputs of an emitted equation spine. Compound regions eliminate internal
+   intermediates; unchanged spines retain the scheduled entry interface. This constructor
+   policy is shared by emission and checked logical projection, not an arbitrary subset rule."
+  [scheduled emitted-equations]
+  (if (some #(seq (get-in % [:attributes :emitted-source-equations])) emitted-equations)
+    (program/infer-inputs emitted-equations)
+    (:inputs scheduled)))
+
+(defn- retained-schedule-matches?
+  "Relate a scheduled peer to checked emitted alternatives. Attached invocation-plan
+   correspondence is exact identity, not ownership proof or portable numerical data."
+  [emitted scheduled equations caller-options]
+  (program/validate! scheduled)
+  (let [by-id (into {} (map (juxt :id identity)) (:equations scheduled))
+        numerical-boundary #(update (select-keys % [:values :outputs :effects :attributes])
+                                    :attributes dissoc :invocation-plan)]
+    (and (contains? #{:segop :scheduled-parallel} (:dialect scheduled))
+         (= (contains? (:attributes scheduled) :invocation-plan)
+            (contains? (:attributes emitted) :invocation-plan))
+         (identical? (get-in scheduled [:attributes :invocation-plan])
+                     (get-in emitted [:attributes :invocation-plan]))
+         (= (:inputs emitted) (emission-inputs scheduled (:equations emitted)))
+         (semantic-fingerprint/equivalent?
+          (numerical-boundary scheduled) (numerical-boundary emitted))
+         (= (mapv :id (:equations scheduled)) (mapv :id equations))
+         (every?
+          (fn [equation]
+            (if (true? (get-in equation [:attributes :host-only]))
+              (semantic-fingerprint/equivalent? equation (get by-id (:id equation)))
+              (some (fn [candidate]
+                      (every? #(semantic-fingerprint/equivalent? % (get by-id (:id %)))
+                              (candidate-numerical-equations candidate)))
+                    (equation-candidates (first (:operations equation)) caller-options))))
+          (:equations emitted)))))
+
+(defn retained-typed-program-view
+  "Project a flat TypedSOAC analysis view only after checking the actual emitted program.
+   Retained algorithms, checked host prefixes and allocation context remain authoritative;
+   target operations are not accepted by tag or silently discarded before validation.
+   An optional scheduled peer must match actual retained source schedules, not just their tags.
+   This is not an executable, original-entry completion or invocation-plan capability.
+   Mixed algorithm families abstain rather than broadening semantic analyses."
+  ([parallel-program] (retained-typed-program-view parallel-program nil nil))
+  ([parallel-program caller-options]
+   (retained-typed-program-view parallel-program nil caller-options))
+  ([parallel-program scheduled-peer caller-options]
+   (let [equations (numerical-equations-for-request parallel-program caller-options true)]
+     (when (and (every? #(soac/program-form? (:algorithm %)) equations)
+                ;; Without a checked peer, a physical compound interface may have lost
+                ;; logical intermediates. Abstain rather than invent external inputs.
+                (or scheduled-peer
+                    (set/subset? (set (program/infer-inputs equations))
+                                 (set (:inputs parallel-program))))
+                (or (nil? scheduled-peer)
+                    (retained-schedule-matches? parallel-program scheduled-peer equations caller-options)))
+       (program/make
+        {:dialect :typed-soac :source nil
+         :values (:values parallel-program)
+         :inputs (:inputs (or scheduled-peer parallel-program))
+         :outputs (:outputs parallel-program) :effects (:effects parallel-program)
+         :diagnostics (:diagnostics parallel-program)
+         :provenance (assoc (:provenance parallel-program) :pass :retained-typed-analysis)
+         :attributes (dissoc (:attributes parallel-program) :invocation-plan)
+         :equations (mapv (fn [equation]
+                            (with-meta
+                              (program/map->ProgramEquation
+                               (assoc equation :operations
+                                      (if (true? (get-in equation [:attributes :host-only]))
+                                        [] (soac/equations (:algorithm equation)))))
+                              (meta equation))) equations)})))))
 
 (def ^:private validation-evidence-seal-token (Object.))
 
@@ -328,6 +534,25 @@
   ([parallel-program evidence] (checked-retained-validation-for-request! parallel-program evidence nil))
   ([parallel-program evidence caller-options]
    (checked-retained-validation-for-request! parallel-program evidence caller-options)))
+
+(defn ^:no-doc checked-equation-fragment-validation!
+  "Consume one fragment's own sealed validation after authenticating its exact parent/equation.
+
+   The fragment validation is independently sealed to the complete immutable fragment. This
+   accessor neither reconstructs that fragment nor lends the parent's validation authority."
+  [parent-program equation-id evidence caller-options]
+  (let [fragment (:program evidence)
+        evidence (if (nil? caller-options)
+                   (checked-retained-validation! fragment evidence)
+                   (checked-retained-validation! fragment evidence caller-options))
+        origin (get-in fragment [:attributes ::equation-origin])]
+    (when-not (and (map? origin)
+                   (identical? parent-program (:program origin))
+                   (= equation-id (:equation-id origin)))
+      (throw (ex-info "retained fragment validation does not belong to this parent equation"
+                      {:reason :emitted-parallel-program-fragment-validation
+                       :equation equation-id :ir :emitted-parallel-program})))
+    evidence))
 
 (defn- physical-validation-for-request!
   "Independently validate a program and retain read-only exact-operation projections.

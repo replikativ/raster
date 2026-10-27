@@ -23,7 +23,7 @@
                             (vals (:invocation-catalog emission))))]
     {:emission emission :read read :primal @receiver})))
 
-(deftest outlined-index-preserves-physical-ports-overflow-and-raw-narrowing
+(deftest outlined-index-preserves-physical-ports-and-source-checked-narrowing
   (let [{:keys [emission read primal]} (owned-read)
         observed (bytecode/retained-array-read emission read)
         region (bytecode/compile-array-index-region emission read)
@@ -34,8 +34,8 @@
     (is (= Integer/TYPE (.getReturnType ^java.lang.reflect.Method (:method region))))
     (is (= #{'i 'stride 'offset} (set (:parameters region))))
     (is (= 7 (invoke 2 3 1)))
-    (is (= 0 (invoke 0 1 4294967296)))
-    (is (= 2.0 (primal (double-array [2.0]) 0 1 4294967296)))
+    (is (thrown? ArithmeticException (invoke 0 1 4294967296)))
+    (is (thrown? ArithmeticException (primal (double-array [2.0]) 0 1 4294967296)))
     (is (= -1 (invoke 0 1 -1)))
     (is (thrown? ArithmeticException (invoke Long/MAX_VALUE 2 0)))
     (is (thrown? ArithmeticException (invoke Long/MAX_VALUE 1 1)))
@@ -51,6 +51,27 @@
           outer (first (filter #(= 'xs (:array %)) reads))]
       (is (some? outer))
       (is (false? (:primitive-index? outer))))))
+
+(deftest outlined-index-replays-its-historical-policy-not-the-consumers
+  (doseq [policy [false true :warn-on-boxed]]
+    (let [v (binding [*ns* (the-ns 'raster.compiler.backend.jvm.array-index-region-test)
+                      *unchecked-math* policy]
+              (eval (list 'deftm (gensym "historical-index-")
+                          '[xs :- (Array double) i :- Long] ':- 'Double
+                          '(clojure.core/aget xs i))))
+          {:keys [emission read primal]} (owned-read v)
+          observed (bytecode/retained-array-read emission read)
+          region (binding [*unchecked-math* (not policy)]
+                   (bytecode/compile-array-index-region emission read))]
+      (is (= {:unchecked-math policy}
+             (get-in observed [:index-completion :source-policy])))
+      (is (= 0 ((:invoke region) 0)))
+      (if policy
+        (do (is (= 0 ((:invoke region) 4294967296)))
+            (is (= 2.0 (primal (double-array [2.0]) 4294967296))))
+        (do (is (thrown? ArithmeticException ((:invoke region) 4294967296)))
+            (is (thrown? ArithmeticException
+                         (primal (double-array [2.0]) 4294967296))))))))
 
 (deftest index-siblings-use-a-direct-primitive-call-and-retain-their-declaring-owner
   (let [{:keys [emission read]} (owned-read)

@@ -42,6 +42,81 @@
         "unsupported descriptive objects cannot supply an equality witness")
     (is (= {} (proof/parallel-environment-before program (assoc consumer :id :absent))))))
 
+(defn- outer-equation
+  [subprogram]
+  (let [equation (first (dialect/equations subprogram))]
+    {:id (second equation)
+     :operands (:inputs (dialect/facts subprogram))
+     :results (dialect/outputs subprogram)
+     :algorithm subprogram
+     :effects #{}
+     :operations (dialect/equations subprogram)}))
+
+(deftest component-predecessor-proof-needs-one-exact-contiguous-boundary
+  (let [scalar-value (fn [dtype] (av/tensor {:dtype dtype :shape []}))
+        values {'m (scalar-value :long) 'n (scalar-value :long)
+                'total (scalar-value :long) 'i (scalar-value :int)
+                'current (scalar-value :long) 'after (scalar-value :long)
+                'future (scalar-value :long)}
+        product '(= product [total]
+                   (scalar {:dtypes [:long]} [m n]
+                           (lambda [a b] (region [] [(clojure.core/* a b)]))))
+        product-program
+        (dialect/make
+         (dialect/default-program-facts
+          {:values values :inputs '[m n]
+           :equations {'product (dialect/default-equation-facts)}})
+         [product] '[total])
+        first-equation '(= component-first [current]
+                          (scalar {:dtypes [:long]} [total i]
+                                  (lambda [size ordinal] (region [] [size]))))
+        second-equation '(= component-second [after]
+                           (scalar {:dtypes [:long]} [current]
+                                   (lambda [value] (region [] [value]))))
+        component
+        (dialect/make
+         (dialect/default-program-facts
+          {:values values :inputs '[total i]
+           :equations {'component-first (dialect/default-equation-facts)
+                       'component-second (dialect/default-equation-facts)}})
+         [first-equation second-equation] '[after])
+        component-outers (mapv outer-equation (dialect/equation-subprograms component))
+        predecessor {:id :product :operands '[m n] :results '[total]
+                     :algorithm product-program :effects #{}
+                     :operations (dialect/equations product-program)}
+        future {:id :future :operands '[m] :results '[future]
+                :algorithm (dialect/make
+                            (dialect/default-program-facts
+                             {:values values :inputs '[m]
+                              :equations {'future-equation (dialect/default-equation-facts)}})
+                            ['(= future-equation [future]
+                                (scalar {:dtypes [:long]} [m]
+                                        (lambda [value] (region [] [value]))))]
+                            '[future])
+                :effects #{} :operations []}
+        parallel {:values values :inputs '[m n i]
+                  :equations (vec (concat [predecessor] component-outers [future]))}
+        context {:parallel-program parallel :component component}
+        environment (proof/component-environment-before context)]
+    (is (proof/same-volume? environment 'total '[m n]))
+    (is (= :int (:dtype (get environment 'i))))
+    (is (= {:const 1 :factors ['i]} (:product (get environment 'i))))
+    (is (not (proof/same-volume? environment 'i '[m n])))
+    (is (not-any? #(contains? environment %) '[current after future])
+        "current and future definitions never enter the predecessor environment")
+    (doseq [changed
+            [(assoc context :component (dialect/remap-values component {'after 'foreign-after}))
+             (assoc-in context [:parallel-program :equations]
+                       (vec (concat [predecessor] (take 1 component-outers) [future])))
+             (assoc-in context [:parallel-program :equations]
+                       (vec (concat [predecessor] component-outers component-outers [future])))
+             (assoc-in context [:parallel-program :equations]
+                       (vec (concat [predecessor] (reverse component-outers) [future])))
+             (assoc-in context [:parallel-program :values 'total :dtype] :int)
+             (update-in context [:parallel-program :equations 1 :algorithm]
+                        dialect/remap-values {'current 'copied-current})]]
+      (is (= {} (proof/component-environment-before changed))))))
+
 (deftest extent-equality-is-a-proof-not-cast-stripping
   (doseq [extent ['(* m n) '(* n m) '(* (long m) n) '(* m (* n 1))]]
     (is (proof/same-volume? environment extent '[m n])))

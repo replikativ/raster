@@ -9,7 +9,7 @@
            [java.math BigDecimal BigInteger]
            [java.nio.charset StandardCharsets]
            [java.security MessageDigest]
-           [java.util UUID]))
+           [java.util IdentityHashMap UUID]))
 
 (def schema :raster.semantic-fingerprint/v1)
 
@@ -37,10 +37,10 @@
               r (bit-and 0xff (aget right index))]
           (if (= l r) (recur (inc index)) (compare l r)))))))
 
-(declare canonical-bytes)
+(declare ^:private encode-bytes)
 
-(defn- sorted-encodings [values]
-  (sort unsigned-byte-compare (map canonical-bytes values)))
+(defn- sorted-encodings [context values]
+  (sort unsigned-byte-compare (map #(encode-bytes context %) values)))
 
 (defn- semantic-metadata [value]
   (when (instance? clojure.lang.IObj value)
@@ -49,25 +49,25 @@
 
 (declare encode-value!)
 
-(defn- encode-map! [^DataOutputStream out entries]
+(defn- encode-map! [^DataOutputStream out context entries]
   (let [encoded
         (sort (fn [[left-key left-value] [right-key right-value]]
                 (let [key-order (unsigned-byte-compare left-key right-key)]
                   (if (zero? key-order)
                     (unsigned-byte-compare left-value right-value)
                     key-order)))
-              (map (fn [[key value]] [(canonical-bytes key) (canonical-bytes value)]) entries))]
+              (map (fn [[key value]] [(encode-bytes context key) (encode-bytes context value)]) entries))]
     (.writeInt out (count encoded))
     (doseq [[key value] encoded]
       (write-bytes! out key)
       (write-bytes! out value))))
 
-(defn- encode-sequential! [^DataOutputStream out values]
+(defn- encode-sequential! [^DataOutputStream out context values]
   (.writeInt out (count values))
   (doseq [value values]
-    (write-bytes! out (canonical-bytes value))))
+    (write-bytes! out (encode-bytes context value))))
 
-(defn- encode-raw! [^DataOutputStream out value]
+(defn- encode-raw! [^DataOutputStream out context value]
   (cond
     (nil? value) (.writeByte out 0)
     (false? value) (.writeByte out 1)
@@ -120,44 +120,62 @@
 
     (ratio? value)
     (do (.writeByte out 19)
-        (write-bytes! out (canonical-bytes (numerator value)))
-        (write-bytes! out (canonical-bytes (denominator value))))
+        (write-bytes! out (encode-bytes context (numerator value)))
+        (write-bytes! out (encode-bytes context (denominator value))))
 
     (instance? UUID value)
     (do (.writeByte out 20)
         (.writeLong out (.getMostSignificantBits ^UUID value))
         (.writeLong out (.getLeastSignificantBits ^UUID value)))
 
+    ;; Only the private pair-local source comparison supplies this context.
+    ;; No Class name, identity hash or portable handle representation is used.
+    (and context (class? value))
+    (let [^IdentityHashMap identities context
+          ordinal (if (.containsKey identities value)
+                    (.get identities value)
+                    (let [ordinal (.size identities)]
+                      (.put identities value ordinal)
+                      ordinal))]
+      (.writeByte out 21)
+      (.writeInt out (int ordinal)))
+
     (record? value)
     (do (.writeByte out 30)
         (write-text! out (.getName (class value)))
-        (encode-map! out value))
+        (encode-map! out context value))
 
     (map? value)
-    (do (.writeByte out 31) (encode-map! out value))
+    (do (.writeByte out 31) (encode-map! out context value))
 
     (vector? value)
-    (do (.writeByte out 32) (encode-sequential! out value))
+    (do (.writeByte out 32) (encode-sequential! out context value))
 
     (list? value)
-    (do (.writeByte out 33) (encode-sequential! out value))
+    (do (.writeByte out 33) (encode-sequential! out context value))
 
     (set? value)
     (do (.writeByte out 34)
-        (let [values (sorted-encodings value)]
+        (let [values (sorted-encodings context value)]
           (.writeInt out (count values))
           (doseq [encoded values] (write-bytes! out encoded))))
 
     (sequential? value)
-    (do (.writeByte out 35) (encode-sequential! out value))
+    (do (.writeByte out 35) (encode-sequential! out context value))
 
     :else (fail! value)))
 
-(defn- encode-value! [^DataOutputStream out value]
-  (encode-raw! out value)
+(defn- encode-value! [^DataOutputStream out context value]
+  (encode-raw! out context value)
   (if-let [metadata (semantic-metadata value)]
-    (do (.writeByte out 1) (write-bytes! out (canonical-bytes metadata)))
+    (do (.writeByte out 1) (write-bytes! out (encode-bytes context metadata)))
     (.writeByte out 0)))
+
+(defn- encode-bytes [context value]
+  (let [buffer (ByteArrayOutputStream.)]
+    (with-open [out (DataOutputStream. buffer)]
+      (encode-value! out context value))
+    (.toByteArray buffer)))
 
 (defn canonical-bytes
   "Return the canonical byte encoding of a supported pure compiler value.
@@ -165,10 +183,19 @@
    Source-location metadata is intentionally ignored. Other metadata, including type tags, is
    semantic and participates. Functions, Vars, namespaces, arrays and runtime handles fail loud."
   [value]
-  (let [buffer (ByteArrayOutputStream.)]
-    (with-open [out (DataOutputStream. buffer)]
-      (encode-value! out value))
-    (.toByteArray buffer)))
+  (encode-bytes nil value))
+
+(defn retained-source-equivalent?
+  "Exact process-local comparison of retained source, additionally allowing Class identity.
+   All ordinary semantic encoding rules still apply. Classes compare by actual
+   identity within this ONE pair, including inside metadata/maps/sets. Distinct
+   loaders' same-named Classes are different. No local bytes or context escape;
+   this boolean is not a portable fingerprint, ownership proof or cache key.
+   Other runtime objects remain unsupported even when identical on both sides."
+  [left right]
+  (let [context (IdentityHashMap.)]
+    (java.util.Arrays/equals ^bytes (encode-bytes context left)
+                            ^bytes (encode-bytes context right))))
 
 (defn equivalent?
   "Exact canonical semantic equality, including floating-point bits and type metadata.

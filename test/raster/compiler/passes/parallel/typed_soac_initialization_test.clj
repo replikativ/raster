@@ -22,6 +22,20 @@
 (defn- program [source]
   (frontend/form->program source {:dtype :double :array-types {'input :float 'output :float}}))
 
+(defn- with-first-body-result
+  "Alter one scalar region while retaining its equation ID and boundary value facts."
+  [equation result]
+  (let [equation (vec equation)
+        operation (vec (nth equation 3))
+        lambda-index (dec (count operation))
+        lambda (vec (nth operation lambda-index))
+        region (vec (nth lambda 2))
+        results (assoc (vec (nth region 2)) 0 result)
+        region (apply list (assoc region 2 results))
+        lambda (apply list (assoc lambda 2 region))
+        operation (apply list (assoc operation lambda-index lambda))]
+    (apply list (assoc equation 3 operation))))
+
 (deftest zero-initialization-needs-full-coverage-not-write-permission
   (doseq [[extent fills elided] [[4 1 0] [8 0 1]]]
     (let [source (source '(float-array 8) extent)
@@ -122,24 +136,88 @@
         extent (first (nth definition 2))
         projection {:typed-program p :outputs (dialect/outputs p)}
         scalar-entry {:kind :typed-soac :equation-id (second definition)}
+        source-entry {:kind :source-action :description {:sym extent} :source-reads []}
         writer-entry {:kind :typed-soac :equation-id (second writer)}
-        component {:entries [writer-entry] :prefix [scalar-entry] :suffix []}
-        narrowed (#'route/typed-component-program projection component)
-        [scheduled stats] (initialization/materialize narrowed)]
-    (is (not (some #{extent} (:inputs (dialect/facts narrowed)))))
-    (is (not (some #{extent} (get-in (dialect/facts narrowed) [:attributes :source-bindings]))))
-    (is (some? (get (extent-proof/initial-environment narrowed) extent)))
-    (is (= 1 (:initialization-fills stats)))
-    (is (some #{extent} (:inputs (dialect/facts scheduled))))
-    (is (= scheduled (dialect/validate! scheduled)))
-    ;; The same scalar is unavailable when it has not executed in this component's prefix.
-    ;; Do not turn a future source binding into an incoming value merely because it has a type.
-    (let [future (#'route/typed-component-program
-                  projection (assoc component :prefix [] :suffix [scalar-entry]))]
-      (is (nil? (get (extent-proof/initial-environment future) extent)))
-      (is (= :typed-soac-initialization-contract
-             (try (initialization/materialize future) nil
-                  (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))))
+        component {:entries [writer-entry] :suffix []}]
+    (doseq [[producer prefix] [[:typed-scalar [scalar-entry]]
+                               [:source-action [source-entry]]]]
+      (let [narrowed (#'route/typed-component-program projection (assoc component :prefix prefix))
+            [scheduled stats] (initialization/materialize narrowed)]
+        (is (not (some #{extent} (:inputs (dialect/facts narrowed)))) (name producer))
+        (is (not (some #{extent} (get-in (dialect/facts narrowed) [:attributes :source-bindings])))
+            (name producer))
+        (is (some? (get (extent-proof/initial-environment narrowed) extent)) (name producer))
+        (is (= 1 (:initialization-fills stats)) (name producer))
+        (is (some #{extent} (:inputs (dialect/facts scheduled))) (name producer))
+        (is (= scheduled (dialect/validate! scheduled)) (name producer))))
+    ;; The same scalar is unavailable when either kind of producer has not executed in this
+    ;; component's prefix. Do not turn a future binding into an incoming value merely because
+    ;; it has a type or a retained source description.
+    (doseq [[producer future-entry] [[:typed-scalar scalar-entry]
+                                     [:source-action source-entry]]]
+      (let [future (#'route/typed-component-program
+                    projection (assoc component :prefix [] :suffix [future-entry]))]
+        (is (nil? (get (extent-proof/initial-environment future) extent)) (name producer))
+        (is (= :typed-soac-initialization-contract
+               (try (initialization/materialize future) nil
+                    (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))
+            (name producer))))))
+
+(deftest checked-predecessor-product-can-discharge-a-later-component-overwrite
+  (let [options {:dtype :float :array-types {'input :float 'output :float}
+                 :scalar-types {'n :long 'width :long
+                                'allocation-count :long 'write-count :long}}
+        source (frontend/normalize-source
+                '(let* [allocation-count (* n width)
+                        write-count (* width n)
+                        output (float-array allocation-count)
+                        written (raster.par/map! output i write-count nil (aget input i))]
+                   written)
+                options)
+        captured (atom nil)
+        materialize initialization/materialize
+        routed (with-redefs [initialization/materialize
+                             (fn [program context]
+                               (when (some #(= 'output (:destination %))
+                                           (get-in (dialect/facts program) [:attributes :allocations]))
+                                 (reset! captured {:program program :context context}))
+                               (materialize program context))]
+                 (route/attempt source :float (:array-types options)
+                                (assoc options :segmented-plans? true
+                                               :resident-initialization? true)))
+        _ (when-not (and (:program routed) @captured)
+            (throw (ex-info "test needs the actual production initialization boundary"
+                            {:reason :missing-test-component-boundary})))
+        {:keys [program context]} @captured
+        component program
+        [_ ordinary] (initialization/materialize component)
+        [scheduled bridged] (initialization/materialize component context)
+        foreign (dialect/make (dialect/facts component)
+                              [(with-first-body-result
+                                 (first (dialect/equations component)) '(float 0.0))]
+                              (dialect/outputs component))
+        [_ foreign-ordinary] (initialization/materialize foreign)
+        [_ foreign-context] (initialization/materialize foreign context)]
+    (is (= 1 (:initialization-fills ordinary)))
+    (is (zero? (:initialization-full-overwrites ordinary)))
+    (is (zero? (:initialization-fills bridged)))
+    (is (= 1 (:initialization-full-overwrites bridged)))
+    (is (= (dialect/equations component) (dialect/equations scheduled))
+        "the predecessor proof elides a fill without copying executable equations")
+    (is (= foreign-ordinary foreign-context)
+        "a different current algorithm with the same IDs and scalar facts cannot consume proof")
+    (doseq [changed [(assoc context :component
+                            (dialect/make (dialect/facts component)
+                                          (dialect/equations component)
+                                          (dialect/outputs component)))
+                     (assoc-in context [:parallel-program :values 'n :dtype] :int)
+                     (assoc context :component
+                            (dialect/make
+                             (assoc-in (dialect/facts component) [:values 'n :representation]
+                                       {:kind :resident-scalar-buffer :elements 1})
+                             (dialect/equations component) (dialect/outputs component)))]]
+      (is (= ordinary (second (initialization/materialize component changed)))
+          "foreign or mismatched scalar facts contribute no predecessor proof"))))
 
 (deftest total-functional-domains-include-boundaries-and-scan-results
   (doseq [operation ['(raster.par/scan output accumulator (float 0.0) i 8 float

@@ -1,7 +1,10 @@
 (ns raster.compiler.passes.parallel.scheduled-equation-graph-test
   (:require [clojure.test :refer [deftest is]]
+            [raster.compiler.backend.gpu.parallel-program-c-family :as c-family]
             [raster.compiler.pipeline :as pipeline]
             [raster.compiler.ir.abstract-value :as av]
+            [raster.compiler.ir.emitted-parallel-program :as emitted-program]
+            [raster.compiler.ir.invocation-plan :as invocation]
             [raster.compiler.ir.parallel-program :as program]
             [raster.compiler.ir.kernel-precondition :as precondition]
             [raster.compiler.ir.kernel-graph-call :as graph-call]
@@ -14,6 +17,7 @@
             [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]
             [raster.compiler.passes.parallel.map-read-requirements :as map-reads]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
+            [raster.compiler.passes.parallel.structured-control-route :as structured-route]
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
             [raster.compiler.passes.parallel.typed-soac-route :as route]
             [raster.compiler.passes.parallel.typed-soac-projection :as projection]
@@ -86,6 +90,22 @@
                                            (clojure.core/float doubled)))]
      second-effect))
 
+(def ^:private invocation-scalar-source
+  (let [product
+        (with-meta
+          '(.invk raster.numeric/_star__m_long_long-impl
+                  (clojure.core/long rows) (clojure.core/long width))
+          {:raster.op/original 'raster.numeric/*
+           :raster.type/tag 'long :tag 'long})]
+    (list 'let*
+          ['slab product
+           'written
+           '(raster.par/map! out i rows float
+                             (clojure.core/+
+                              (clojure.core/aget x (clojure.core/+ i slab))
+                              (clojure.core/float width)))]
+          'written)))
+
 (defn- scheduled-three-maps []
   (let [options {:dtype :float :target-device :ocl:0
                  :array-types {'x :float 'tmp :float 'middle :float 'out :float}
@@ -101,6 +121,26 @@
         typed (frontend/form->program scalar-gap-source options)
         envelope (route/program-envelope typed)]
     (:form (segop-lower/segop-lower-pass envelope options))))
+
+(defn- scheduled-invocation-scalar-program []
+  (let [options {:dtype :float :target-device :ocl:0
+                 :public-parameters '[x out rows width]
+                 :array-types {'x :float 'out :float}
+                 :scalar-types {'rows :long 'width :long 'slab :long}
+                 :values {'x (av/tensor {:dtype :float :shape ['(extent x)]})
+                          'out (av/tensor {:dtype :float :shape ['(extent out)]})}}
+        typed (:program
+               (route/attempt invocation-scalar-source :float (:array-types options)
+                              {:scalar-types (:scalar-types options)
+                               :values (:values options)
+                               :lexical-inputs (:public-parameters options)}))
+        promoted (structured-route/promote-program typed options)]
+    (structured-route/schedule-program promoted options)))
+
+(defn- emitted-invocation-scalar-program []
+  (:program
+   (c-family/emit-program (scheduled-invocation-scalar-program)
+                          {:target-dialect :opencl-portable :dtype :float})))
 
 (defn- reason-of [thunk]
   (try
@@ -416,6 +456,194 @@
     (is (= (mapv :id numerical) (mapv :id (subvec (:equations body) 1))))
     (is (= 2 (count (:nodes graph))))))
 
+(deftest invocation-scalars-retain-typed-equality-guards-for-read-proofs
+  (let [scheduled (scheduled-invocation-scalar-program)
+        [equation] (filterv #(not (true? (get-in % [:attributes :host-only])))
+                            (:equations scheduled))
+        {:keys [body graph]} (equation-graph/make-for-equation scheduled equation)
+        constraints (equation-graph/body-invocation-scalar-preconditions body)
+        condition (first constraints)]
+    (is (= 1 (count constraints)))
+    (is (= 'slab (:expression condition)))
+    (is (= := (:op condition)))
+    (is (= #{'rows 'width} (launch/expression-references (:value condition))))
+    (is (= :long (launch/typed-expression-dtype
+                  (:value condition) {'rows :long 'width :long})))
+    (is (= condition (first (:preconditions graph)))
+        "the same typed projection supplies graph read definitions and an executable guard")
+    (is (true? (precondition/check! constraints {'slab 6 'rows 2 'width 3})))
+    (is (= :kernel-precondition-failed
+           (reason-of #(precondition/check! constraints {'slab 0 'rows 2 'width 3})))
+        "a zero traversal extent cannot bypass the scalar equality guard")))
+
+(deftest scalar-proof-batches-share-only-the-current-source-check
+  (let [scheduled (scheduled-invocation-scalar-program)
+        plan (get-in scheduled [:attributes :invocation-plan])
+        region (filterv #(not (true? (get-in % [:attributes :host-only])))
+                        (:equations scheduled))
+        expected (equation-graph/invocation-scalar-preconditions scheduled region)
+        structural (atom 0) correspondence (atom 0)
+        validate invocation/validate!
+        validate-against invocation/validate-against!]
+    (is (seq expected))
+    (with-redefs [invocation/validate!
+                  (fn [candidate]
+                    (when (identical? plan candidate) (swap! structural inc))
+                    (validate candidate))
+                  invocation/validate-against!
+                  (fn [candidate source]
+                    (when (and (identical? plan candidate) (identical? scheduled source))
+                      (swap! correspondence inc))
+                    (validate-against candidate source))]
+      (doseq [call [1 2]]
+        (is (= [expected expected]
+               (equation-graph/invocation-scalar-preconditions-for-regions
+                scheduled [region region])))
+        (is (= (* 2 call) @structural)
+            "one structural projection check plus validate-against's independent check")
+        (is (= call @correspondence) "the next public call must check the source again"))
+      (is (equation-graph/invocation-scalar-proof-demand-for-regions?
+           scheduled [region region]))
+      (is (= 5 @structural))
+      (is (= 2 @correspondence) "demand is not a source-correspondence proof")
+      (is (= [[]] (equation-graph/invocation-scalar-preconditions-for-regions scheduled [[]])))
+      (is (= 6 @structural))
+      (is (= 2 @correspondence) "guard-free regions impose no unrelated source correspondence"))
+    (is (= :scheduled-equation-region
+           (reason-of #(equation-graph/invocation-scalar-preconditions-for-regions
+                        scheduled [region [(assoc (first region) :id :foreign-region)]]))))
+    (is (= :invocation-program-mismatch
+           (reason-of #(equation-graph/invocation-scalar-preconditions-for-regions
+                        (assoc scheduled :outputs []) [region region]))))))
+
+(deftest invocation-scalar-captures-substitute-simultaneously
+  (let [project #'equation-graph/project-integral-launch-expression
+        product (with-meta '(clojure.core/* a 2) {:raster.type/tag 'long})
+        expression (with-meta (list 'clojure.core/+ product 'b)
+                     {:raster.type/tag 'long})
+        identity-projection
+        (project 'result expression '[a b] (constantly :long) :long
+                 {'a (launch/runtime-value 'a) 'b (launch/runtime-value 'b)}
+                 (constantly :long))
+        swapped-projection
+        (project 'result expression '[a b] (constantly :long) :long
+                 {'a (launch/runtime-value 'b) 'b (launch/runtime-value 'a)}
+                 (constantly :long))]
+    (is (= 11 (launch/resolve-expression {'a 3 'b 5} identity-projection)))
+    (is (= 13 (launch/resolve-expression {'a 3 'b 5} swapped-projection))
+        "a replacement leaf is not recursively reinterpreted as another lexical capture")))
+
+(deftest invocation-scalar-body-contract-rejects-cycles-width-changes-and-foreign-values
+  (let [scheduled (scheduled-invocation-scalar-program)
+        equation (first (filter #(not (true? (get-in % [:attributes :host-only])))
+                                (:equations scheduled)))
+        body (:body (equation-graph/make-for-equation scheduled equation))
+        [condition] (equation-graph/body-invocation-scalar-preconditions body)
+        reason #(reason-of (fn [] (equation-graph/body-invocation-scalar-preconditions %)))]
+    (is (= :scheduled-equation-invocation-scalar-preconditions
+           (reason (assoc-in body [:values 'slab :dtype] :int)))
+        "a retained RHS cannot silently widen to the LHS dtype")
+    (is (= :kernel-precondition-scope
+           (reason (assoc-in body [:attributes :invocation-scalar-preconditions 0 :value]
+                             'foreign)))
+        "the guard cannot import a scalar outside the actual body ABI")
+    (is (= :scheduled-equation-invocation-scalar-preconditions
+           (reason (update-in body [:attributes :invocation-scalar-preconditions]
+                              conj {:expression 'rows :op := :value (:expression condition)})))
+        "no equality RHS may depend on any equality-defined LHS")))
+
+(deftest emitted-equation-fragments-revalidate-their-exact-parent-origin
+  (let [parent (emitted-invocation-scalar-program)
+        equation (first (remove #(true? (get-in % [:attributes :host-only]))
+                                (:equations parent)))
+        fragment (emitted-program/equation-fragment parent (:id equation))
+        origin-key :raster.compiler.ir.emitted-parallel-program/equation-origin
+        numerical-index (dec (count (:equations fragment)))
+        guard-path [:equations numerical-index :operations 0 :body
+                    :attributes :invocation-scalar-preconditions]]
+    (is (seq (get-in fragment guard-path)))
+    (is (= fragment (emitted-program/validate! fragment)))
+    (is (= fragment (:program (emitted-program/validate-with-physical-results! fragment))))
+    (is (nil? (:source fragment)))
+    (is (not (contains? (:attributes fragment) :invocation-plan)))
+    (is (= #{origin-key} (set (remove #{:allocations} (keys (:attributes fragment))))))
+    (doseq [changed [(assoc-in fragment [:attributes origin-key :equation-id] :foreign)
+                     (assoc-in fragment [:attributes origin-key :program] nil)
+                     (assoc fragment :source '(invented-source))
+                     (assoc fragment :outputs [])
+                     (assoc-in fragment guard-path [])
+                     (update fragment :attributes dissoc origin-key)]]
+      (is (thrown? clojure.lang.ExceptionInfo (emitted-program/validate! changed))))
+    (is (= :emitted-parallel-program-fragment-origin
+           (reason-of #(emitted-program/equation-fragment fragment (:id equation)))))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (emitted-program/validate! fragment {:scalar-math {:overrides {[:tanh :float] :foreign}}})))
+    ;; Parent provenance is independently checked data, not a seal that can bless a
+    ;; changed body merely by rebuilding an otherwise exact fragment around it.
+    (let [parent-index (first (keep-indexed #(when (= (:id equation) (:id %2)) %1)
+                                           (:equations parent)))
+          changed-parent (assoc-in parent
+                                   [:equations parent-index :operations 0 :body :attributes
+                                    :invocation-scalar-preconditions] [])
+          changed-fragment (emitted-program/equation-fragment changed-parent (:id equation))]
+      (is (thrown? clojure.lang.ExceptionInfo (emitted-program/validate! changed-fragment))))))
+
+(deftest emitted-program-rederives-invocation-scalar-constraints-from-the-source-plan
+  (let [emitted (emitted-invocation-scalar-program)
+        equation-index (first (keep-indexed (fn [index equation]
+                                              (when-not (true? (get-in equation
+                                                                       [:attributes :host-only]))
+                                                index))
+                                            (:equations emitted)))
+        operation-path [:equations equation-index :operations 0]
+        condition (first (get-in emitted
+                                 (into operation-path
+                                       [:body :attributes :invocation-scalar-preconditions])))
+        changed (update condition :value #(launch/sum % 1))
+        rebuild-dataflow
+        (fn [candidate body]
+          (let [source-graph (equation-graph/make (:algorithm candidate) body)
+                emitted-graph (:graph candidate)
+                nodes (mapv (fn [source-node emitted-node]
+                              (assoc source-node :operation (:operation emitted-node)))
+                            (:nodes source-graph) (:nodes emitted-graph))]
+            (assoc candidate :body body
+                   :graph (assoc source-graph :nodes nodes
+                                 :abi (:abi emitted-graph)
+                                 :arguments (:arguments emitted-graph)))))
+        remove-condition
+        (fn [candidate]
+          (rebuild-dataflow
+           candidate (update-in (:body candidate) [:attributes]
+                                dissoc :invocation-scalar-preconditions)))
+        change-condition
+        (fn [candidate update-graph?]
+          (let [candidate (assoc-in candidate
+                                    [:body :attributes :invocation-scalar-preconditions 0] changed)]
+            (if update-graph?
+              (rebuild-dataflow candidate (:body candidate))
+              candidate)))]
+    (is (= emitted (emitted-program/validate! emitted)))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (emitted-program/validate!
+                  (update-in emitted operation-path
+                             #(update-in % [:body :attributes]
+                                         dissoc :invocation-scalar-preconditions))))
+        "removing a body guard cannot retain its unchanged derived graph")
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (emitted-program/validate!
+                  (update-in emitted operation-path #(change-condition % false))))
+        "altering a body guard cannot retain its unchanged derived graph")
+    (is (= :emitted-parallel-program-host-prefix
+           (reason-of #(emitted-program/validate!
+                        (update-in emitted operation-path remove-condition))))
+        "a coherently removed body/graph guard still differs from the original InvocationPlan")
+    (is (= :emitted-parallel-program-host-prefix
+           (reason-of #(emitted-program/validate!
+                        (update-in emitted operation-path
+                                   (fn [candidate] (change-condition candidate true))))))
+        "a coherent body/graph mutation cannot replace the source-derived equality")))
+
 (deftest scheduled-graph-checks-each-retained-host-algorithm-once
   (let [scheduled (scheduled-scalar-gap)
         numerical (filterv (comp seq :operations) (:equations scheduled))
@@ -503,6 +731,8 @@
                               parallel-program equation)
         node (first (:nodes graph))]
     (is (= [equation] (:equations body)))
+    (is (not (contains? (:attributes body) :invocation-scalar-preconditions))
+        "the separate segmented-plan graph does not retain guards it cannot emit")
     (is (= (:dialect parallel-program) (:dialect body)))
     (is (= plan (:operation node)))
     (is (= (mapv :id (:operands plan)) (mapv :id (:inputs graph))))

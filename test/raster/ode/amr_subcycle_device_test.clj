@@ -10,6 +10,7 @@
             [raster.gpu.completed-evidence-device-test :as producer]
             [raster.gpu.device-probe :as opencl]
             [raster.gpu.link :as link]
+            [raster.gpu.value :as value]
             [raster.ode.amr-subcycle :as subcycle]
             [raster.ode.amr-subcycle-test :as oracle]
             [raster.runtime.numerical-content :as content]
@@ -90,13 +91,23 @@
                   (let [first-cycle (compiled/invoke-compiled c {})]
                     ;; The second cycle consumes resident outputs directly; the
                     ;; public invocation handoff owns any D2D copies and alias retirement.
-                    (compiled/invoke-compiled c {:coarse (:coarse-out first-cycle)
-                                                 :fine (:fine-out first-cycle)})
-                    (into {} (map (fn [key]
-                                    [key (vec (link/download (:executable c)
-                                                            (output-node prepared key)))]))
-                          [:coarse-out :fine-out]))
+                    (let [second-cycle
+                          (compiled/invoke-compiled c {:coarse (:coarse-out first-cycle)
+                                                      :fine (:fine-out first-cycle)})]
+                      ;; Ordered source execution chooses physical nodes at completion.
+                      ;; The returned semantic outputs, not Prepared's candidate nodes,
+                      ;; are the public numerical boundary.
+                      (into {} (map (fn [key]
+                                      [key (vec (value/->host (get second-cycle key)))]))
+                            [:coarse-out :fine-out])))
                   (finally (compiled/close! c))))
+              _ (doseq [[field expected-values] [[:coarse-out (:coarse expected)]
+                                                [:fine-out (:fine expected)]]]
+                  (is (= (count expected-values) (count (get baseline field)))
+                      "the completed source output retains the complete field geometry")
+                  (is (every? #(< (Math/abs (double %)) 1.0e-11)
+                              (map - expected-values (get baseline field)))
+                      "two source invocations agree with the independent PDE oracle"))
               certificate (capture-synchronized! prepared projection paths)
               chunks (into {} (map (fn [field] [(:id field) (first (:chunks field))]))
                            (get-in certificate [:manifest :fields]))

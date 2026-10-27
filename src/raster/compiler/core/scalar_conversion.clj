@@ -15,10 +15,10 @@
 
    Integral narrowing is rejected unless the caller explicitly requests :wrap or :trap. Those
    options distinguish representation wrapping from a checked source conversion; the default
-   remains rejection. Explicit Float/Double-to-Int/Long source casts use the JVM/Clojure boundary
-   contract: truncate toward zero, map NaN to zero, and saturate out-of-range values. The default
-   rejecting owner still declines that conversion, so an implicit result/storage coercion cannot
-   acquire source-cast semantics accidentally. Identity callers may elide the returned exact
+   remains rejection. Opted-in Float/Double-to-Int/Long numerical conversions truncate toward
+   zero, map NaN to zero, and saturate out-of-range values. That is NOT permission to implement
+   a checked Clojure source cast. Actual JVM source casts keep their source compiler's contract.
+   The default rejecting owner still declines that numerical conversion. Identity callers may elide the returned exact
    conversion. Unknown dtypes or policy options fail loudly."
   ([source target] (policy source target :reject))
   ([source target integral-narrowing]

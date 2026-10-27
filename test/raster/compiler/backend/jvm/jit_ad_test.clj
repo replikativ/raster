@@ -4,6 +4,7 @@
             [raster.numeric :as numeric]
             [raster.arrays :as arrays]
             [raster.ad.reverse :as reverse]
+            [raster.compiler.backend.jvm.bytecode :as bytecode]
             [raster.compiler.passes.scalar.inline :as inline]))
 
 (deftm square-loss [x :- Double] :- Double (* x x))
@@ -17,7 +18,16 @@
                            (var raster.compiler.backend.jvm.jit-ad-test/overloaded-loss)) local)
                       gradient (clojure.core/nth vg 1)] gradient)
         transformed (inline/inline-ad-applications source {'x 'double})
-        f (eval (list 'fn '[x] transformed))]
+        ;; AD normalization retains bytecode-owned input completions. Execute
+        ;; them through that consumer, not Clojure eval of reserved IR syntax.
+        {:keys [methods]}
+        (bytecode/compile-specialized-class!
+         "raster.compiled.LetBoundAdOverload"
+         [{:name 'run :params [(with-meta 'x {:tag 'double})]
+           :return-tag 'Object :walked-body [transformed]
+           :source-ns (the-ns 'raster.compiler.backend.jvm.jit-ad-test)}])
+        method (get methods 'run)
+        f (fn [x] (.invoke ^java.lang.reflect.Method method nil (object-array [x])))]
     (is (= (float 6.0) (f 3.0)))
     (is (instance? Float (f 3.0)))))
 

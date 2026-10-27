@@ -97,7 +97,26 @@
   (testing "Compiled maxpool2d gradient has correct sparse pattern"
     (let [compiled (pipeline/compile-aot #'maxpool-vg)
           x (double-array [1 3 2 4  5 7 6 8  9 11 10 12  13 15 14 16])
-          result (compiled x)
+          result (try (compiled x)
+                      (catch ClassCastException error
+                        ;; Preserve the failure and collect the existing helper
+                        ;; diagnostics for cold/order-dependent storage mismatches.
+                        ;; Do not retry or replace the compiled implementation.
+                        (let [helpers (::pipeline/compiled-diagnostics (meta #'maxpool-vg))
+                              describe (fn [symbol]
+                                         {:name (str symbol)
+                                          :tag (some-> symbol meta :tag str)
+                                          :retained-tag (some-> symbol meta :raster.type/tag str)})]
+                          (prn :maxpool-compiled-helper-types
+                               (into {}
+                                     (for [[name helper] (:helper-map helpers)]
+                                       [name {:params (mapv describe (:params helper))
+                                              :index-uses
+                                              (->> (tree-seq coll? seq (:expr helper))
+                                                   (filter symbol?)
+                                                   (filter #(.startsWith (str %) "argmax"))
+                                                   (map describe) distinct vec)}]))))
+                        (throw error)))
           ^doubles grad (nth result 1)]
       (is (== 1.0 (aget grad 5)) "grad at max pos 0")
       (is (== 2.0 (aget grad 7)) "grad at max pos 1")

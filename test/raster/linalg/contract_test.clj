@@ -5,6 +5,8 @@
   (:require [clojure.test :refer [deftest is testing]]
             [raster.core :refer [deftm]]
             [raster.ad.reverse :as rev]
+            [raster.compiler.equation-first :as equation-first]
+            [raster.compiler.ir.soac-dialect :as soac]
             [raster.arrays :as ra]
             [raster.linalg.contract :as lc]))
 
@@ -18,8 +20,42 @@
     C))
 
 (deftest contract-mm-forward-is-matmul
-  (let [A (double-array [1 2 3 4 5 6]) B (double-array [1 2 3 4 5 6])]  ; 3×2 · 2×3
-    (is (= (vec (lc/contract-mm A B 3 2 3)) (vec (ref-matmul A B 3 2 3))))))
+  (doseq [array [double-array float-array]
+          :let [A (array [1 2 3 4 5 6]) B (array [1 2 3 4 5 6])
+                C (lc/contract-mm A B 3 2 3)]]
+    (is (= (class A) (class C)))
+    (is (= (vec C) (vec (ref-matmul (double-array A) (double-array B) 3 2 3))))))
+
+(deftest contraction-pullbacks-preserve-the-operand-element-type
+  (doseq [array [double-array float-array]
+          :let [A (array [1 2 3 4 5 6]) B (array [1 2 3 4 5 6])
+                Cbar (array (range 1 10))
+                dA (lc/contract-mm-dA Cbar B 3 2 3)
+                dB (lc/contract-mm-dB A Cbar 3 2 3)]]
+    (is (= (class A) (class dA) (class dB)))
+    (is (= [14.0 32.0 32.0 77.0 50.0 122.0] (vec dA)))
+    (is (= [48.0 57.0 66.0 60.0 72.0 84.0] (vec dB)))))
+
+(deftest float-contraction-compiles-from-genuine-float-source-contracts
+  (doseq [v [#'lc/contract-mm #'lc/contract-mm-dA #'lc/contract-mm-dB]
+          target [:cuda:0 :hip:0]]
+    (let [compilation (equation-first/compile v {:target target :dtype :float})
+          parameters (get-in compilation [:semantic :attributes :invocation-plan :parameters])
+          reductions (into [] (comp (mapcat #(soac/equations (:algorithm %)))
+                                    (map soac/operation-parts)
+                                    (filter #(= 'segmented-reduce (:kind %))))
+                           (get-in compilation [:semantic :equations]))
+          slots (mapcat :abi (:kernels compilation))]
+      (is (= [:float :float :long :long :long] (mapv #(get-in % [:value :dtype]) parameters)))
+      (is (seq (:kernels compilation)))
+      (is (seq reductions))
+      (doseq [reduction reductions]
+        (is (= [:float] (get-in reduction [:attributes :dtypes])))
+        (is (every? zero? (get-in reduction [:attributes :identities]))))
+      (is (every? #(= :float (get-in compilation [:semantic :values % :dtype]))
+                  (get-in compilation [:semantic :outputs])))
+      (is (some #(= :float (:dtype %)) slots))
+      (is (not-any? #(= :double (:dtype %)) slots)))))
 
 ;; L(A,B) = ½ Σ C²  where C = contract-mm(A,B);  dL/dC = C, so
 ;; dL/dA = C·Bᵀ = contract-mm-dA(C,B),  dL/dB = Aᵀ·C = contract-mm-dB(A,C).

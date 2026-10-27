@@ -4,8 +4,14 @@
             [raster.compiler.fixtures.contractions :as contractions]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.invocation-plan :as invocation]
+            [raster.compiler.ir.invocation-materialization :as materialization]
             [raster.compiler.ir.invocation-source :as source]
             [raster.compiler.ir.parallel-program :as parallel-program]
+            [raster.compiler.ir.semantic-fingerprint :as semantic]
+            [raster.compiler.ir.soac-dialect :as soac]
+            [raster.compiler.core.value-completion :as completion]
+            [raster.compiler.core.method-entry :as method-entry]
+            [clojure.walk :as walk]
             [raster.compiler.passes.parallel.auxiliary-semantic-witness-test :as auxiliary]
             [raster.core :refer [deftm]]
             [raster.arrays :as arrays]
@@ -25,6 +31,34 @@
         out (arrays/zeros-like x n)
         result (par/map! out i n double (+ (aget out i) 1.0))]
     result))
+
+(deftm literal-helper-source-zero-observed
+  [x :- (Array float), early :- (Array float)] :- (Array float)
+  (let [written (par/map! early i 1 float (+ (aget x i) 1.0))
+        out (arrays/zeros-like x 1)
+        result (par/map! out i 1 float (+ (aget out i) 1.0))]
+    result))
+
+(deftm helper-source-unspecified-observed
+  [x :- (Array double), early :- (Array double), n :- Long] :- (Array double)
+  (let [written (par/map! early i 1 double (+ (aget x i) 1.0))
+        out (arrays/alloc-like x n)
+        result (par/map! out i n double (+ (aget x i) 1.0))]
+    result))
+
+(deftm preserved-scalar-between-writes
+  [x :- (Array double), out :- (Array double), n :- Long] :- (Array double)
+  (let [written (par/map! out i 1 double (+ (aget x i) 1.0))
+        ^long required ^{:raster.effect/preserve-evaluation true} (* (long n) (long n))]
+    (par/map! out i 1 double (+ (aget out i) 1.0))))
+
+(deftm write-before-resident-reduction
+  [x :- (Array double), out :- (Array double), n :- Long] :- Double
+  (let [written (par/map! out i 1 double (+ (aget x i) 1.0))
+        ^long required ^{:raster.effect/preserve-evaluation true} (* (long n) (long n))
+        sum (par/reduce total 0.0 i n (+ total (aget x i)))
+        consumed (par/map! out i 1 double (+ sum (aget out i)))]
+    sum))
 
 (defn- compilation [v dtype]
   (let [program (:semantic (equation-first/compile v {:target :ocl:0 :dtype dtype}))]
@@ -48,6 +82,35 @@
                      (assoc-in plan [:steps step-index :source-projection :helper :implementation]
                                'unrelated/constructor)]]
       (is (= :invocation-source-step-mismatch (reason #(invocation/source-order changed program)))))))
+
+(deftest literal-helper-allocation-retains-source-position-and-definition
+  (let [[program plan] (compilation #'literal-helper-source-zero-observed :float)
+        order (invocation/source-order plan program)
+        allocation (first (filter #(= 'out (:storage %)) order))
+        expression (:source-expression (first (filter #(= 'out (:destination %))
+                                                       (get-in program [:attributes :allocations]))))
+        projection (source/allocation-source expression (:values program))]
+    (is (= 1 (:position allocation)) "literal helper allocation remains after the preceding write")
+    (is (= :zero (:initialization projection)))
+    (is (= :float (:dtype projection)))
+    (is (= 1 (last (get-in projection [:helper :arguments]))))
+    (is (= 'clojure.core/float-array (first (:constructor projection))))))
+
+(deftest delegated-allocation-keeps-the-public-unspecified-initialization
+  (let [[program plan] (compilation #'helper-source-unspecified-observed :double)
+        order (invocation/source-order plan program)
+        step (first (filter #(= 'out (:symbol %)) (:steps plan)))
+        allocation (first (filter #(= 'out (:storage %)) order))
+        expression (:source-expression
+                    (first (filter #(= 'out (:destination %))
+                                   (get-in program [:attributes :allocations]))))
+        projection (source/allocation-source expression (:values program))]
+    (is (= :unspecified (:initialization step)))
+    (is (= :unspecified (:initialization projection)))
+    (is (= :zero (:realized-initialization projection)))
+    (is (= 'out (:storage allocation)))
+    (is (= 'raster.arrays/alloc-like (get-in projection [:helper :operation])))
+    (is (= 'clojure.core/double-array (first (:constructor projection))))))
 
 (deftest source-position-is-not-the-dependency-pruned-prefix-ordinal
   (let [[program plan] (compilation #'write-before-shape :double)
@@ -109,6 +172,43 @@
                :program-inputs '[out] :program-outputs '[out]})]
     [program plan]))
 
+(deftest retained-source-class-identity-does-not-relax-effects-or-portability
+  (let [values (zipmap '[x y] (repeat (av/tensor {:dtype :double :shape []})))
+        expression (with-meta '(clojure.core/+ x 0.0) {:tag Double/TYPE})
+        program (parallel-program/make
+                 {:dialect :typed-parallel :values values :inputs '[y] :outputs '[y]
+                  :source (list 'let* ['y expression] 'y)})
+        plan (invocation/from-prefix
+              {:id :retained-completion-source :parameters '[x]
+               :parameter-values (select-keys values '[x])
+               :bindings [['y expression]] :binding-values (select-keys values '[y])
+               :program-values values :program-inputs '[y] :program-outputs '[y]})
+        changed (with-meta expression {:tag Float/TYPE})
+        checked-input (completion/complete-value
+                       (completion/bytecode-boxed-parameter-contract Double/TYPE) 'x)]
+    (is (vector? (invocation/source-order plan program)))
+    (is (= :invocation-source-step-mismatch
+           (reason #(invocation/source-order plan (assoc program :source (list 'let* ['y changed] 'y))))))
+    (is (= :semantic-fingerprint-unsupported (reason #(semantic/fingerprint plan)))
+        "local source comparison cannot make a Class-bearing plan persistable")
+    (let [checked-plan (invocation/from-prefix
+                        {:id :unclosed-entry-check :parameters '[x]
+                         :parameter-values (select-keys values '[x])
+                         :bindings [['y checked-input]] :binding-values (select-keys values '[y])
+                         :program-values values :program-inputs '[y] :program-outputs '[y]})
+          step (first (:steps checked-plan))]
+      (is (invocation/source-completion? step)
+          "checked evaluation uses its explicit invocation operation, not a pure scalar step")
+      (is (= checked-input (:expression step))
+          "source comparison cannot erase the checked conversion")
+      (is (= :invocation-scalar-effect
+             (reason #(invocation/validate!
+                       (assoc checked-plan :steps
+                              [(invocation/->ScalarCompute
+                                (:id step) (:symbol step) (:operands step)
+                                (soac/lambda-form '[x] [checked-input]) (:value step))]))))
+          "relabeling checked evaluation as pure scalar work is still refused"))))
+
 (deftest structured-allocation-cannot-erase-changed-constructor-arguments
   (let [[program plan] (allocation-boundary)]
     (is (vector? (invocation/source-order plan program)))
@@ -119,6 +219,65 @@
       (let [changed (assoc program :source (list 'let* ['out expression] 'out))]
         (is (= :invocation-source-allocation
                (reason #(invocation/source-order plan changed))) (str expression))))))
+
+(deftest allocation-extents-use-preceding-prefix-aliases-not-future-program-values
+  (let [scalar (av/tensor {:dtype :int :shape []})
+        buffer (av/tensor {:dtype :double :shape '[n]})
+        length (with-meta '(clojure.core/alength buffer_arg) {:raster.type/tag 'int})
+        constructor (list 'clojure.core/double-array (list 'clojure.core/long length))
+        pairs [['n '(clojure.core/alength x)] ['copy '(clojure.core/aclone x)]
+               ['buffer_arg 'copy] ['out constructor]]
+        values {'n scalar 'out buffer}
+        program (parallel-program/make
+                 {:dialect :typed-parallel :values values :inputs '[out] :outputs '[out]
+                  :source (list 'let* (vec (mapcat identity pairs)) 'out)})
+        plan (invocation/from-prefix
+              {:id :causal-allocation-length :parameters '[x]
+               :parameter-values {'x (av/tensor {:dtype :double :shape '[(extent x)]})}
+               :bindings pairs :binding-values {'n scalar 'copy buffer 'buffer_arg buffer 'out buffer}
+               :program-values values :program-inputs '[out] :program-outputs '[out]})
+        original-source (:source program)
+        order (invocation/source-order plan program)
+        data (double-array [1.0 2.0 3.0])
+        materialized (materialization/materialize
+                      plan [data] (fn [& _] (throw (AssertionError. "unexpected scalar execution"))))]
+    (is (= ['n 'copy 'buffer_arg 'out] (into [] (keep :binding) order)))
+    (is (identical? original-source (:source program)) "shape comparison does not rewrite source")
+    (is (nil? (get (:values plan) 'buffer_arg))
+        "the alias is intentionally stored only under its invocation identity")
+    (is (some #(= 'out (:storage %))
+              (invocation/source-order
+               plan (assoc-in program [:attributes :allocations]
+                              [{:destination 'out :source-expression constructor}])))
+        "an allocation claim reuses the same causal constructor check, not the whole value table")
+    (is (= '(clojure.core/aclone x) (get (into {} pairs) 'copy)))
+    (is (= '(clojure.core/double-array (clojure.core/long (clojure.core/alength buffer_arg)))
+           constructor))
+    (is (= [3] (:shape (get-in materialized [:values (:id (last (:steps plan)))]))))
+    (is (not (source/allocation-corresponds?
+              '(clojure.core/double-array (clojure.core/int n)) buffer :zero
+              {'n (av/tensor {:dtype :long :shape []})}))
+        "metadata-insensitive typed equality does not authorize integral narrowing")
+    (is (not (source/allocation-corresponds?
+              '(clojure.core/double-array (clojure.core/double n)) buffer :zero {'n scalar}))
+        "floating conversions stay outside exact integral size projection")
+    (is (not (source/allocation-corresponds?
+              (list 'clojure.core/double-array
+                    (list 'clojure.core/long (with-meta 'n {:raster.type/tag 'long})))
+              buffer :zero {'n scalar}))
+        "source width disagreement is still checked before typed-tree comparison")
+    (doseq [source ['future_buffer 'unknown_buffer]]
+      (let [changed-length (with-meta (list 'clojure.core/alength source) (meta length))
+            changed-constructor (list 'clojure.core/double-array
+                                      (list 'clojure.core/long changed-length))
+            changed (-> program
+                        (assoc-in [:values 'future_buffer] buffer)
+                        (assoc :source (list 'let* (assoc (vec (second original-source)) 7
+                                                        changed-constructor) 'out)))]
+        (is (= :invocation-source-allocation
+               (reason #(invocation/source-order
+                         (assoc-in plan [:values 'future_buffer] buffer) changed)))
+            "an outer value table cannot supply a missing or later source buffer")))))
 
 (deftest clone-correspondence-preserves-arity-and-operand-evaluation
   (let [values {'xs (av/tensor {:dtype :double :shape '[n]})
@@ -145,6 +304,49 @@
   (doseq [dtype [:byte :long]]
     (is (not (source/projection-corresponds? '(clojure.core/byte (clojure.core/alength xs))
                                              (av/tensor {:dtype dtype :shape []}))))))
+
+(deftest typed-length-projection-owns-the-definition-not-the-object-return-tag
+  (let [expression (with-meta '(.invk raster.arrays/alength_m_doubles-impl xs)
+                     {:raster.op/original 'raster.arrays/alength})
+        values {'xs (av/tensor {:dtype :double :shape '[unknown]})
+                'foreign (av/tensor {:dtype :double :shape '[unknown]})
+                'length (av/tensor {:dtype :long :shape []})}
+        project #(source/canonicalize-shape-projection values #{'xs 'foreign} 'length expression)
+        expected '(clojure.core/long (clojure.core/alength xs))
+        original method-entry/selected-typed-entry-body
+        changed-body
+        (fn [transform]
+          (with-redefs [method-entry/selected-typed-entry-body
+                        (fn [definition]
+                          (when-let [context (original definition)]
+                            (assoc context :body [(transform (first (:body context))
+                                                              (first (:parameters definition)))])))]
+            (project)))]
+    (is (= Object (:result-carrier
+                  (method-entry/live-selected-parameter-carriers
+                   'raster.arrays/alength 'raster.arrays/alength_m_doubles-impl 1))))
+    (is (= expected (project)))
+    (is (string? (semantic/fingerprint (project))) "no source-owner object leaks into the projection")
+    (is (= expected
+           (changed-body (fn [body parameter]
+                           (walk/postwalk #(if (= parameter %) (with-meta % {:tag 'doubles}) %) body)))))
+    (doseq [transform [(fn [body parameter]
+                        (walk/postwalk #(if (= parameter %) 'foreign %) body))
+                      (fn [body parameter]
+                        (walk/postwalk #(if (= parameter %) (with-meta % {:tag 'objects}) %) body))
+                      (fn [body _] (list 'do '(throw (Exception.)) body))
+                      (fn [body _] (list 'let* '[unused 1] body))]]
+      (is (= expression (changed-body transform))))
+    (with-redefs [method-entry/observed-body-operation (fn [& _] nil)]
+      (is (= expression (project)) "qualified spelling is not historical lookup authority"))
+    (is (= expression
+           (source/canonicalize-shape-projection
+            (assoc values 'xs (av/tensor {:dtype :float :shape '[unknown]}))
+            #{'xs} 'length expression)))
+    ;; The same source must qualify after the helper genuinely JITs, not only
+    ;; while its original source is pending. No numerical helper is invoked by project.
+    (is (= 3 (arrays/alength (double-array 3))))
+    (is (= expected (project)))))
 
 (deftest allocation-claims-and-auxiliary-owners-are-unambiguous
   (let [[program plan] (allocation-boundary)

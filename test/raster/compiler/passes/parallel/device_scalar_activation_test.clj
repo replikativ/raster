@@ -1,6 +1,7 @@
 (ns raster.compiler.passes.parallel.device-scalar-activation-test
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.ir.par :as par-ir]
+            [raster.compiler.core.method-entry :as entry]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.ir.write-coverage :as coverage]
@@ -35,6 +36,29 @@
            %)
         (:equations program)))
 
+(deftest rejected-publication-candidate-rolls-back-source-and-owner-history
+  ;; A deliberately unproved callback candidate tests orchestration rollback,
+  ;; not publication authority. Reading the input has no preceding owned writer
+  ;; and must not replace the accepted original output boundary.
+  (entry/call-with-definition-inputs
+   (fn []
+     (let [options {:dtype :float :array-types {'input :float}}
+           admitted (#'route/source-projection terminal-source options)
+           original (#'route/validated-terminal-scalar-projection* admitted options)
+           before @entry/*emission-inputs*
+           declined (list 'let* (second terminal-source)
+                          '(clojure.core/float (clojure.core/aget input 0)))
+           actual (frontend/call-with-contextual-reduction-constructor
+                   (fn [_]
+                     (swap! entry/*emission-inputs* assoc ::rejected-candidate true)
+                     {:form declined})
+                   #(#'route/validated-terminal-scalar-projection admitted options))]
+       (is (= (:form original) (:form actual)))
+       (is (= (dialect/outputs (:typed-input original))
+              (dialect/outputs (:typed-input actual))))
+       (is (= before @entry/*emission-inputs*)
+           "candidate-local dependencies do not survive a failed complete terminal audit")))))
+
 (deftest terminal-naming-reuses-frontend-authority-and-fails-closed
   (let [{:keys [form result description]}
         (frontend/materialize-terminal-scalar-result
@@ -59,6 +83,47 @@
                  (list 'let* (second terminal-source)
                        '(unknown-scalar (clojure.core/aget out 0)))
                  {:dtype :float :array-types {'input :float}}))))))
+
+(deftest named-public-scalar-keeps-internal-liveouts-and-the-whole-writer-spine
+  (let [source (list 'let*
+                     (into ['internal-sum '(raster.par/reduce acc 0.0 j 4
+                                             (+ acc (double (clojure.core/aget input j))))
+                            'internal-array '(raster.par/pmap k 4 float
+                                               (clojure.core/aget input k))]
+                           (second terminal-source))
+                     '(clojure.core/float (clojure.core/aget out 0)))]
+    (doseq [components? [false true]
+            :let [options {:dtype :float :array-types {'input :float}
+                           :segmented-plans? components?}
+                  admitted (#'route/source-projection source options)
+                  rebuilt (#'route/validated-terminal-scalar-projection admitted options)
+                  program (:typed-input rebuilt)
+                  result (last (:form rebuilt))
+                  outputs (dialect/outputs program)]]
+      (is (:admitted? admitted))
+      (is (= 1 (:terminal-scalars-materialized rebuilt)))
+      (is (= [result] (get-in (dialect/facts program) [:attributes :public-scalar-checkpoint])))
+      (is (some #{'internal-sum} outputs))
+      (is (some #{'internal-array} outputs))
+      (is (some #{result} outputs))
+      (is (some? (resident/terminal-device-scalar-projection program)))
+      (is (= components? (some? (:projection rebuilt)))))))
+
+(deftest terminal-naming-cannot-substitute-another-result-or-binding
+  (let [options {:dtype :float :array-types {'input :float}}
+        admitted (#'route/source-projection terminal-source options)
+        materialize frontend/materialize-terminal-scalar-result
+        reason (fn [mutate]
+                 (try
+                   (with-redefs [frontend/materialize-terminal-scalar-result
+                                 (fn [source options] (mutate (materialize source options)))]
+                     (#'route/validated-terminal-scalar-projection admitted options))
+                   nil
+                   (catch clojure.lang.ExceptionInfo error (:invariant (ex-data error)))))]
+    (is (= :terminal-scalar-result-projection
+           (reason #(assoc % :result 'effect))))
+    (is (= :terminal-scalar-result-projection
+           (reason #(update % :result (fn [result] (with-meta result {:changed true}))))))))
 
 (deftest direct-terminal-scalar-is-realized-and-scheduled-once
   (let [{:keys [program stats declined]} (route-source terminal-source {'input :float})
@@ -247,7 +312,9 @@
       (is (= (last source) (last (get-in routed [:program :source])))))))
 
 (deftest lost-post-optimization-residency-restores-original-return
-  (with-redefs [resident/realize (fn [program]
+  (with-redefs [resident/realize (fn [program public-outputs]
+                                 (is (empty? public-outputs)
+                                     "the injected loss of residency grants no public-output demand")
                                  [program {:resident-reductions 0 :inlined-scalars 0
                                            :resident-terminal-scalars 0}])]
     (let [routed (route-source terminal-source {'input :float})]

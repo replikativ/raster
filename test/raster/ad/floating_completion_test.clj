@@ -116,3 +116,18 @@
           (is (= :ad-unclosed-completion-transpose
                  (try (run) :accepted
                       (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))))))
+
+(deftest reference-bytecode-completion-does-not-acquire-structural-ad
+  (doseq [carrier [Object (class (float-array 0))]
+          owner [nil {:backend :jvm-bytecode} {:source-policy policy}]
+          active? [false true]]
+    (let [x (typed 'x 'floats) result (typed 'result 'floats)
+          term (completion/complete-value
+                (completion/bytecode-reference-input-contract
+                 carrier (completion/bytecode-operand-context {})) x)]
+      (binding [reverse/*generated-product-context* owner]
+        (doseq [run [#(#'reverse/ad-form-kind term active? result)
+                     #(#'reverse/ad-record :completion result term {x active?})]]
+          (is (= :ad-unclosed-completion-transpose
+                 (try (run) :accepted
+                      (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))))))

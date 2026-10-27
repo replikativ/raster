@@ -7,9 +7,11 @@
 (defn- typed [id tag] (with-meta id {:raster.type/tag tag}))
 
 (defn- forward [input output contract]
+  ;; Object consumption and an explicit Class.cast retain their original primal
+  ;; actions. Their tangent transport needs no invented generated-source owner.
   (with-bindings {#'reverse/*source-memory-context*
                   {:values [input] :value-facts {} :replayed {} :unprojectable {} :aliases {}}
-                  #'reverse/*generated-product-context* {:source-policy {:unchecked-math false}}}
+                  #'reverse/*generated-product-context* nil}
     (#'reverse/forward-pass
      [output (completion/complete-value contract input)] [input])))
 
@@ -42,6 +44,28 @@
     (is (= output (#'reverse/exact-replay-root output value-facts)))
     (is (contains? (memory/transitive-closure #{output} aliases) input))
     (is (= (completion/complete-value contract input) (second fwd-bindings)))))
+
+(deftest explicit-reference-check-composes-through-public-source-ad
+  (let [input (typed 'input 'double) checked (typed 'checked 'double)
+        source (list 'let* [checked (completion/complete-value
+                                    (completion/reference-check-contract Double) input)]
+                     (list 'clojure.core/* checked checked))
+        differentiated (reverse/grad-expr source [input])
+        compile-body (fn [body]
+                       (binding [*unchecked-math* false]
+                         (eval (list 'let* ['reference_class Double]
+                                     (list 'fn* [input]
+                                           (completion/project-to-jvm-source
+                                            body {:unchecked-math false} {Double 'reference_class}))))))
+        oracle (compile-body source) execute (compile-body differentiated)]
+    (doseq [value [-3.0 0.0 2.0]]
+      (let [[primal pullback] (execute value)]
+        (is (= (oracle value) primal))
+        (is (= [(* 2.0 value)] (pullback 1.0)))))
+    (doseq [value [nil "not a Double"]]
+      (let [failure #(try (% value) nil (catch Throwable error (class error)))]
+        (is (= (failure oracle) (failure execute)))
+        (is (some? (failure execute)))))))
 
 (deftest completed-primal-values-keep-their-own-reference-and-trap-behavior
   (doseq [contract [completion/object-input-contract

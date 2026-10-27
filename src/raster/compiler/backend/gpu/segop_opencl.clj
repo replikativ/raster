@@ -176,9 +176,35 @@
              scheduled graph-node kernel-graph storage-context))
         ;; Retained storage stays in its original representation. Exact source context still
         ;; certifies causal host definitions; shape-only leaves now have honest scalar ABI slots.
-        _ (when kernel-graph
-            (equation-graph/validated-storage-scalars
-             kernel-graph scheduled-equation-algorithm scheduled-equation-body))
+        source-definitions
+        (when kernel-graph
+          (equation-graph/validated-storage-scalars
+           kernel-graph scheduled-equation-algorithm scheduled-equation-body))
+        leaf-source-definitions
+        (merge-with (fn [left right]
+                      (if (= left right) left
+                          (throw (ex-info "leaf source contexts disagree on a scalar definition"
+                                          {:reason :segmap-leaf-precondition-context
+                                           :left left :right right
+                                           :operation (:id segmap)}))))
+                    source-definitions (:scalar-definitions storage-options))
+        source-conditions
+        (when kernel-graph
+          (segmap-body/source-read-definition-preconditions
+           graph-node kernel-graph leaf-source-definitions))
+        address-conditions
+        (when (get-in scheduled [:body :attributes :address-projection])
+          (segmap-body/address-proof-definition-preconditions graph-node kernel-graph))
+        _ (when (and (seq (concat source-conditions address-conditions))
+                     (not (and scheduled-equation-algorithm scheduled-equation-body)))
+            (throw (ex-info "leaf scalar definitions require their exact source context"
+                            {:reason :segmap-leaf-precondition-context
+                             :operation (:id segmap)})))
+        leaf-conditions (vec (distinct (concat source-conditions address-conditions)))
+        scheduled (if (seq leaf-conditions)
+                    (segmap-body/project-leaf-definition-preconditions!
+                     scheduled graph-node kernel-graph leaf-conditions)
+                    scheduled)
         kernel-name (str kernel-name-prefix "_" (gensym ""))
         ]
     (kernel-body-target/emit-artifact kernel-name scheduled target-dialect

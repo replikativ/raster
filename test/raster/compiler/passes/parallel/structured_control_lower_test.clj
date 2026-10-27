@@ -7,6 +7,7 @@
             [raster.compiler.ir.emitted-parallel-program :as emitted-program]
             [raster.compiler.ir.emitted-parallel-program-call :as program-call]
             [raster.compiler.ir.kernel-artifact :as artifact]
+            [raster.compiler.ir.invocation-link :as invocation-link]
             [raster.compiler.ir.link-plan :as link]
             [raster.compiler.ir.parallel-program :as parallel-program]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
@@ -348,6 +349,20 @@
           proof (emitted-program/validate-with-physical-results! program request)
           prepared (program-call/make program buffers scalars scratch nil {} proof request)]
       (is (= call (loop-call/validate! call request)))
+      (let [equation (first (:equations program))
+            stage (:call (program-call/make-equation-program-call
+                          program (:id equation)
+                          {:buffers buffers :scalar-values scalars :loop-scratch scratch}
+                          proof request))
+            state {:buffers {'u0 :initial-buffer}
+                   :storage {:initial-buffer {:shape [64] :abstract (get-in program [:values 'u0])}}}]
+        (is (= (:steps prepared) (:steps stage)))
+        (is (link/program-link-instance? (link/program-instance {:id :selected-loop :call stage} request)))
+        (is (thrown? clojure.lang.ExceptionInfo (link/program-instance {:id :selected-loop :call stage})))
+        (is (some? (get-in (#'invocation-link/lower-loop-storage state :selected equation scalars request)
+                          [:buffers 'u-final])))
+        (is (thrown? clojure.lang.ExceptionInfo
+                     (#'invocation-link/lower-loop-storage state :selected equation scalars nil))))
       (let [events (atom [])
             executor {:bind! (fn [key graph bindings values]
                                (swap! events conj [:bind bindings values])

@@ -19,6 +19,8 @@
             [raster.compiler.backend.cpu.aot :as aot]
             [raster.compiler.backend.cpu.csimd :as csimd]
             [raster.compiler.backend.gpu.c-emit :as ce]
+            [raster.compiler.backend.gpu.opencl-pass :as opencl-pass]
+            [raster.compiler.pipeline :as pipeline]
             [raster.compiler.core.util :as util]
             [raster.compiler.core.value-completion :as completion]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
@@ -28,7 +30,60 @@
             [raster.compiler.ir.parallel-program :as parallel-program]
             [raster.compiler.ir.kernel-body :as kernel-body]
             [raster.compiler.ir.reduction :as reduction]
+            [raster.compiler.ir.soac-dialect :as dialect]
+            [raster.compiler.passes.parallel.typed-soac-route :as typed-route]
+            [raster.compiler.passes.parallel.scalar-region-lower :as scalar-region-lower]
             [raster.compiler.ir.segop :as segop]))
+
+(deftest native-forward-passes-receive-declared-source-abi-facts
+  (doseq [[params tags kernel-dtype arrays scalars]
+          [['[x y cnt] '[doubles doubles long] :double
+            '{x :double y :double} '{cnt :long}]
+           ['[x y gain cnt] '[floats floats double long] :double
+            '{x :float y :float} '{gain :double cnt :long}]
+           ['[x y offset cnt] '[ints floats int long] :float
+            '{x :int y :float} '{offset :int cnt :long}]
+           ['[x y offset cnt] '[ints floats long long] :float
+            '{x :int y :float} '{offset :long cnt :long}]]
+          frozen? [false true]]
+    (let [source '(let* [effect (raster.par/map! y i cnt double 1.0)] y)
+          calls (atom [])
+          derivations (atom [])
+          derive opencl-pass/derive-param-types
+          ;; Use a deliberately different order for the frozen source entry:
+          ;; the source's public parameter order, not map iteration, owns the ABI.
+          selected-params (if frozen? (vec (reverse params)) params)
+          frontend (when frozen?
+                     {:source-entry {:params selected-params :source-ns *ns*}
+                      :body [source]})]
+      (with-redefs [pipeline/get-params (fn [_ _] params)
+                    pipeline/get-walked-body (fn [_ _] [source])
+                    pipeline/normalize-source-bindings (fn [body _] body)
+                    pipeline/build-param-env (fn [_ _] (zipmap params tags))
+                    opencl-pass/derive-param-types
+                    (fn [parameters declared-tags dt options]
+                      (swap! derivations conj [parameters declared-tags dt options])
+                      (derive parameters declared-tags dt options))
+                    pipeline/run-passes
+                    (fn [form passes options]
+                      (swap! calls conj {:form form :passes passes :options options})
+                      form)]
+        (let [result (#'aot/fused-scalar-form* ::source-owner kernel-dtype true true frontend)
+              options (:options (first @calls))]
+          (is (= source (:form result)))
+          (is (= selected-params (:params result) (:active-params options)))
+          (is (= [[selected-params (mapv (zipmap params tags) selected-params)
+                   kernel-dtype {:preserve-declared-array-storage? true}]]
+                 @derivations))
+          (is (= arrays (:array-types options)) "write-only y retains its declared storage seed")
+          (is (= scalars (:scalar-types options)))
+          (is (true? (:preserve-declared-array-storage? options)))
+          (is (= kernel-dtype (:dtype options)))
+          (is (true? (:keep-par-forms? options)))
+          (is (false? (:simd? options)))
+          (is (= pipeline/forward-passes (:passes (first @calls))))
+          (is (= 1 (count @calls)))
+          (is (not (contains? options :source-var)) "entry facts do not invent source ownership"))))))
 
 (deftest native-completion-admission-precedes-local-source-simplification
   (let [value (completion/complete-value completion/object-input-contract 'x)]
@@ -290,7 +345,9 @@
             "reassociation alone does not authorize implicit FMA")
         (is (not (re-find #"_mm256_fmadd_pd" (:c-source (meta f-scal))))
             ":simd? false stays scalar (clang auto-vec only)")
-        (doseq [n [16 64 257 1000]]
+        (is (not (str/includes? (:c-source (meta f-simd)) "reduce(")))
+        (is (not (str/includes? (:c-source (meta f-scal)) "reduce(")))
+        (doseq [n [0 1 3 7 16 64 257 1000]]
           (let [eps 1.0e-6
                 x (double-array (map #(clojure.core/- (/ (double %) 9.0) 3.0) (range n)))
                 w (double-array (repeat n 1.3))
@@ -301,6 +358,167 @@
                 (str "n=" n " simd == interpreter"))
             (is (every? true? (map #(< (Math/abs (clojure.core/- %1 %2)) 1e-9) os oc))
                 (str "n=" n " simd == scalar-C"))))))))
+
+(defn- rms-reduction-owner []
+  (let [result (aot/fused-scalar-form #'rmsnorm-red :double :simd? true)
+        program (:parallel-program result)]
+    [program (some (fn [owner]
+                     (when (and (dialect/program-form? (:algorithm owner))
+                                (= 'reduce (dialect/operation-kind
+                                            (first (dialect/equations (:algorithm owner))))))
+                       owner))
+                   (:equations program))]))
+
+(deftm float-fold-double-result [x :- (Array float) out :- (Array double)] :- (Array double)
+  (let [sum (reduce! [acc (clojure.core/float 0.0)] [x] (rn/+ acc x))]
+    (raster.par/map! out i 1 double (double sum)))
+  out)
+
+(deftest native-scalar-fold-retains-float-rounding-under-double-computation
+  (let [result (aot/fused-scalar-form #'float-fold-double-result :double :simd? true)
+        program (:parallel-program result)
+        owner (some #(when (some (fn [operation] (instance? raster.compiler.ir.segop.SegRed operation))
+                                (:operations %)) %) (:equations program))
+        emitted (binding [aot/*scheduled-program* program aot/*native-simd?* false
+                          ce/*scalar-type* "double"]
+                  (#'aot/emit-owned-reduction owner (first (:results owner)) #{'x 'out}))]
+    (is (some? owner) "the Float fold must actually reach the owned-equation consumer")
+    (is (= :float (:raw-dtype (#'aot/owned-reduction-projection owner))))
+    (let [projection (#'aot/owned-reduction-projection owner)
+          read (some #(when (and (seq? %) (= 'clojure.core/aget (first %))) %)
+                     (tree-seq coll? seq (:source projection)))]
+      (is (= 'float (:raster.type/tag (meta read)))
+          "the generated element read retains its owned operand AV's scalar dtype"))
+    (is (re-find #"float rstr_native_raw_\w+\s*=" (or emitted "")))
+    (is (re-find #"float acc\w*\s*=" (or emitted "")) "the loop accumulator itself rounds at Float width")
+    (when (clang-available?)
+      (let [native (aot/compile-aot-c #'float-fold-double-result :double :simd? false)
+            input (float-array [16777216.0 1.0 -16777216.0])]
+        (is (= [0.0] (vec (float-fold-double-result input (double-array 1)))
+               (vec (native input (double-array 1)))))))))
+
+(defn- with-owned-result-transform [owner transform result-dtype]
+  ;; TypedSOAC is deliberately a list spine, not an associative vector.
+  (let [[program-head facts equations outputs] (:algorithm owner)
+        [equation-head id results [kind attributes & arguments]] (first equations)
+        operation (apply list kind (assoc attributes :result-transform transform) arguments)
+        equation (with-meta (list equation-head id results operation) (meta (first equations)))
+        algorithm (with-meta
+                    (list program-head (assoc-in facts [:values (first results) :dtype] result-dtype)
+                          (assoc equations 0 equation) outputs)
+                    (meta (:algorithm owner)))
+        last-index (dec (count (:operations owner)))]
+    (-> owner
+        (assoc :algorithm algorithm)
+        (assoc-in [:operations last-index :reduction :attributes :result-region]
+                  (scalar-region-lower/from-typed-result-transform transform)))))
+
+(deftest native-owned-reduction-conversion-admission-uses-existing-totality-evidence
+  (let [i (with-meta 'i {:tag 'int :raster.type/tag 'int})
+        f (with-meta 'f {:tag 'float :raster.type/tag 'float})]
+    (doseq [expression [(list 'clojure.core/int i)
+                        (list 'clojure.core/float f)
+                        '(clojure.core/float 0.0)
+                        '(clojure.core/unchecked-float 1.0e100)]]
+      (is (nil? (#'aot/check-owned-reduction-conversions! {:id :test} [expression]))))
+    (doseq [expression ['(clojure.core/int unknown)
+                        '(clojure.core/double (clojure.core/int unknown))
+                        '(clojure.core/float 1.0e100)
+                        (list 'clojure.core/float
+                              (with-meta '(clojure.core/aget x i)
+                                {:tag 'double :raster.type/tag 'double}))]]
+      (is (= :unsupported-native-owned-reduction
+             (try (#'aot/check-owned-reduction-conversions! {:id :test} [expression])
+                  nil
+                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))))
+
+(deftest owned-native-reduction-consumes-complete-result-boundary
+  (let [[program owner] (rms-reduction-owner)
+        original [(:id owner) (:site owner) (:results owner) (:operations owner)]
+        projection (#'aot/owned-reduction-projection owner)
+        vectorize csimd/compile-segred-c
+        calls (atom 0)]
+    (is (some? owner))
+    (is (= :double (:raw-dtype projection) (:result-dtype projection)))
+    (doseq [simd? [true false]]
+      (reset! calls 0)
+      (let [source (binding [aot/*scheduled-program* program aot/*native-simd?* simd?]
+                     (with-redefs [aot/compatibility-segop
+                                   (fn [& _] (throw (AssertionError. "owned reduction was rescheduled")))
+                                   csimd/active-isa (constantly :avx2)
+                                   csimd/compile-segred-c
+                                   (fn [& args] (swap! calls inc) (apply vectorize args))]
+                       (#'aot/emit-owned-reduction owner (first (:results owner)) #{'x 'w 'out})))]
+        (is (= (if simd? 1 0) @calls))
+        (is (= 1 (count (re-seq #"double rstr_native_raw_\w+\s*[;=]" source))))
+        (is (str/includes? source "/"))
+        (is (str/includes? source "n"))
+        (is (not (str/includes? source "reduce(")))))
+    (is (= original [(:id owner) (:site owner) (:results owner) (:operations owner)]))
+    (is (= program (parallel-program/validate! program)))))
+
+(deftest owned-native-reduction-rejects-inconsistent-physical-phases
+  (let [[_ owner] (rms-reduction-owner)
+        last-index (dec (count (:operations owner)))
+        reason (fn [changed]
+                 (try (#'aot/owned-reduction-projection changed)
+                      nil
+                      (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))]
+    (doseq [changed [(assoc-in owner [:operations last-index :reduction :attributes :result-region :expression] 0.0)
+                     (assoc-in owner [:operations 0 :dtype] :float)
+                     (assoc-in owner [:operations 0 :reduction :components 0 :neutral] 7.0)
+                     (assoc-in owner [:operations 0 :space :dims 0 :bound] 7)
+                     (assoc-in owner [:operations 0 :phase] :cross-block)
+                     (update owner :algorithm
+                             (fn [[head facts equations outputs :as algorithm]]
+                               (with-meta (list head facts (conj equations (first equations)) outputs)
+                                 (meta algorithm))))
+                     (assoc owner :algorithm nil)]]
+      (is (= :unsupported-native-owned-reduction (reason changed))))))
+
+(deftest owned-native-reduction-keeps-raw-precision-and-evaluates-multi-use-transform-once
+  (let [[program owner] (rms-reduction-owner)
+        equation (first (dialect/equations (:algorithm owner)))
+        {:keys [accumulators]} (:attributes (dialect/operation-parts equation))
+        acc (first accumulators)
+        last-index (dec (count (:operations owner)))
+        result (first (:results owner))
+        raw-source (:source (#'aot/owned-reduction-projection owner))]
+    (doseq [[expression result-dtype expected-type]
+            [[(list 'clojure.core/+ acc acc) :double "double"]
+             [(list 'clojure.core/unchecked-float acc) :float "float"]]]
+      (let [transform (dialect/make-result-transform
+                       {:accumulator acc :expression expression :result-dtype result-dtype
+                        :operands [] :scalars []})
+            source (typed-route/materialize-functional-result-transform raw-source transform)
+            changed (assoc (with-owned-result-transform owner transform result-dtype) :source source)
+            algorithm (:algorithm changed)
+            emitted (binding [aot/*scheduled-program* program aot/*native-simd?* false]
+                      (#'aot/emit-owned-reduction changed result #{'x 'w 'out}))]
+        (is (= algorithm (dialect/validate! algorithm)))
+        (is (= 1 (count (re-seq #"double rstr_native_raw_\w+\s*=" emitted))))
+        (is (str/starts-with? emitted (str expected-type " " (ce/c-symbol result) ";")))
+        (is (not (str/includes? emitted "reduce(")))))
+    (doseq [[expression result-dtype expected-reason]
+            [[(completion/complete-value completion/object-input-contract acc)
+              :double :unclosed-c-family-value-completion]
+             [(list 'clojure.core/float acc)
+              :float :unsupported-native-owned-reduction]
+             [(list 'clojure.core/double (list 'clojure.core/int acc))
+              :double :unsupported-native-owned-reduction]
+             [(completion/complete-value
+               (completion/primitive-input-contract Float/TYPE {:unchecked-math false}) acc)
+              :float :unclosed-c-family-value-completion]]]
+      (let [transform (dialect/make-result-transform
+                     {:accumulator acc :expression expression :result-dtype result-dtype
+                      :operands [] :scalars []})
+          changed (with-owned-result-transform owner transform result-dtype)]
+      (is (= expected-reason
+             (try (binding [aot/*scheduled-program* program aot/*native-simd?* false]
+                    (#'aot/emit-owned-reduction changed result #{'x 'w 'out}))
+                  nil
+                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+          "a result boundary cannot waive native completion admission")))))
 
 (deftest canonical-c-host-bindings-and-retained-schedules-share-exact-ids
   (let [source '(let* [sum__98765 (raster.par/reduce acc 0.0 i (clojure.core/alength a)

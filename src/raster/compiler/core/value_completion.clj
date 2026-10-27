@@ -3,9 +3,13 @@
 
    Object input completion preserves source boxing/reference identity. An
    explicit primitive input context preserves the original expected-parameter
-   conversion under a retained source compilation policy. Neither is inferred
-   from a scalar tag or permission to reorder calls or enable an AD rule."
-  (:require [raster.compiler.core.util :as util]))
+   conversion under a retained source compilation policy. Bytecode result
+   completion replays an observed region context without converting its value.
+   None is inferred from a scalar tag or permission to reorder calls or enable
+   an AD rule."
+  (:require [raster.compiler.core.util :as util]
+            [raster.compiler.core.types :as types]
+            [raster.compiler.core.source-policy :as source-policy]))
 
 (def completion-symbol
   ;; Reserved IR syntax, deliberately not this namespace's constructor Var.
@@ -22,8 +26,7 @@
   "The retained Clojure source policy relevant to implicit primitive inputs.
    It is supplied by source compilation, never inferred from ambient state."
   [policy]
-  (and (map? policy) (= #{:unchecked-math} (set (keys policy)))
-       (contains? #{false true :warn-on-boxed} (:unchecked-math policy))))
+  (source-policy/valid? policy))
 
 (defn- primitive-carrier? [carrier]
   (and (class? carrier) (.isPrimitive ^Class carrier) (not= Void/TYPE carrier)))
@@ -52,6 +55,28 @@
                      :carrier parameter-class :source-policy source-policy})))
   {:source-context :jvm-primitive-input :target-carrier parameter-class
    :policy :preserve-source-input :source-policy source-policy})
+
+(defn source-integral-cast-contract
+  "Freeze an actual source int/long operation's compilation policy.
+   Construction proves no origin: the caller must own that source operation.
+   This is neither a resolved parameter Class nor a target-neutral numeric cast."
+  [operation policy]
+  (when-not (and (contains? #{:int :long} operation) (source-policy? policy))
+    (throw (ex-info "source integral cast requires an operation and retained policy"
+                    {:reason :unsupported-value-completion
+                     :operation operation :source-policy policy})))
+  {:source-context :source-integral-cast :operation operation :source-policy policy})
+
+(defn source-floating-cast-contract
+  "Retain an explicit source float/unchecked-float operation and its compilation policy.
+   This names the original RT overload, not an IEEE narrowing permission. Construction grants
+   no source-occurrence ownership, input-domain proof, totality or accelerator admission."
+  [operation policy]
+  (when-not (and (contains? #{:float :unchecked-float} operation) (source-policy? policy))
+    (throw (ex-info "source floating cast requires an explicit operation and retained policy"
+                    {:reason :unsupported-value-completion
+                     :operation operation :source-policy policy})))
+  {:source-context :source-floating-cast :operation operation :source-policy policy})
 
 (def bytecode-operand-context-keys
   "Bytecode result-position facts that affect an input's original evaluation.
@@ -96,15 +121,107 @@
   {:source-context :jvm-bytecode-integral-input :target-carrier parameter-class
    :policy :preserve-bytecode-input :operand-context operand-context})
 
+(defn bytecode-reference-input-contract
+  "Retain an actual reference consumer's original bytecode input context.
+   Object consumption and concrete reference checks are distinct from a source
+   CHECKCAST. The original Method (parameter or return) and operand context remain producer obligations;
+   this contract proves neither non-nullness nor runtime assignability."
+  [parameter-class operand-context]
+  (when-not (and (class? parameter-class) (not (.isPrimitive ^Class parameter-class))
+                 (bytecode-operand-context? operand-context))
+    (throw (ex-info "bytecode reference completion requires an actual reference parameter Class"
+                    {:reason :unsupported-value-completion :carrier parameter-class})))
+  {:source-context :jvm-bytecode-reference-input :target-carrier parameter-class
+   :policy :preserve-bytecode-input :operand-context operand-context})
+
+(defn bytecode-input-contract
+  "Select an existing input recipe from an actual resolved consumer Class.
+   This is not overload inference; original Method/context authority is external."
+  [carrier operand-context]
+  (cond
+    (and (class? carrier) (not (.isPrimitive ^Class carrier)))
+    (bytecode-reference-input-contract carrier operand-context)
+    (contains? #{Integer/TYPE Long/TYPE} carrier)
+    (bytecode-integral-input-contract carrier operand-context)
+    :else (bytecode-floating-input-contract carrier operand-context)))
+
+(defn bytecode-boxed-parameter-contract
+  "Retain one generated IFn entry's Object-to-compute-parameter completion.
+   Unlike typed invocation adaptation, this uses the wrapper's Number.xxxValue,
+   Boolean/Character unboxing or exact reference CHECKCAST. The producer owns
+   the actual wrapper/compute Method correspondence and argument evaluation order."
+  [parameter-class]
+  (when-not (and (class? parameter-class) (not= Void/TYPE parameter-class))
+    (throw (ex-info "boxed parameter completion requires a non-void resolved Class"
+                    {:reason :unsupported-value-completion :carrier parameter-class})))
+  {:source-context :jvm-bytecode-boxed-parameter-input :target-carrier parameter-class
+   :policy :preserve-bytecode-boxed-entry})
+
+(defn bytecode-result-context-contract
+  "Retain the actual bytecode region-entry context and normal result carrier.
+   This is not Object-input conversion: the consumer must return the original
+   value, without adding boxing, unboxing or a cast. It carries no payload,
+   presence, totality or transpose fact. The producer owns occurrence/context
+   correspondence; the constructor does not authenticate observations."
+  [operand-context result-carrier]
+  (when-not (and (bytecode-operand-context? operand-context)
+                 (contains? #{:ref :double :float :long :int :bool} result-carrier))
+    (throw (ex-info "bytecode result context requires an observed supported carrier"
+                    {:reason :unsupported-value-completion :result-carrier result-carrier})))
+  {:source-context :jvm-bytecode-result-context
+   :operand-context operand-context :result-carrier result-carrier})
+
+(defn- planned-input-carriers? [carrier raw]
+  (and (class? carrier) (contains? #{:ref :int :long :float :double :bool} raw)
+       ;; Object consumption boxes BEFORE the recorded carrier; concrete
+       ;; reference consumers require a reference before their CHECKCAST.
+       (or (.isPrimitive ^Class carrier) (= :ref raw))))
+
+(defn planned-bytecode-input-contract
+  "Construct a new owned physical program's input recipe from a resolved Class
+   and established raw carrier. This does not claim an earlier emitted source
+   occurrence. The owner must retain Method/selection/placement correspondence;
+   actual emission rechecks the raw operand before applying the conversion.
+   Unlike source-policy conversions this uses Raster's bytecode adaptation."
+  [parameter-class operand-context raw-carrier]
+  (when-not (planned-input-carriers? parameter-class raw-carrier)
+    (throw (ex-info "planned bytecode input requires an established raw carrier"
+                    {:reason :unsupported-value-completion :raw-carrier raw-carrier})))
+  (assoc (bytecode-input-contract parameter-class operand-context)
+         :expected-input-carrier raw-carrier))
+
 (defn canonical-contract? [contract]
   (and (map? contract)
        (or (= object-input-contract contract)
-           (and (= #{:source-context :target-carrier :policy :operand-context} (set (keys contract)))
+           (and (= #{:source-context :operation :source-policy} (set (keys contract)))
+                (= :source-integral-cast (:source-context contract))
+                (contains? #{:int :long} (:operation contract))
+                (source-policy? (:source-policy contract)))
+           (and (= #{:source-context :operation :source-policy} (set (keys contract)))
+                (= :source-floating-cast (:source-context contract))
+                (contains? #{:float :unchecked-float} (:operation contract))
+                (source-policy? (:source-policy contract)))
+           (and (= #{:source-context :target-carrier :policy} (set (keys contract)))
+                (= :jvm-bytecode-boxed-parameter-input (:source-context contract))
+                (= :preserve-bytecode-boxed-entry (:policy contract))
+                (class? (:target-carrier contract))
+                (not= Void/TYPE (:target-carrier contract)))
+           (and (= #{:source-context :operand-context :result-carrier} (set (keys contract)))
+                (= :jvm-bytecode-result-context (:source-context contract))
+                (contains? #{:ref :double :float :long :int :bool} (:result-carrier contract))
+                (bytecode-operand-context? (:operand-context contract)))
+           (and (or (= #{:source-context :target-carrier :policy :operand-context} (set (keys contract)))
+                    (and (= #{:source-context :target-carrier :policy :operand-context :expected-input-carrier}
+                            (set (keys contract)))
+                         (planned-input-carriers? (:target-carrier contract) (:expected-input-carrier contract))))
                 (case (:source-context contract)
                   :jvm-bytecode-floating-input
                   (contains? #{Float/TYPE Double/TYPE} (:target-carrier contract))
                   :jvm-bytecode-integral-input
                   (contains? #{Integer/TYPE Long/TYPE} (:target-carrier contract))
+                  :jvm-bytecode-reference-input
+                  (and (class? (:target-carrier contract))
+                       (not (.isPrimitive ^Class (:target-carrier contract))))
                   false)
                 (= :preserve-bytecode-input (:policy contract))
                 (bytecode-operand-context? (:operand-context contract)))
@@ -120,12 +237,52 @@
                 (primitive-carrier? (:target-carrier contract))
                 (source-policy? (:source-policy contract))))))
 
+(defn source-cast-result-tag
+  "The declared result of a valid source-cast contract, not an operand type proof.
+   This query grants no evaluation, portability or reordering permission."
+  [contract]
+  (when (and (canonical-contract? contract)
+             (contains? #{:source-integral-cast :source-floating-cast} (:source-context contract)))
+    (case (:operation contract) :int 'int :long 'long (:float :unchecked-float) 'float nil)))
+
+(defn invocation-result-description
+  "Describe the bounded source completion result, not its numerical operand.
+   Object input yields an opaque host value, even when numerical metadata says
+   Float. Buffer identities retain their separate existing storage projection.
+   This declares neither an input Class nor successful conversion/execution."
+  [contract]
+  (when (canonical-contract? contract)
+    (cond
+      (= object-input-contract contract) {:kind :opaque}
+      (source-cast-result-tag contract) {:kind :scalar :tag (source-cast-result-tag contract)}
+      (and (contains? #{:jvm-bytecode-boxed-parameter-input :jvm-bytecode-floating-input :jvm-bytecode-integral-input
+                        :jvm-primitive-input} (:source-context contract))
+           (some #(identical? (types/tag->java-class %) (:target-carrier contract)) '[float double long int]))
+      {:kind :scalar :tag (some #(when (identical? (types/tag->java-class %) (:target-carrier contract)) %)
+                               '[float double long int])})))
+
 (defn- value-meta [contract expression]
   ;; A new value term cannot inherit the original callee's identity/effects or
   ;; a JVM hint which changes physical compilation. Retain declarations only.
-  (select-keys (meta expression)
-               (cond-> [:line :column :file]
-                 (= object-input-contract contract) (conj :raster.type/tag))))
+  (let [metadata (select-keys (meta expression)
+                              (cond-> [:line :column :file]
+                                (= object-input-contract contract) (conj :raster.type/tag)))
+        ;; This conversion declares its result, not its operand. Carry the
+        ;; wrapper's explicit builtin target to the logical type pipeline at
+        ;; construction; never repair a lost type by guessing at a consumer.
+        ;; No JVM hint, successful conversion, presence or physical input fact
+        ;; follows from this declaration. Exact Class identity stays in contract.
+        ^Class target (:target-carrier contract)
+        tag (if-let [source-tag (source-cast-result-tag contract)]
+              source-tag
+              (when (= :jvm-bytecode-boxed-parameter-input (:source-context contract))
+              (if (.isPrimitive target)
+                (let [tag (symbol (.getName target))]
+                  (when (and (contains? types/primitive-info tag)
+                             (identical? target (types/tag->java-class tag))) tag))
+                (some (fn [[tag carrier]] (when (identical? target carrier) tag))
+                      types/primitive-array-info))))]
+    (cond-> metadata tag (assoc :raster.type/tag tag))))
 
 (defn complete-value
   "Build a checked completion term. The contract must come from the original
@@ -144,6 +301,94 @@
 (defn canonical-parts [expression]
   (when (canonical-form? expression)
     {:contract (second expression) :operand (nth expression 2)}))
+
+(defn object-input-parts
+  "Recognize ONLY the exact canonical Object-input completion syntax.
+   Its operand still owes evaluation and its own value/storage evidence. This
+   query grants no blanket conversion erasure, Class, presence or alias fact."
+  [expression]
+  (let [parts (canonical-parts expression)]
+    (when (= object-input-contract (:contract parts)) parts)))
+
+(defn planned-compound-integral-input-parts
+  "Recognize a declared owned Int/Long result recipe, not its provenance or executability.
+   Actual Method/completion, current ports, callback closure and representation
+   correspondence must still be established by the source consumer. Its input
+   values remain a separate, currently Long-only physical-frame obligation."
+  [expression]
+  (let [{:keys [contract operand] :as parts} (canonical-parts expression)]
+    (when (and (= :jvm-bytecode-integral-input (:source-context contract))
+               (contains? #{Integer/TYPE Long/TYPE} (:target-carrier contract))
+               (contains? #{:int :long :ref} (:expected-input-carrier contract))
+               (seq? operand))
+      parts)))
+
+(defn numeric-object-literal-carrier
+  "Physical carrier of a direct primitive numeric literal in canonical Object input context.
+   No cast, closed expression, logical hint or arbitrary Number conversion is evaluated. This
+   recognizes a bounded source recipe, not execution or permission to replace its owned reference."
+  [expression]
+  (when-let [parts (object-input-parts expression)]
+    (types/numeric-literal-carrier (:operand parts))))
+
+(defn reference-input-parts
+  "Recognize an explicit entry/Method reference CHECKCAST, without discharging it.
+   The actual Class remains in the original contract. No declaration, storage
+   dtype or source spelling establishes the operand's Class or presence."
+  [expression]
+  (when-let [{:keys [contract] :as parts} (canonical-parts expression)]
+    (let [carrier (:target-carrier contract)]
+      (when (and (contains? #{:jvm-bytecode-boxed-parameter-input :jvm-bytecode-reference-input}
+                            (:source-context contract))
+                 (class? carrier) (not (.isPrimitive ^Class carrier)))
+        parts))))
+
+(defn boxed-reference-input-parts
+  "The boxed-wrapper-only specialization of the reference-input grammar."
+  [expression]
+  (let [parts (reference-input-parts expression)]
+    (when (= :jvm-bytecode-boxed-parameter-input (get-in parts [:contract :source-context]))
+      parts)))
+
+(defn reference-return-parts
+  "Recognize a closed reference return recipe over one lexical value. This
+   supplies no operand Class or permission to remove either completion; a
+   current owned emitter observation must discharge both reference edges."
+  [expression]
+  (let [checked (canonical-parts expression)
+        contextual (canonical-parts (:operand checked))
+        carrier (get-in checked [:contract :target-carrier])]
+    (when (and (= :jvm-checkcast (get-in checked [:contract :source-context]))
+               (class? carrier) (not (.isPrimitive ^Class carrier))
+               (= :jvm-bytecode-result-context (get-in contextual [:contract :source-context]))
+               (= :ref (get-in contextual [:contract :result-carrier]))
+               (false? (get-in contextual [:contract :operand-context :void-context]))
+               (symbol? (:operand contextual)))
+      {:contract (:contract checked) :operand (:operand contextual)
+       :reference-return? true :completions [expression (:operand checked)]})))
+
+(defn bytecode-context-form?
+  "A canonical region whose reconstruction needs original bytecode authority.
+   Shape recognition is a rewrite barrier, not proof of ownership or execution."
+  [expression]
+  (contains? #{:jvm-bytecode-boxed-parameter-input
+               :jvm-bytecode-reference-input :jvm-bytecode-integral-input
+               :jvm-bytecode-floating-input :jvm-bytecode-result-context}
+             (get-in (canonical-parts expression) [:contract :source-context])))
+
+(defn object-value-declaration
+  "An exact Object completion preserves an explicitly declared logical value.
+   This conveys no presence or physical carrier and does not infer from hints.
+   Other conversions need their own declaration authority."
+  [expression]
+  (when-let [{:keys [operand]} (object-input-parts expression)]
+    (let [tag (:raster.type/tag (meta operand))
+          existing (:raster.type/tag (meta expression))]
+      (when (and tag existing (not= tag existing))
+        (throw (ex-info "Object completion has conflicting logical declarations"
+                        {:reason :conflicting-value-completion-declaration
+                         :operand-tag tag :completion-tag existing})))
+      tag)))
 
 (defn contains-completion?
   "Whether executable syntax contains a retained input/result context. Quoted
@@ -205,6 +450,8 @@
    than replacing it with a guessed core cast. The caller MUST compile the
    returned form under that same retained policy and physical lexical scope;
    this pure projection does not execute or police later compilation.
+   Source numeric casts instead name their frozen RT operation explicitly;
+   their conversion policy does not depend on the consuming compiler binding.
    CHECKCAST contexts additionally require an owner-local map from the actual
    Class to a fresh lexical Class value port. The owner must bind the actual
    Class there and preserve its scope; a Class literal can lose loader identity.
@@ -219,13 +466,29 @@
      (if (and (seq? form) (= completion-symbol (first form)))
        (if-let [{:keys [contract operand]} (canonical-parts form)]
          (with-meta (case (:source-context contract)
-                      (:jvm-bytecode-floating-input :jvm-bytecode-integral-input)
-                      (throw (ex-info "Bytecode-owned input completion requires its bytecode consumer"
+                      (:jvm-bytecode-boxed-parameter-input
+                       :jvm-bytecode-floating-input :jvm-bytecode-integral-input
+                       :jvm-bytecode-reference-input :jvm-bytecode-result-context)
+                      (throw (ex-info "Bytecode-owned completion requires its bytecode consumer"
                                       {:reason :unsupported-value-completion-source-context
                                        :contract contract}))
                       :jvm-object-input (list '. (list 'do Object) (list 'cast operand))
                       :jvm-checkcast (list '. (reference-class-expression contract reference-bindings)
                                           (list 'cast operand))
+                      :source-integral-cast
+                      ;; Freeze the selected runtime operation, not an ambient-policy
+                      ;; core inline. Clojure still selects its actual operand overload.
+                      (list (symbol "clojure.lang.RT"
+                                    (case (:operation contract)
+                                      :int (if (source-policy/unchecked-math (:source-policy contract))
+                                             "uncheckedIntCast" "intCast")
+                                      :long "longCast")) operand)
+                      :source-floating-cast
+                      (list (symbol "clojure.lang.RT"
+                                    (case (:operation contract)
+                                      :float (if (source-policy/unchecked-math (:source-policy contract))
+                                               "uncheckedFloatCast" "floatCast")
+                                      :unchecked-float "uncheckedFloatCast")) operand)
                       :jvm-primitive-input (project-primitive-input contract operand compilation-policy))
            (value-meta contract form))
          (throw (ex-info "invalid canonical value completion"

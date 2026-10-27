@@ -690,6 +690,25 @@
 ;; O4 — composition: HVP = FD(grad); Jet-k coeffs = k-th derivatives
 ;; ================================================================
 
+(deftest runtime-vector-product-zeros-preserve-shape-and-leaf-types
+  (is (= [] (tangent/zero-like [])))
+  (let [input (float-array [2.0 3.0])
+        primal [(float 1.0) [4.0 nil input []]]
+        zero (tangent/zero-like primal)
+        zero-again (tangent/zero-like primal)
+        array-zero (get-in zero [1 2])]
+    (is (instance? Float (first zero)))
+    (is (= [0.0 nil] (subvec (second zero) 0 2)))
+    (is (= (class input) (class array-zero)))
+    (is (= [0.0 0.0] (vec array-zero)))
+    (is (= [] (get-in zero [1 3])))
+    (is (not (identical? input array-zero)))
+    (is (not (identical? array-zero (get-in zero-again [1 2]))))
+    (is (= [2.0 3.0] (vec input))))
+  (is (thrown? clojure.lang.ExceptionInfo (tangent/zero-like [(Object.)])))
+  (is (thrown? clojure.lang.ExceptionInfo (tangent/zero-like {:x 1.0})))
+  (is (thrown? clojure.lang.ExceptionInfo (tangent/zero-like '(1.0)))))
+
 (deftest o4-composition-law
   (testing "compile-hvp-fn on quadratic: exact Hessian columns"
     (let [hvp (rev/compile-hvp-fn #'laws-quad)]

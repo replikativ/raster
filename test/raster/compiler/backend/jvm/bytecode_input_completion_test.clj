@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.backend.jvm.bytecode :as bytecode]
             [raster.compiler.core.value-completion :as completion]
+            [raster.compiler.core.source-arithmetic :as source-arithmetic]
             [raster.compiler.core.types :as types]
             [raster.core :as core :refer [deftm]]))
 
@@ -429,3 +430,177 @@
                 (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
     (let [f (compiled ['failure] (completion/complete-value contract '(throw failure)))]
       (is (= {:error IllegalStateException} (outcome f (IllegalStateException. "stop")))))))
+
+(defn- owned-integral-completion
+  [operand tags target]
+  (let [contract (completion/bytecode-integral-input-contract
+                  target (completion/bytecode-operand-context
+                          {:preserve-source-call-results? true}))
+        original (completion/complete-value contract operand)
+        input-body [original]
+        interface (types/ensure-fn-interface! tags)
+        return-tag (if (identical? Integer/TYPE target) 'int 'long)]
+    (assoc (#'core/emit-owned-bytecode!
+            bytecode/compile-typed-impl! "raster.compiled.CompoundIntegralCompletion"
+            '[left right] tags return-tag input-body
+            (the-ns 'raster.compiler.backend.jvm.bytecode-input-completion-test)
+            (:iface-name interface) 'compound-integral-completion)
+           :input-body input-body :original original)))
+
+(defn- owned-long-completion
+  ([operand] (owned-long-completion operand '[long long]))
+  ([operand tags] (owned-integral-completion operand tags Long/TYPE)))
+
+(defonce completion-reference-inputs (atom []))
+
+(defn observe-completion-reference-input [value]
+  (swap! completion-reference-inputs conj value)
+  value)
+
+(deftest owned-long-completion-preserves-actual-reference-ports-without-payload-authority
+  (let [operand (list 'clojure.core/* 'left
+                      (typed-helper-call
+                       #'integral-long-caller
+                       '(observe-completion-reference-input right)))
+        {:keys [implementation emission input-body original]}
+        (owned-long-completion operand '[long Object])
+        before (count @completion-reference-inputs)
+        region (bytecode/compile-owned-bytecode-completion-region emission input-body original)
+        conversions (atom 0)
+        number (proxy [Number] []
+                 (longValue [] (swap! conversions inc) (long 7))
+                 (intValue [] (int 7))
+                 (floatValue [] (float 7))
+                 (doubleValue [] (double 7)))]
+    (is (= before (count @completion-reference-inputs)) "construction executes no operand")
+    (is (= [Long/TYPE Object]
+           (vec (.getParameterTypes ^java.lang.reflect.Method (:method region)))))
+    (is (= :ref (get-in region [:physical-ports 'right :type])))
+    (is (identical? Object (get-in region [:physical-ports 'right :reference-class])))
+    (is (boolean? (get-in region [:physical-ports 'right :verified])))
+    ;; Strings/custom Numbers are exercised ONLY as faithful bytecode replay.
+    ;; This API intentionally grants no source callback closure or payload fact.
+    (doseq [[left right] [[3 (Long/valueOf 100000)] [Long/MAX_VALUE (Long/valueOf 2)]
+                         [3 nil] [3 "not a Number"] [3 number]]]
+      (reset! completion-reference-inputs [])
+      (is (= (outcome implementation left right) (outcome (:invoke region) left right)))
+      (is (= 2 (count @completion-reference-inputs)))
+      (is (every? #(identical? right %) @completion-reference-inputs)
+          "original Object ports are passed unchanged, never rewritten as primitive Longs"))
+    (is (= 2 @conversions) "each original/reference replay performs its actual Number conversion")))
+
+(deftest owned-compound-long-completion-preserves-ports-order-and-overflow
+  (doseq [arithmetic ['(clojure.core/- left right)
+                     (typed-helper-call #'integral-long-caller '(clojure.core/- left right))]]
+    (let [operand (list 'do '(clojure.core/swap! input-calls clojure.core/inc) arithmetic)
+          {:keys [implementation emission input-body original]} (owned-long-completion operand)
+          record (bytecode/retained-input-completion-context emission input-body original)
+          before @input-calls
+          region (bytecode/compile-owned-bytecode-completion-region emission input-body original)]
+      (is (= before @input-calls) "constructing a physical replay never evaluates its operand")
+      (is (= '[left right] (:parameters region)) "ports use original physical slot order")
+      (is (= #{'left 'right} (set (keys (:physical-ports region)))))
+      (is (= #{:long} (set (map :type (vals (:physical-ports region))))))
+      (is (contains? #{:long :ref} (:input-carrier record)))
+      (is (identical? Long/TYPE (.getReturnType ^java.lang.reflect.Method (:method region))))
+      (doseq [[left right] [[9 4] [4 9] [Long/MIN_VALUE 1] [Long/MAX_VALUE -1]]]
+        (let [before @input-calls
+              expected (outcome implementation left right)
+              actual (outcome (:invoke region) left right)]
+          (is (= expected actual))
+          (is (= (+ before 2) @input-calls) "each replay evaluates the callback exactly once"))))))
+
+(deftest owned-compound-int-completion-preserves-raw-narrowing-order-and-overflow
+  (doseq [operand [(list 'do '(clojure.core/swap! input-calls clojure.core/inc)
+                              '(clojure.core/* left right))
+                   (typed-helper-call #'integral-long-caller
+                                      '(clojure.core/* left right))
+                   (typed-helper-call #'integral-int-caller
+                                      '(clojure.core/int (clojure.core/* left right)))]]
+    (let [{:keys [implementation emission input-body original]}
+          (owned-integral-completion operand '[long long] Integer/TYPE)
+          record (bytecode/retained-input-completion-context emission input-body original)
+          before @input-calls
+          region (bytecode/compile-owned-bytecode-completion-region emission input-body original)]
+      (is (= before @input-calls) "constructing the Int replay executes no operand")
+      (is (= '[left right] (:parameters region)))
+      (is (= #{:long} (set (map :type (vals (:physical-ports region))))))
+      (is (contains? #{:long :ref} (:input-carrier record)))
+      (is (identical? Integer/TYPE (.getReturnType ^java.lang.reflect.Method (:method region))))
+      (doseq [[left right] [[0 0] [3 2] [-1 1] [4294967297 1]
+                            [65536 65536] [Long/MAX_VALUE Long/MAX_VALUE]]]
+        (is (= (outcome implementation left right)
+               (outcome (:invoke region) left right))
+            "the outlined completion keeps the original JVM l2i/Number.intValue behavior")))))
+
+(deftest owned-int-completion-faithfully-replays-an-actual-reference-input
+  (let [operand '(observe-completion-reference-input right)
+        {:keys [implementation emission input-body original]}
+        (owned-integral-completion operand '[long Object] Integer/TYPE)
+        record (bytecode/retained-input-completion-context emission input-body original)
+        region (bytecode/compile-owned-bytecode-completion-region emission input-body original)
+        conversions (atom 0)
+        number (proxy [Number] []
+                 (intValue [] (swap! conversions inc) (int 7))
+                 (longValue [] (long 7))
+                 (floatValue [] (float 7))
+                 (doubleValue [] (double 7)))]
+    (is (= :ref (:input-carrier record)))
+    (is (= ['right] (:parameters region)))
+    (is (= [Object] (vec (.getParameterTypes ^java.lang.reflect.Method (:method region)))))
+    (doseq [right [(Long/valueOf 3) nil "not a Number" number]]
+      (reset! completion-reference-inputs [])
+      (is (= (outcome implementation 0 right) (outcome (:invoke region) right)))
+      (is (= 2 (count @completion-reference-inputs)))
+      (is (every? #(identical? right %) @completion-reference-inputs)))
+    (is (= 2 @conversions) "each original/reference replay performs its actual intValue callback")))
+
+(deftest primitive-long-quot-observes-only-actual-identity-inputs
+  (let [node '(clojure.core/quot left right)
+        {:keys [implementation emission input-body original]} (owned-long-completion node)
+        record (bytecode/retained-input-arithmetic emission input-body node)
+        region (bytecode/compile-owned-bytecode-completion-region emission input-body original)]
+    (is (= "quot" (:operator record)))
+    (is (= (source-arithmetic/primitive-operation-policy "/" :long) (:policy record)))
+    (is (= :long (:result-carrier record)))
+    (is (= [:long :long] (mapv :emitted-type (:input-completions record))))
+    (is (= [:identity :identity] (mapv :adaptation (:input-completions record))))
+    (is (= [0 1] (:evaluation-order record)))
+    (is (= [] (:completion-order record)))
+    (is (nil? (bytecode/retained-input-arithmetic emission input-body (apply list node))))
+    (is (not-any? #(contains? record %) [:pure? :total? :nonthrowing :range]))
+    (doseq [[left right] [[9 4] [-9 4] [9 -4] [Long/MIN_VALUE -1] [1 0]]]
+      (is (= (outcome implementation left right) (outcome (:invoke region) left right))))
+    (is (= {:error ArithmeticException} (outcome (:invoke region) 1 0))))
+  (let [node (list 'clojure.core/quot 'left
+                   (completion/complete-value completion/object-input-contract 'right))
+        {:keys [emission input-body]} (owned-long-completion node)]
+    (is (nil? (bytecode/retained-input-arithmetic emission input-body node))
+        "a reference/unboxing operand is not a primitive identity-input observation")))
+
+(deftest owned-compound-long-completion-rejects-copied-foreign-and-stale-origins
+  (let [{:keys [emission input-body original]}
+        (owned-long-completion
+         (list 'do '(clojure.core/swap! input-calls clojure.core/inc)
+               (typed-helper-call #'integral-long-caller '(clojure.core/- left right))))
+        foreign (owned-long-completion '(clojure.core/- left right))
+        reject (fn [owner body expression]
+                 (try (bytecode/compile-owned-bytecode-completion-region owner body expression)
+                      :accepted
+                      (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))]
+    (doseq [[owner body expression]
+            [[emission input-body (with-meta (apply list original) (meta original))]
+             [emission (vec (seq input-body)) original]
+             [(:emission foreign) input-body original]]]
+      (is (= :unowned-bytecode-completion-region (reject owner body expression))))
+    (let [region (bytecode/compile-owned-bytecode-completion-region emission input-body original)
+          source (core/resolve-deftm-var #'integral-long-helper)
+          metadata (meta source)
+          before @input-calls]
+      (try
+        (alter-meta! source assoc ::stale-completion-owner true)
+        (is (thrown? clojure.lang.ExceptionInfo
+                     (bytecode/compile-owned-bytecode-completion-region emission input-body original)))
+        (is (thrown? clojure.lang.ExceptionInfo ((:invoke region) 9 4)))
+        (is (= before @input-calls) "a stale owner fails before any operand callback")
+        (finally (reset-meta! source metadata))))))

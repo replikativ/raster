@@ -7,6 +7,9 @@
 (defn report-costs [report]
   (when-not (= 1 (:schema-version report))
     (throw (ex-info "unsupported CI timing schema" {})))
+  (when-not (= :completed (:run-state report))
+    (throw (ex-info "timing weights require a completed CI report"
+                    {:run-state (:run-state report)})))
   (when-not (map? (:namespaces report))
     (throw (ex-info "CI timing report requires a namespace map" {})))
   (into {}

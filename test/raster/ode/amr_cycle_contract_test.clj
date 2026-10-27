@@ -1,22 +1,21 @@
 (ns raster.ode.amr-cycle-contract-test
   (:require [clojure.test :refer [deftest is]]
-            [raster.compiler.core.hardware :as hardware]
+            [raster.compiler.equation-first :as equation-first]
             [raster.compiler.ir.emitted-parallel-program :as emitted]
             [raster.ode.amr-cycle-contract :as contract]
-            [raster.ode.amr-cycle-lowering :as lowering]
-            [raster.ode.amr-subcycle :as subcycle]
-            [raster.ode.amr-subcycle-test :as oracle]))
+            [raster.ode.amr-subcycle :as subcycle]))
 
 (def ^:private retained-cycle
   (delay
     (let [target :ocl:temporal-contract
           descriptor {:device-id target :device-type :gpu :backend :ocl :fp64? true
-                      :subgroup-dialect :intel-opencl :max-workgroup-size 256}
-          p (subcycle/project (#'oracle/hierarchy) {:domain-lengths [1.0 1.0] :diffusivity 0.2})
-          {:keys [coarse fine]} (#'oracle/initial-state)]
-      (with-redefs [hardware/descriptor-for (constantly descriptor)]
-        (get-in (lowering/lower p (double-array coarse) (double-array fine) 0.001 {:target target})
-                [:lowering :plan :instances 0 :call :program])))))
+                      :subgroup-dialect :intel-opencl :max-workgroup-size 256}]
+      ;; Match the real cycle lowerer's argument-independent compilation template.
+      ;; Stage contracts require its emitted semantics, not private scratch ownership
+      ;; or a concrete composition before ordered source work has completed.
+      (:emitted (equation-first/compile #'subcycle/diffusion-cycle!
+                                       {:target target :dtype :double :inline? true}
+                                       descriptor)))))
 
 (defn- stages [program]
   ;; Independent producer partition of this authored numerical cycle. The validator

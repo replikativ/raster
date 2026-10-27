@@ -1,9 +1,10 @@
 (ns raster.compiler.passes.scalar.normal-return-test
   (:require [clojure.test :refer [deftest is use-fixtures]]
-            [raster.core :as core :refer [deftm]]
+            [raster.core :as core :refer [deftm broadcast]]
             [raster.compiler.core.types :as types]
             [raster.compiler.core.method-entry :as method-entry]
             [raster.compiler.core.inference :as inference]
+            [raster.compiler.core.value-completion :as completion]
             [raster.compiler.passes.parallel.scalar-expression-body :as scalar-body]
             [raster.compiler.passes.scalar.normal-return :as normal]
             [raster.compiler.passes.scalar.local-products :as products]
@@ -11,8 +12,25 @@
             [raster.compiler.passes.parallel.materialize :as materialize]
             [raster.compiler.pipeline :as pipeline]))
 
+(deftest floating-completion-presence-is-conditional-not-totality-or-input-domain
+  (doseq [operation [:float :unchecked-float]]
+    (let [contract (completion/source-floating-cast-contract operation {:unchecked-math false})]
+      (is (= {:presence :present}
+             (normal/result-fact (completion/complete-value contract 'unknown-input))))
+      (is (= {:presence :no-return}
+             (normal/result-fact (completion/complete-value contract '(throw failure))))))))
+
 (use-fixtures :each
   (fn [test!]
+    ;; These tests consume frozen semantic source, not a pending receiver's raw
+    ;; syntax or a warm receiver's optimized body. Preparation is an explicit
+    ;; producer action before the read-only query's independent owner begins.
+    (doseq [name '[allocated effectful-allocation recursive-array borrowed-array
+                  nullable-array borrowed-array-with-count throwing-array
+                  discarded-array object-array-result mismatched-array-result broadcast-array
+                  effectful-primitive-return boxed-reference-return]]
+      (when-let [v (ns-resolve 'raster.compiler.passes.scalar.normal-return-test name)]
+        (core/prepare-emission-source-walk! (core/resolve-deftm-var v))))
     (binding [method-entry/*emission-inputs* (atom {:static [] :values []})]
       (test!))))
 
@@ -85,6 +103,18 @@
 
 (deftm borrowed-array-with-count [n :- Long x :- (Array double)] :- (Array double) x)
 
+(deftm discarded-array [n :- Long] :- Void (clojure.core/double-array n))
+(deftm object-array-result [n :- Long] :- Object (clojure.core/double-array n))
+(deftm mismatched-array-result [n :- Long] :- (Array float) (clojure.core/double-array n))
+(deftm broadcast-array [input :- (Array double) n :- Long] :- (Array double)
+  (broadcast [input] input))
+
+(deftm effectful-primitive-return [events :- (Array long) value :- Object] :- Double
+  (aset events 0 (inc (aget events 0)))
+  value)
+
+(deftm boxed-reference-return [n :- Long] :- java.lang.Double nil)
+
 (defn- selected-call [v args]
   (let [m (meta v) operation (symbol (str (:ns m)) (str (:name m)))
         entry (first (get (core/methods-of v) (count args)))
@@ -92,8 +122,105 @@
     (with-meta (list* '.invk (symbol (str (:mangled-ns entry)) (str name "-impl")) args)
       {:raster.op/original operation})))
 
+(deftest semantic-presence-retains-the-original-reference-return-contract
+  (is (= {:presence :present :array-tag 'doubles}
+         (normal/result-fact (selected-call #'object-array-result '[n]))))
+  (is (= {:presence :present :array-tag 'doubles}
+         (normal/result-fact (selected-call #'broadcast-array '[input n])))
+      "owned structural pmap uses the existing materializer's allocation contract")
+  (is (= {:presence :unknown}
+         (normal/result-fact (selected-call #'discarded-array '[n]))))
+  (is (= {:presence :unknown}
+         (normal/result-fact (selected-call #'mismatched-array-result '[n]))))
+  (let [call (selected-call #'discarded-array '[0])]
+    (core/ensure-bytecode-implementation! (find-var (second call)))
+    (is (nil? (discarded-array 0)) "void completion discards the present body value")))
+
+(deftest semantic-presence-survives-only-legitimate-jit-and-intrinsic-history
+  (let [v (binding [*ns* (the-ns 'raster.compiler.passes.scalar.normal-return-test)]
+            (eval '(core/deftm fresh-semantic-array [n :- Long] :- Object
+                     (clojure.core/double-array n))))
+        call (selected-call v '[n])
+        receiver (find-var (second call))
+        cold-root (var-get receiver)
+        before @method-entry/*emission-inputs*
+        _ (is (= {:presence :unknown} (normal/result-fact call))
+              "a read-only query does not prepare a missing semantic frontend")
+        _ (is (identical? before @method-entry/*emission-inputs*))
+        _ (is (identical? cold-root (var-get receiver)))
+        _ (core/prepare-emission-source-walk! (core/resolve-deftm-var v))
+        captured (method-entry/call-with-definition-inputs
+                  #(let [result (normal/result-fact call)]
+                     [result @method-entry/*emission-inputs*]))]
+    (is (= {:presence :present :array-tag 'doubles} (first captured)))
+    (is (not (contains? (:definition-proofs (second captured)) receiver)))
+    (is (some? (:raster.core/jit-spec (meta receiver))))
+    (core/ensure-bytecode-implementation! receiver)
+    (is (nil? (:raster.core/jit-spec (meta receiver))))
+    (is (true? (method-entry/assert-definition-inputs-current! (second captured))))
+    (with-redefs [clojure.core/double-array (fn [_] nil)]
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (method-entry/assert-definition-inputs-current! (second captured))))
+      (is (= :intrinsic-source-definition-mismatch
+             (try (binding [method-entry/*emission-inputs* nil]
+                    (method-entry/call-with-definition-inputs #(normal/result-fact call)))
+                  :accepted
+                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))))
+
+(deftest primitive-return-completion-is-not-totality-or-body-carrier-evidence
+  (is (= {:presence :unknown}
+         (normal/result-fact (selected-call #'boxed-reference-return '[n]))))
+  (is (nil? (boxed-reference-return 0)) "an explicitly boxed reference may return nil")
+  (is (= {:presence :unknown}
+         (normal/result-fact (with-meta '(unknown-number) {:raster.type/tag 'double}))))
+  (let [call (selected-call #'effectful-primitive-return '[events input])
+        receiver (find-var (second call))
+        raw (list 'let* ['result call] '(if (clojure.core/nil? result) :absent :present))
+        captured (method-entry/call-with-definition-inputs
+                  #(let [fact (normal/result-fact call)
+                         lowered (products/lower-local-products raw)]
+                     {:fact fact :lowered lowered :inputs @method-entry/*emission-inputs*}))
+        compile! #(eval (list 'fn* '[events input] %))
+        original (compile! raw)
+        optimized (compile! (:lowered captured))
+        observe (fn [function value]
+                  (let [events (long-array [0])
+                        outcome (try {:value (function events value)}
+                                     (catch Throwable error {:error (class error)}))]
+                    (assoc outcome :events (vec events))))]
+    (is (= {:presence :present :scalar-type :double} (:fact captured)))
+    (is (not (contains? (:definition-proofs (:inputs captured)) receiver)))
+    (is (= 1 (count (filter #(= call %) (tree-seq coll? seq (:lowered captured))))))
+    (doseq [value [2.0 nil (Object.)]]
+      (let [expected (observe original value)
+            actual (observe optimized value)]
+        (is (= expected actual))
+        (is (= [1] (:events actual)) "unknown body effects and return conversions run once")
+        (if (number? value)
+          (is (= :present (:value actual)))
+          (is (class? (:error actual)) "presence is conditional on successful return"))))
+    (is (true? (method-entry/assert-definition-inputs-current! (:inputs captured)))
+        "genuine JIT did not change the semantic return contract")))
+
+(deftest return-domain-does-not-import-hints-or-promote-branch-widths
+  (is (= {:presence :present}
+         (normal/result-fact 'input {'input {:presence :present :scalar-type :double
+                                            :producer-scalar-type :float}})))
+  (let [operation 'raster.numeric//
+        signature (inference/registered-call-signature operation '[float float])
+        implementation (symbol (str (:mangled-sym signature) "-impl"))
+        _ (core/prepare-deftm-frontend! (find-var (:mangled-sym signature)))
+        float-call (with-meta (list '.invk implementation 'left 'right)
+                     {:raster.op/original operation})
+        double-call (selected-call #'effectful-primitive-return '[events input])
+        fact #(method-entry/call-with-definition-inputs (fn [] (normal/result-fact %)))]
+    (is (= {:presence :present :scalar-type :float} (fact float-call)))
+    (is (= {:presence :present} (fact (list 'if 'condition float-call double-call))))
+    (is (= {:presence :present :scalar-type :float}
+           (fact (list 'if 'condition float-call float-call))))))
+
 (deftest presence-never-uses-source-captured-before-its-observation
-  (doseq [selection [:typed :direct] mutate-on [1 2]]
+  (doseq [selection [:typed :direct] phase [:before-observation :after-observation]]
     (let [v (if (= selection :typed) #'allocated #'direct-allocated)
           operation (symbol (str (:ns (meta v))) (str (:name (meta v))))
           entry (first (get (core/methods-of v) 1))
@@ -105,7 +232,9 @@
           call (if (= selection :typed) (selected-call v [0]) (list implementation 0))
           selector-var (if (= selection :typed) #'method-entry/selected-definition
                            #'method-entry/direct-selected-definition)
-          original @selector-var calls (atom 0)
+          original @selector-var
+          observe! method-entry/observe-definition-input!
+          changed? (atom false)
           inputs (atom {:static [] :values []})]
       (is (some? (original operation implementation 1))
           "both fixtures must reach a real admitted definition")
@@ -114,16 +243,24 @@
           (with-redefs-fn
             {selector-var (fn [& arguments]
                             (let [selected (apply original arguments)]
-                              (when (and selected (= mutate-on (swap! calls inc)))
+                              (when (and selected (= :before-observation phase)
+                                         (compare-and-set! changed? false true))
                                 (alter-var-root source (constantly (fn [_] nil))))
-                              selected))}
-            #(if (= mutate-on 1)
+                              selected))
+             #'method-entry/observe-definition-input!
+             (fn [v & arguments]
+               (let [result (apply observe! v arguments)]
+                 (when (and (identical? v source) (= :after-observation phase)
+                            (compare-and-set! changed? false true))
+                   (alter-var-root source (constantly (fn [_] nil))))
+                 result))}
+            #(if (= :before-observation phase)
                (do (is (= {:presence :unknown} (normal/result-fact call)))
                    (is (true? (method-entry/assert-definition-inputs-current! @inputs))))
                (is (= :stale-definition-proof-input
                       (try (normal/result-fact call) nil
                            (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))
-                   (pr-str [selection mutate-on @calls])))))
+                   (pr-str [selection phase @changed?])))))
         (finally (alter-var-root source (constantly saved)))))))
 
 (deftest selected-scalar-presence-is-owned-and-does-not-bypass-definition-checks
@@ -272,7 +409,10 @@
   (is (= :present (normal/presence '(raster.par/pmap i 0 float (unknown i)))))
   (is (= :unknown (normal/presence
                    (with-meta '(raster.par/pmap i 0 float (unknown i))
-                     {:raster.op/lexical-callee true})))))
+                     {:raster.op/lexical-callee true}))))
+  (doseq [expression ['(raster.par/pmap i 0 float (unknown i) extra)
+                      '(raster.par/pmap 0 0 float (unknown i))]]
+    (is (= :unknown (normal/presence expression)))))
 
 (deftest optional-materialization-declines-only-its-unsupported-domain
   (let [unsupported '(raster.par/pmap i 0 unknown-cast i)
@@ -321,6 +461,68 @@
         (when (instance? java.lang.AutoCloseable compiled)
           (.close ^java.lang.AutoCloseable compiled))))))
 
+(deftest normalization-analysis-isolates-repeated-semantic-footprints-without-caching-facts
+  (let [source (core/resolve-deftm-var #'allocated)
+        call (selected-call #'allocated '[n])
+        selected! @#'normal/selected-result*
+        measurements
+        (mapv (fn [n]
+                (let [visits (atom 0) queries (atom 0)
+                      unrelated (reify method-entry/RetainedProducerInput
+                                  (assert-producer-current! [this] (swap! visits inc) this))
+                      parent (atom {:static [] :values [] :producer-inputs [unrelated]})]
+                  (binding [method-entry/*emission-inputs* parent]
+                    (with-redefs-fn
+                      {#'normal/selected-result* (fn [& arguments]
+                                                  (swap! queries inc) (apply selected! arguments))}
+                      #(method-entry/call-with-definition-analysis
+                        (fn []
+                          (dotimes [_ n]
+                            (is (= {:presence :present :array-tag 'doubles}
+                                   (normal/result-fact call))))))))
+                  (is (>= @queries n) "every query still performs actual analysis, not a fact-cache hit")
+                  (is (contains? (:definition-proofs @parent) source))
+                  {:visits @visits :producers (count (:producer-inputs @parent))})) [2 16])]
+    (is (= (first measurements) (second measurements))
+        "neither unrelated validation nor producer history grows with repeated use of the same dependencies")
+    (is (<= 1 (:visits (first measurements)) 6))))
+
+(deftest standalone-result-fact-does-not-add-a-new-unrelated-parent-fence
+  (let [visits (atom 0)
+        unrelated (reify method-entry/RetainedProducerInput
+                    (assert-producer-current! [_]
+                      (swap! visits inc)
+                      (throw (ex-info "stale unrelated parent" {:reason ::stale-parent}))))
+        parent (atom {:static [] :values [] :producer-inputs [unrelated]})]
+    (binding [method-entry/*emission-inputs* parent]
+      (is (= {:presence :present} (normal/result-fact 1.0)))
+      (is (zero? @visits))
+      (is (= ::stale-parent
+             (try (method-entry/call-with-definition-analysis #(normal/result-fact 1.0)) nil
+                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))
+      (is (= 1 @visits)))))
+
+(deftest normalization-analysis-does-not-leak-proof-work-or-realize-quoted-data
+  (let [forced (atom 0)
+        payload (lazy-seq (swap! forced inc) (list 'opaque-data))
+        quoted (list 'quote payload)
+        owner (atom {:static [] :values []})
+        [output quoted-output]
+        (binding [method-entry/*emission-inputs* owner]
+          (method-entry/call-with-definition-analysis
+           (fn []
+             [(products/lower-local-products
+               '(let* [out (clojure.core/double-array 3)] (if (clojure.core/nil? out) 1 2)))
+              (products/lower-local-products quoted)])))]
+    (with-redefs [method-entry/observe-definition-input!
+                  (fn [& _] (throw (Exception. "definition observation escaped its analysis owner")))
+                  method-entry/observe-source-reference!
+                  (fn [& _] (throw (Exception. "qualification escaped its analysis owner")))]
+      (is (seq (pr-str output)))
+      (is (seq (doall (tree-seq coll? seq output)))))
+    (is (identical? quoted quoted-output))
+    (is (zero? @forced))))
+
 (deftest folding-presence-must-preserve-failing-allocation
   (let [source '(let* [out (clojure.core/double-array -1)]
                  (if (clojure.core/nil? out) 1 2))
@@ -338,3 +540,22 @@
           (finally
             (when (instance? java.lang.AutoCloseable compiled)
               (.close ^java.lang.AutoCloseable compiled))))))))
+
+(deftest owned-boxed-entry-adapters-preserve-conversions-without-running-the-body
+  (binding [method-entry/*emission-inputs* nil]
+    (method-entry/call-with-definition-inputs
+     (fn []
+       (let [frontend (core/prepare-owned-source-frontend! (core/resolve-deftm-var #'effectful-allocation))
+             emission (method-entry/observed-frontend-emission frontend)
+             compile! (requiring-resolve 'raster.compiler.backend.jvm.bytecode/compile-boxed-entry-parameter-region)
+             array-input (compile! emission 0)
+             count-input (compile! emission 1)
+             counter (long-array [0])]
+         (is (identical? counter ((:invoke array-input) counter)))
+         (is (nil? ((:invoke array-input) nil)))
+         (is (= 7 ((:invoke count-input) (double 7.75))))
+         (is (= 0 (aget counter 0)))
+         (is (thrown? ClassCastException ((:invoke array-input) (double-array 0))))
+         (is (thrown? ClassCastException ((:invoke count-input) "wrong")))
+         (is (thrown? NullPointerException ((:invoke count-input) nil)))
+         (is (thrown? clojure.lang.ExceptionInfo (compile! emission 2))))))))

@@ -252,6 +252,33 @@
     (run-scale-case :ocl:0)
     (opencl/opencl-skip! "mixed coefficient scale on OpenCL")))
 
+(defn- run-owned-scale-changed-inputs [target]
+  (doseq [dtype [:float :double]]
+    (let [alpha (+ 1.0 (Math/scalb 1.0 (int -24)))
+          initial (float-array [1.5 -1.5 0.0])
+          artifact (compiled/compile
+                    #'storage/mixed-scale [alpha initial]
+                    (merge storage/policy {:compiler :equation-first :target target :dtype dtype}))]
+      (try
+        (doseq [xs [[1.5 -1.5 0.0] [-3.0 0.5 4.0]]]
+          (let [input (float-array xs)
+                outputs (compiled/invoke-compiled artifact {:values input})
+                actual (value/->host (:result outputs))
+                expected (storage/mixed-scale alpha input)]
+            (is (= #{:result} (set (keys outputs))))
+            (is (= (class expected) (class actual)))
+            (is (= (vec expected) (vec actual)))
+            (is (= (mapv float xs) (vec input)))))
+        (finally (compiled/close! artifact))))))
+
+(deftest owned-functional-map-preserves-storage-precision-and-changed-inputs
+  (if @gp/gpu-available?
+    (run-owned-scale-changed-inputs :ze:0)
+    (gp/gpu-skip! "owned functional map on Level Zero"))
+  (if @opencl/opencl-available?
+    (run-owned-scale-changed-inputs :ocl:0)
+    (opencl/opencl-skip! "owned functional map on OpenCL")))
+
 (defn- run-completed-conversion-case [target]
   (doseq [n [0 3 2049]]
     (let [x (double-array (take n (cycle [16777216.0 1.0 1.0])))
@@ -281,16 +308,18 @@
   (doseq [n [0 3 2049]]
     (let [x (double-array (take n (cycle [1.5 -2.0 0.25])))
           coefficient (float 2.0)
-          expected (storage/mixed-scale-energy-gradient coefficient x)
           artifact (compiled/compile
                     #'storage/mixed-scale-energy-gradient [coefficient x]
                     (merge storage/policy
                            {:compiler :equation-first :target target :dtype :double}))]
       (try
-        (dotimes [_ 2]
+        (doseq [offset [0.0 0.5]]
           ;; Select by the public result's tangent representation, never generated ABI
           ;; names. Other returned arrays are Double intermediates, not scalar gradients.
-          (let [results (map value/->host (vals (artifact {})))
+          (let [input (double-array (map #(+ (double %) offset) x))
+                expected (storage/mixed-scale-energy-gradient coefficient input)
+                results (map value/->host
+                             (vals (compiled/invoke-compiled artifact {:values input})))
                 gradients (filter #(instance? (class (float-array 0)) %) results)]
             (is (= 1 (count gradients)))
             (is (= [expected] (vec (first gradients))))))

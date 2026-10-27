@@ -321,9 +321,7 @@
          equations (emit-equations parallel-program opts)
          region-count (count (filter #(= :product-ordered-consumer
                                          (get-in % [:attributes :schedule])) equations))
-         program-inputs (if (pos? region-count)
-                          (program/infer-inputs equations)
-                          (:inputs parallel-program))
+         program-inputs (emitted-program/emission-inputs parallel-program equations)
          emitted-program
          (validate-program-for-request
           (program/make

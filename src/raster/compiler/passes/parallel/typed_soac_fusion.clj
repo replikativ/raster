@@ -1499,6 +1499,12 @@
                           @(nth exceptional right-index)))
            :when left-boundary
            :when right-boundary
+           ;; Result storage is aligned with every functional result. The current dialect has
+           ;; no sparse "fresh result" entry that can be concatenated beside an explicit stored
+           ;; result. Pure+pure and stored+stored maps therefore compose, while a mixed pair must
+           ;; remain separate until fusion owns a complete per-result location algebra.
+           :when (= (boolean (seq (:storage left-boundary)))
+                    (boolean (seq (:storage right-boundary))))
            :when (= (:extent (:attributes left)) (:extent (:attributes right)))
            :when (empty? (set/intersection left-results right-uses))
            :when (empty? (set/intersection right-results left-uses))

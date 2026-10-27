@@ -2,6 +2,7 @@
   "Small source-versus-bytecode boundary checks; no GPU or full compiler corpus needed."
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.backend.jvm.bytecode :as bytecode]
+            [raster.compiler.core.source-arithmetic :as source-arithmetic]
             [raster.compiler.fixtures.checked-casts :as checked-casts]
             [raster.compiler.pipeline :as pipeline])
   (:import (java.lang.reflect InvocationTargetException)))
@@ -97,6 +98,49 @@
                       [Long/MAX_VALUE (long 1)] [Long/MIN_VALUE (long 1)]
                       [(long -7) (long 3)] [(long 0) (long 0)]]))]
       (is (= (outcome oracle args) (outcome invoke args)) (pr-str [name args])))))
+
+(deftest shared-primitive-policy-preserves-int-wrap-and-ieee-division
+  (let [examples [{:name 'int-add :tag 'int :op "+"
+                   :args [Integer/MAX_VALUE (int 1)] :expected Integer/MIN_VALUE}
+                  {:name 'int-sub :tag 'int :op "-"
+                   :args [Integer/MIN_VALUE (int 1)] :expected Integer/MAX_VALUE}
+                  {:name 'int-mul :tag 'int :op "*"
+                   :args [Integer/MAX_VALUE (int 2)] :expected (int -2)}
+                  {:name 'long-add :tag 'long :op "+"
+                   :args [(long 3) (long 4)] :expected (long 7)}
+                  {:name 'integer-div :tag 'long :op "/"
+                   :args [(long 1) (long 0)] :expected Double/POSITIVE_INFINITY}
+                  {:name 'float-div :tag 'float :op "/"
+                   :args [(float 1.0) (float 0.0)] :expected Float/POSITIVE_INFINITY}
+                  {:name 'float-zero :tag 'float :op "/"
+                   :args [(float -0.0) (float 2.0)] :expected (float -0.0)}
+                  {:name 'double-div :tag 'double :op "/"
+                   :args [0.0 0.0] :expected Double/NaN}]
+        selected (atom [])
+        policy source-arithmetic/primitive-operation-policy
+        compiled (with-redefs [source-arithmetic/primitive-operation-policy
+                               (fn [operator carrier]
+                                 (swap! selected conj [operator carrier])
+                                 (policy operator carrier))]
+                   (bytecode/compile-specialized-class!
+                    (str "raster.test.SharedPrimitivePolicy" (gensym))
+                    (mapv (fn [{:keys [name tag op]}]
+                            {:name name :params (parameters [tag tag])
+                             :walked-body [(list (symbol "clojure.core" op) 'x 'y)]
+                             :source-ns *ns* :return-tag 'Object}) examples)))]
+    (doseq [{:keys [name args expected]} examples
+            :let [method (get-in compiled [:methods name])
+                  actual (.invoke method nil (object-array args))]]
+      (is (= (class expected) (class actual)) (str name))
+      (is (= (cond (instance? Float expected) (Float/floatToRawIntBits expected)
+                   (instance? Double expected) (Double/doubleToLongBits expected)
+                   :else expected)
+             (cond (instance? Float actual) (Float/floatToRawIntBits actual)
+                   (instance? Double actual) (Double/doubleToLongBits actual)
+                   :else actual)) (str name)))
+    (is (every? (set @selected) [["+" :int] ["+" :long] ["/" :float] ["/" :double]]))
+    (is (not-any? #{["/" :int] ["/" :long]} @selected)
+        "source division still selects IEEE arithmetic after promotion")))
 
 (deftest reference-carried-numbers-are-not-rounded-through-double
   (let [operations '[clojure.core/+ clojure.core/- clojure.core/* clojure.core//]

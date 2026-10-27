@@ -19,14 +19,383 @@
   dispatch: it is always a bug, and the inliner must say so AT THE CALL — naming the
   callee and both arities."
   (:require [clojure.test :refer [deftest is testing]]
-            [raster.core :refer [deftm]]
+            [raster.core :as core :refer [deftm]]
             [raster.par]
             [raster.numeric]
             [raster.arrays]
             [raster.compiler.passes.scalar.inline :as inline]
             [raster.compiler.passes.scalar.effects :as effects]
+            [raster.compiler.passes.scalar.source-import :as source-import]
+            [raster.compiler.core.method-entry :as entry]
+            [raster.compiler.core.source-policy :as source-policy]
+            [raster.compiler.core.types :as types]
+            [raster.compiler.core.value-completion :as completion]
+            [raster.compiler.backend.jvm.bytecode :as bytecode]
             [raster.compiler.pipeline :as pipeline]
             [raster.ad.reverse :as rev]))
+
+(defn- owned-inline-function
+  ([parameters construct!]
+   (owned-inline-function parameters {} construct!))
+  ([parameters {:keys [tags return-tag source-ns policy]} construct!]
+   (let [policy (or policy (source-policy/capture))
+         tags (or tags (vec (repeat (count parameters) 'Object)))
+         return-tag (or return-tag 'Object)
+         source-ns (or source-ns (the-ns 'raster.compiler.passes.scalar.inline-test))]
+     (entry/call-with-definition-inputs
+      #(source-policy/call-with-policy
+        policy
+        (fn []
+          (let [{:keys [projection body]} (construct!)
+                interface (types/ensure-fn-interface! tags)
+                {:keys [implementation emission]}
+                (core/emit-owned-bytecode!
+                 bytecode/compile-typed-impl!
+                 (str "raster.compiled.InlineBodyTest_" (clojure.lang.RT/nextID))
+                 parameters tags return-tag [body] source-ns
+                 (:iface-name interface) 'inline-body @entry/*emission-inputs*)
+                emission (bytecode/prepare-emitted-global-invocations! emission)
+                guard (entry/prepare-emission-input-guard! emission)]
+            [projection (fn [& arguments]
+                          (guard)
+                          (let [result (apply implementation arguments)]
+                            (guard)
+                            result))])))))))
+
+(deftm history-constant-seven [input :- (Array double)] :- Long 7)
+
+(defmacro define-history-caller [name n]
+  (let [ids (mapv #(symbol (str "answer" %)) (range n))
+        bindings
+        (vec (mapcat (fn [id]
+                       [id (list 'raster.compiler.passes.scalar.inline-test/history-constant-seven
+                                 'input)])
+                     ids))]
+    (list 'raster.core/deftm name '[input :- (Array double)] ':- 'Long
+          (list 'let* bindings (peek ids)))))
+
+(declare history-constant-two history-constant-sixteen)
+(define-history-caller history-constant-two 2)
+(define-history-caller history-constant-sixteen 16)
+
+(deftm owned-long-identity [x :- Long] :- Long x)
+
+(deftm nested-owned-long-identity [x :- Long] :- Long
+  (owned-long-identity (owned-long-identity x)))
+
+(deftm loop-initializer-owned-long-identity [offset :- Long] :- Long
+  (loop [i 0 acc (owned-long-identity (long (+ offset 2)))]
+    (if (< i 3) (recur (inc i) (+ acc i)) acc)))
+
+(defn- prepared-caller [caller]
+  (let [source-var (core/resolve-deftm-var caller)
+        facts (pipeline/deftm-frontend-facts source-var :double)
+        source (first (pipeline/get-walked-body source-var :double))
+        parameters (:parameters facts)]
+    {:source-var source-var
+     :facts facts
+     :source source
+     :options {:source-var source-var :source-ns (:source-ns facts)
+               :active-params parameters :public-parameters parameters}
+     :header {:tags (mapv (:param-env facts) parameters)
+              :return-tag (:return-tag facts)
+              :source-ns (:source-ns facts)
+              :policy (:source-policy facts)}}))
+
+(defn- prepared-history-helper []
+  (let [source (core/resolve-deftm-var #'history-constant-seven)]
+    (core/prepare-emission-source-walk! source)
+    (entry/call-with-definition-inputs #(entry/original-source-frontend source))))
+
+(defn- prepared-sum-source []
+  (let [source (core/resolve-deftm-var #'raster.par/sum)]
+    (core/prepare-emission-source-walk! source)
+    (entry/call-with-definition-inputs #(entry/original-source-frontend source))))
+
+(defn- repeated-sum-source [frontend n]
+  (list 'let*
+        (vec (mapcat (fn [i]
+                       [(symbol (str "answer" i))
+                        (list '.invk (get-in frontend [:definition :implementation-op]) 'input)])
+                     (range n)))
+        (symbol (str "answer" (dec n)))))
+
+(deftest owned-backend-expansion-does-not-multiply-unrelated-parent-history
+  ;; Close normal first-invocation publication before measuring retained history.
+  ;; This test measures expansion, not JIT preparation of the remaining calls.
+  (doseq [caller [history-constant-seven history-constant-two history-constant-sixteen]]
+    (is (= 7 (caller (double-array [1.0])))))
+  (let [frontend (prepared-history-helper)
+        helper (get-in frontend [:source-entry :source-var])
+        implementation (get-in frontend [:definition :implementation-op])
+        measurements
+        (mapv
+         (fn [caller]
+           (let [{:keys [source-var facts source options header]} (prepared-caller caller)
+                 parameters (:parameters facts)
+                 visits (atom 0)
+                 guard (reify entry/RetainedProducerInput
+                         (assert-producer-current! [this] (swap! visits inc) this))
+                 parent (atom {:static [] :values [] :producer-inputs [guard]})
+                 imports (atom 0)
+                 import-source source-import/prepare-original-helper-source
+                 expanded (binding [entry/*emission-inputs* parent]
+                            (with-redefs [source-import/prepare-original-helper-source
+                                          (fn [& args]
+                                            (swap! imports inc)
+                                            (apply import-source args))]
+                              (inline/expand-for-backends source 3 (:param-env facts) options)))
+                 checks @visits
+                 source-calls (count (filter #(and (seq? %) (= '.invk (first %))
+                                                   (= implementation (second %)))
+                                             (tree-seq coll? seq source)))
+                 expanded-calls (count (filter #(and (seq? %) (= '.invk (first %))
+                                                     (= implementation (second %)))
+                                               (tree-seq coll? seq expanded)))
+                 [_ compiled]
+                 (owned-inline-function
+                  parameters header #(hash-map :projection expanded :body expanded))
+                 input (double-array [1.0 2.0 3.0])]
+             (is (pos? source-calls))
+             (is (zero? expanded-calls) "every independently proved sequential call expands")
+             (is (= (- source-calls expanded-calls) @imports)
+                 "each admitted application imports once; resolving candidates adds no duplicate import")
+             (is (= 7 (@caller input) (compiled input)))
+             (is (= [1.0 2.0 3.0] (vec input)))
+             (is (contains? (:definition-proofs @parent) helper))
+             (is (some #(seq (:lookups %)) (:values @parent)))
+             (is (some #(identical? guard %) (:producer-inputs @parent)))
+             (is (true? (entry/assert-definition-inputs-current! @parent)))
+             (is (identical? source-var (:resolved-var facts)))
+             checks))
+         [#'history-constant-two #'history-constant-sixteen])]
+    (is (= (first measurements) (second measurements)))
+    (is (<= 1 (first measurements) 8)
+        "the inherited history is fenced once around the complete expansion")))
+
+(deftest unplanned-real-helper-does-not-import-a-body
+  (let [frontend (prepared-history-helper)
+        call (list '.invk (get-in frontend [:definition :implementation-op]) 'input)
+        owner (atom {:static [] :values []})]
+    (binding [entry/*emission-inputs* owner]
+      (with-redefs [source-import/prepare-original-helper-source
+                    (fn [& _] (throw (AssertionError. "unplanned body import")))
+                    core/prepare-emission-source-walk!
+                    (fn [& _] (throw (AssertionError. "unplanned source preparation")))]
+        (is (= call (#'inline/inline-invk call)))
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Arity mismatch"
+                             (#'inline/inline-invk (list '.invk (second call)))))))))
+
+(deftest no-op-inline-requests-do-not-open-a-new-history-boundary
+  (let [visits (atom 0)
+        guard (reify entry/RetainedProducerInput
+                (assert-producer-current! [this] (swap! visits inc) this))
+        parent (atom {:static [] :values [] :producer-inputs [guard]})
+        before @parent]
+    (binding [entry/*emission-inputs* parent]
+      (doseq [[form depth] [['input 3] ['(let* [answer input] answer) 0]]]
+        (is (identical? form (inline/inline-deftm-calls form depth)))))
+    (is (zero? @visits))
+    (is (identical? before @parent))))
+
+(deftest backend-expansion-fences-the-complete-final-stage-before-adoption
+  (let [frontend (prepared-history-helper)
+        helper (get-in frontend [:source-entry :source-var])
+        {:keys [source facts options]} (prepared-caller #'history-constant-two)
+        flatten-original inline/flatten-nested-lets
+        root (var-get helper)]
+    (doseq [change [:already-stale :becomes-stale :replaced :used-helper :throws]]
+      (let [current? (atom (not= change :already-stale))
+            reached? (atom false)
+            guard (reify entry/RetainedProducerInput
+                    (assert-producer-current! [this]
+                      (when-not @current?
+                        (throw (ex-info "stale backend expansion parent" {:reason ::stale-backend-parent})))
+                      this))
+            parent (atom {:static [] :values [] :producer-inputs [guard]})
+            before @parent
+            failure (Exception. "final expansion stage failed")]
+        (try
+          (let [observed
+                (binding [entry/*emission-inputs* parent]
+                  (with-redefs [inline/flatten-nested-lets
+                                (fn [& arguments]
+                                  (let [result (apply flatten-original arguments)]
+                                    ;; Its one-argument entry delegates to the two-argument
+                                    ;; arity. Inject once, after the entire final stage.
+                                    (when (= 1 (count arguments))
+                                      (reset! reached? true)
+                                      (case change
+                                        :becomes-stale (reset! current? false)
+                                        :replaced (reset! parent (into {} @parent))
+                                        :used-helper (alter-var-root helper (constantly (fn [_] -99.0)))
+                                        :throws (throw failure)
+                                        nil))
+                                    result))]
+                    (try (inline/expand-for-backends source 3 (:param-env facts) options) nil
+                         (catch Exception error error))))]
+            (if (= change :throws)
+              (is (identical? failure observed))
+              (is (= (case change
+                       :replaced :unstable-definition-proof-input
+                       :used-helper :stale-definition-proof-input
+                       ::stale-backend-parent)
+                     (:reason (ex-data observed)))))
+            (is (= (not= change :already-stale) @reached?))
+            (is (= before @parent))
+            (is (= (not= change :replaced) (identical? before @parent)))
+            (is (empty? (:definition-proofs @parent))))
+          (finally (alter-var-root helper (constantly root))))))))
+
+(deftest backend-expansion-finishes-proof-work-without-realizing-quoted-data
+  (let [frontend (prepared-sum-source)
+        call (list '.invk (get-in frontend [:definition :implementation-op]) 'input)
+        quoted-visits (atom 0)
+        payload (lazy-seq (swap! quoted-visits inc) (list call))
+        quoted (with-meta (list 'quote payload) {:source-marker :opaque-data})
+        owner (atom {:static [] :values []})
+        expanded (binding [entry/*emission-inputs* owner]
+                   (inline/expand-for-backends [quoted call]))
+        plain (binding [entry/*emission-inputs* owner]
+                (inline/expand-for-backends call))
+        unexpected (fn [& _] (throw (AssertionError. "proof work escaped backend expansion")))]
+    (is (identical? quoted (first expanded)))
+    (is (zero? @quoted-visits))
+    (is (= 6.0 (eval (list 'let* ['input '(double-array [1 2 3])] (second expanded)))))
+    (binding [entry/*emission-inputs* nil]
+      (with-redefs [entry/observe-definition-input! unexpected
+                    entry/observe-source-reference! unexpected
+                    entry/observe-source-resolution! unexpected]
+        (is (string? (pr-str plain)))
+        (is (seq (doall (tree-seq coll? seq plain))))))
+    (is (zero? @quoted-visits))))
+
+(deftest complete-inline-expansion-refuses-stale-or-replaced-parent-without-adoption
+  (let [frontend (prepared-sum-source)
+        source (repeated-sum-source frontend 1)
+        expand @#'inline/inline-one-pass]
+    (doseq [change [:already-stale :becomes-stale :replaced]]
+      (let [current? (atom (not= change :already-stale))
+            called? (atom false)
+            guard (reify entry/RetainedProducerInput
+                    (assert-producer-current! [this]
+                      (when-not @current?
+                        (throw (ex-info "stale enclosing owner" {:reason ::stale-parent})))
+                      this))
+            parent (atom {:static [] :values [] :producer-inputs [guard]})
+            before @parent
+            failure
+            (binding [entry/*emission-inputs* parent]
+              (with-redefs-fn
+                {#'inline/inline-one-pass
+                 (fn [& arguments]
+                   (reset! called? true)
+                   (let [result (apply expand arguments)]
+                     (case change
+                       :becomes-stale (reset! current? false)
+                       :replaced (reset! parent (into {} @parent))
+                       nil)
+                     result))}
+                #(try (inline/inline-deftm-calls source 3 false true) nil
+                      (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))]
+        (is (= (if (= change :replaced) :unstable-definition-proof-input ::stale-parent) failure))
+        (is (= (not= change :already-stale) @called?))
+        (is (empty? (:definition-proofs @parent)) "local observations were never published")
+        (is (= before @parent))
+        (is (= (not= change :replaced) (identical? before @parent)))))))
+
+(deftest complete-inline-expansion-preserves-local-source-freshness-and-failure-identity
+  (let [frontend (prepared-history-helper)
+        helper (get-in frontend [:source-entry :source-var])
+        {:keys [source options]} (prepared-caller #'history-constant-two)
+        original-root @helper
+        expand @#'inline/inline-one-pass]
+    (doseq [change [:source-root :throws]]
+      (let [parent (atom {:static [] :values []})
+            before @parent
+            failure (Exception. "expansion failed after observing the helper")]
+        (try
+          (let [observed
+                (binding [entry/*emission-inputs* parent]
+                  (with-redefs-fn
+                    {#'inline/inline-one-pass
+                     (fn [& arguments]
+                       (let [result (apply expand arguments)]
+                         (if (= change :throws)
+                           (throw failure)
+                           (alter-var-root helper (constantly (fn [_] -99.0))))
+                         result))}
+                    #(try (entry/call-with-independent-definition-inputs
+                           (fn []
+                             (inline/call-with-source-input-completions
+                              source options
+                              (fn [] (inline/inline-deftm-calls source 1 false true))))) nil
+                          (catch Exception error error))))]
+            (if (= change :throws)
+              (is (identical? failure observed))
+              (is (= :stale-definition-proof-input (:reason (ex-data observed)))))
+            (is (identical? before @parent))
+            (is (empty? (:definition-proofs @parent))))
+          (finally (alter-var-root helper (constantly original-root))))))))
+
+(deftest source-preparation-is-scoped-to-the-actual-inline-candidate
+  (let [scope (create-ns (gensym "raster.inline-source-frontier."))
+        attempts (atom 0)
+        prepared-sources (atom [])
+        prepare! core/prepare-deftm-frontend!]
+    (try
+      (binding [*ns* scope]
+        (refer 'clojure.core)
+        (eval '(raster.core/deftm candidate [x :- Double] :- Double x))
+        (eval '(raster.core/deftm ^:no-inline opaque [x :- Double] :- Double x))
+        (let [candidate (core/resolve-deftm-var (ns-resolve scope 'candidate))
+              opaque (core/resolve-deftm-var (ns-resolve scope 'opaque))
+              receiver (fn [source]
+                         (ns-resolve scope (symbol (str (:name (meta source)) "-impl"))))
+              candidate-receiver (receiver candidate)
+              opaque-receiver (receiver opaque)
+              candidate-root (var-get candidate-receiver)
+              opaque-root (var-get opaque-receiver)
+              opaque-metadata (meta opaque-receiver)
+              candidate-symbol (symbol (str (ns-name scope)) (str (:name (meta candidate))))
+              opaque-symbol (symbol (str (ns-name scope)) (str (:name (meta opaque))))]
+          (is (map? (:raster.core/jit-spec (meta candidate-receiver))))
+          (is (nil? (get-in (meta candidate-receiver)
+                           [:raster.core/jit-spec :frontend-source-owner])))
+          (is (map? (:raster.core/jit-spec opaque-metadata)))
+          (is (nil? (get-in opaque-metadata [:raster.core/jit-spec :frontend-source-owner])))
+          (let [imported
+                (with-redefs [core/prepare-deftm-frontend!
+                              (fn [source]
+                                (swap! prepared-sources conj source)
+                                (prepare! source))]
+                  (entry/call-with-definition-inputs
+                   (fn []
+                     (swap! attempts inc)
+                     ;; Both are genuine earlier observations. Only the selected
+                     ;; candidate is a body consumer; opacity is checked before
+                     ;; the other source can enter preparation.
+                     (doseq [v [candidate-receiver opaque-receiver]]
+                       (entry/observe-definition-input! v scope (.sym ^clojure.lang.Var v)))
+                     (is (nil? (#'inline/try-resolve-deftm opaque-symbol)))
+                     (let [result (#'inline/try-resolve-deftm candidate-symbol)]
+                       (entry/assert-definition-inputs-current! @entry/*emission-inputs*)
+                       result))))]
+            (is (some? imported))
+            (is (= '[x] (:walked-body imported)))
+            (is (= 2 @attempts)
+                "publishing the actual candidate frontend restarts its original owner once")
+            (is (seq @prepared-sources))
+            (is (every? #(identical? candidate %) @prepared-sources))
+            (is (some? (get-in (meta candidate-receiver)
+                              [:raster.core/jit-spec :frontend-source-owner])))
+            (is (identical? candidate-root (var-get candidate-receiver))
+                "source preparation does not JIT or execute the candidate")
+            (is (identical? opaque-root (var-get opaque-receiver)))
+            (is (identical? opaque-metadata (meta opaque-receiver)))
+            (is (identical? (:raster.core/jit-spec opaque-metadata)
+                            (:raster.core/jit-spec (meta opaque-receiver)))))))
+      (finally (remove-ns (ns-name scope))))))
 
 (deftest no-op-ad-hoisting-preserves-exact-source-occurrences
   (let [leaf (with-meta '(helper x) {:source-marker :leaf})
@@ -242,12 +611,14 @@
 
 (deftest ad-arguments-evaluate-once-in-source-order-even-when-unused
   (doseq [mode [:value+grad :grad]]
-    (let [expanded (inline/inline-value+grad-call
-                    {:var-sym 'raster.compiler.passes.scalar.inline-test/argument-effect-loss
-                     :args '[(draw :first) (draw :unused)] :mode mode})
-          f (eval (list 'fn '[draw]
-                        (list 'let* (vec (mapcat identity (:bindings expanded)))
-                              (:elements expanded))))
+    (let [[_ f]
+          (owned-inline-function
+           '[draw]
+           #(let [expanded (inline/inline-value+grad-call
+                            {:var-sym 'raster.compiler.passes.scalar.inline-test/argument-effect-loss
+                             :args '[(draw :first) (draw :unused)] :mode mode})]
+              {:projection expanded
+               :body (list 'let* (vec (mapcat identity (:bindings expanded))) (:elements expanded))}))
           trace (atom [])
           draw (fn [id] (swap! trace conj id) (if (= id :first) 3.0 7.0))]
       (is (= (if (= mode :value+grad)
@@ -274,13 +645,30 @@
        (inline/inline-value+grad-call
         {:var-sym 'raster.compiler.passes.scalar.inline-test/argument-effect-loss
          :args '[x] :mode :value+grad})))
-  (let [expanded (inline/inline-value+grad-call
-                  {:var-sym 'raster.compiler.passes.scalar.inline-test/option-one-loss
-                   :args '[(clojure.core/float (draw))] :mode :value+grad})
-        [argument expression] (first (:bindings expanded))]
-    (is (= '(clojure.core/float (draw)) expression))
-    (is (= 'float (:raster.type/tag (meta argument)))
-        "the Double formal must not widen the lifted Float producer")))
+  (let [authored '(clojure.core/float (draw))
+        [expanded execute]
+        (owned-inline-function
+         '[draw]
+         #(let [expanded (inline/inline-value+grad-call
+                          {:var-sym 'raster.compiler.passes.scalar.inline-test/option-one-loss
+                           :args [authored] :mode :value+grad})]
+            {:projection expanded
+             :body (list 'let* (vec (mapcat identity (:bindings expanded))) (:elements expanded))}))
+        [argument expression] (first (:bindings expanded))
+        {:keys [contract operand]} (completion/canonical-parts expression)
+        expected ((rev/value+grad #'option-one-loss) (clojure.core/float 0.3))
+        actual (execute (constantly 0.3))
+        bits #(mapv (fn [value] (Double/doubleToRawLongBits (double value))) %)]
+    (is (= completion/object-input-contract contract))
+    (is (= authored operand) "the Object snapshot retains the authored Float producer")
+    (is (not-any? '#{float double long int Float Double Long Integer}
+                  ((juxt :tag :raster.type/tag) (meta argument)))
+        "an Object snapshot must not claim its producer's primitive carrier")
+    (is (every? #(instance? Double %) actual))
+    (is (= (bits expected) (bits actual))
+        "the Double formal consumes the already-rounded Float value and gradient")
+    (is (thrown? IllegalArgumentException (clojure.core/float Double/MAX_VALUE)))
+    (is (thrown? IllegalArgumentException (execute (constantly Double/MAX_VALUE))))))
 
 (deftm option-overloaded-loss [x :- Float n :- Long] :- Float
   (raster.numeric/* x x))
@@ -292,12 +680,14 @@
   (doseq [[tag argument] [['float (float 2.0)] ['double 2.0]]]
     (let [callee 'raster.compiler.passes.scalar.inline-test/option-overloaded-loss
           resolved (#'inline/resolve-deftm-for-ad callee [tag 'long])
-          result (inline/inline-value+grad-call
-                  {:var-sym callee :args '[x n] :mode :value+grad}
-                  :param-env {'x tag 'n 'long})
-          f (eval (list 'fn '[x n]
-                        (list 'let* (vec (mapcat identity (:bindings result)))
-                              (:elements result))))
+          [result f]
+          (owned-inline-function
+           '[x n]
+           #(let [result (inline/inline-value+grad-call
+                          {:var-sym callee :args '[x n] :mode :value+grad}
+                          :param-env {'x tag 'n 'long})]
+              {:projection result
+               :body (list 'let* (vec (mapcat identity (:bindings result))) (:elements result))}))
           actual (f argument (long 3))]
       (is (= ((rev/value+grad (:var resolved)) argument (long 3)) actual))
       (is (= [4.0 4.0 nil] actual))
@@ -326,15 +716,17 @@
                              (var raster.compiler.passes.scalar.inline-test/option-loss)
                              :mode :reverse :wrt [0])
                    vg (gradient x y)] vg)]]
-    (let [expanded (inline/inline-deftm-calls source)
-          f (eval (list 'fn '[x y] expanded))]
+    (let [[_ f] (owned-inline-function
+                 '[x y] #(let [expanded (inline/inline-deftm-calls source)]
+                           {:projection expanded :body expanded}))]
       (is (= [10.0 7.0 nil] (f 2.0 3.0)))
       (is (= ((rev/value+grad #'option-loss :wrt [0]) 2.0 3.0) (f 2.0 3.0)))))
   (let [source '(let* [gradient ((raster.ad.reverse/grad
                                   (var raster.compiler.passes.scalar.inline-test/option-loss)
                                   :wrt [0]) x y)] gradient)
-        expanded (inline/inline-deftm-calls source)
-        f (eval (list 'fn '[x y] expanded))]
+        [_ f] (owned-inline-function
+               '[x y] #(let [expanded (inline/inline-deftm-calls source)]
+                         {:projection expanded :body expanded}))]
     (is (= [7.0 nil] (f 2.0 3.0))))
   (doseq [source ['(let* [g ((raster.ad.reverse/grad
                              (var raster.compiler.passes.scalar.inline-test/option-one-loss)
@@ -343,15 +735,17 @@
                                     (var raster.compiler.passes.scalar.inline-test/option-one-loss)
                                     :wrt [0])
                           g (gradient x)] g)]]
-    (let [expanded (inline/inline-deftm-calls source)
-          f (eval (list 'fn '[x] expanded))]
+    (let [[_ f] (owned-inline-function
+                 '[x] #(let [expanded (inline/inline-deftm-calls source)]
+                         {:projection expanded :body expanded}))]
       (is (= ((rev/grad #'option-one-loss :wrt [0]) 2.0) (f 2.0)))
       (is (= 4.0 (f 2.0)))))
   (let [source '(let* [vg ((raster.ad.reverse/value+grad
                             (var raster.compiler.passes.scalar.inline-test/option-loss)
                             :wrt []) x y)] vg)
-        expanded (inline/inline-deftm-calls source)
-        f (eval (list 'fn '[x y] expanded))]
+        [_ f] (owned-inline-function
+               '[x y] #(let [expanded (inline/inline-deftm-calls source)]
+                         {:projection expanded :body expanded}))]
     (is (= [10.0 nil nil] (f 2.0 3.0))))
   (doseq [wrt [[-1] [2] [0 0]]]
     (is (thrown? clojure.lang.ExceptionInfo
@@ -396,36 +790,38 @@
     (is (:raster.effect/effectful (meta binder)))
     (is (= 'raster.par/map-void! (-> result second second first)))))
 
-(deftest inlining-preserves-unused-checked-arguments
-  (with-redefs-fn {#'inline/try-resolve-deftm
-                  (fn [_] {:params ['x] :tags ['int] :walked-body [42]})}
-    (fn []
-      (let [inlined (#'inline/inline-invk '(.invk example/constant (int 4294967296)))]
-        (is (thrown? ArithmeticException (eval inlined))
-            "an unused checked argument still throws before entering the callee"))
-      (let [inlined (#'inline/inline-invk
-                    '(.invk example/constant (int (do (swap! calls inc) 3))))]
-        (is (= [42 1] (eval (list 'let ['calls '(atom 0)]
-                                 [inlined '(deref calls)]))))))))
+(deftest unowned-helper-descriptions-do-not-authorize-body-copying
+  (let [marker ::forged-helper-body
+        forged {:params ['x] :tags ['long] :return-tag 'long :walked-body [marker]}
+        forms ['(.invk example/constant (int 3))
+               '(.invk example/constant [(swap! calls inc)])
+               '(.invk example/constant {:key (swap! calls inc)})
+               '(.invk example/constant #{(swap! calls inc)})
+               '(.invk example/identity (.invk example/identity (+ 1 2)))
+               '(loop* [i 0 acc (.invk example/identity (long (+ i 2)))]
+                  (if (< i 3) (recur (inc i) (+ acc i)) acc))]
+        owner (atom {:static [] :values []})]
+    (with-redefs-fn {#'inline/try-resolve-deftm (fn [& _] forged)}
+      (fn []
+        (doseq [source forms]
+          (let [result (binding [entry/*emission-inputs* owner]
+                         (#'inline/inline-invk source))
+                invocations (fn [form]
+                              (count (filter #(and (seq? %) (= '.invk (first %)))
+                                             (tree-seq coll? seq form))))]
+            (is (= (invocations source) (invocations result)))
+            (is (not-any? #(= marker %) (tree-seq coll? seq result))
+                "params/tags/body without an exact caller owner are not inline authority")))))
+    (is (empty? (:definition-proofs @owner)))))
 
 (deftest direct-inline-arity-is-checked-before-substitution
   (with-redefs-fn {#'inline/try-resolve-deftm
-                  (fn [_] {:params ['x] :tags ['long] :walked-body [42]})}
+                  (fn [& _] {:params ['x] :tags ['long] :walked-body [42]})}
     (fn []
       (doseq [call ['(.invk example/constant)
                    '(.invk example/constant 1 (swap! calls inc))]]
         (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Arity mismatch"
                              (#'inline/inline-invk call)))))))
-
-(deftest unused-collection-arguments-still-evaluate-their-elements
-  (with-redefs-fn {#'inline/try-resolve-deftm
-                  (fn [_] {:params ['x] :walked-body [42]})}
-    (fn []
-      (doseq [argument ['[(swap! calls inc)] '{:key (swap! calls inc)}
-                       '#{(swap! calls inc)}]]
-        (let [inlined (#'inline/inline-invk (list '.invk 'example/constant argument))]
-          (is (= [42 1] (eval (list 'let ['calls '(atom 0)]
-                                   [inlined '(deref calls)])))))))))
 
 (deftest local-function-inlining-preserves-call-by-value
   (doseq [body [nil false 42 '(+ x x)]
@@ -441,35 +837,20 @@
       (is (= [(if (seq? body) 6 body) 1]
              (eval (list 'let ['calls '(atom 0)] [executable '(deref calls)])))))))
 
-(deftest binding-inline-accepts-constant-leaves
-  (with-redefs-fn {#'inline/try-resolve-deftm
-                  (fn [& _] {:params ['x] :tags ['long] :walked-body [42]})}
-    (fn []
-      (let [inlined (:form (#'inline/inline-one-pass
-                           '(let* [result (example/constant (int 4294967296))] result)))]
-        (is (thrown? ArithmeticException (eval inlined)))))))
-
-(deftest nested-argument-calls-are-expanded-before-lifting
-  (with-redefs-fn {#'inline/try-resolve-deftm
-                  (fn [_] {:params ['x] :tags ['long] :walked-body ['x]})}
-    (fn []
-      (let [inlined (#'inline/inline-invk
-                    '(.invk example/identity (.invk example/identity (+ 1 2))))]
-        (is (not-any? #(and (seq? %) (= '.invk (first %)))
-                      (tree-seq coll? seq inlined)))
-        (is (= 3 (eval inlined)))))))
-
-(deftest inlining-visits-loop-initializers-without-changing-binders
-  (with-redefs-fn {#'inline/try-resolve-deftm
-                  (fn [_] {:params ['x] :tags ['long] :walked-body ['x]})}
-    (fn []
-      (let [inlined (#'inline/inline-invk
-                    '(loop* [i 0 acc (.invk example/identity (long (+ i 2)))]
-                       (if (< i 3) (recur (inc i) (+ acc i)) acc)))]
-        (is (= ['i 'acc] (vec (take-nth 2 (second inlined)))))
-        (is (not-any? #(and (seq? %) (= '.invk (first %)))
-                      (tree-seq coll? seq inlined)))
-        (is (= 5 (eval inlined)))))))
+(deftest genuine-nested-and-loop-helper-callers-retain-public-behavior
+  (doseq [[caller inputs expected]
+          [[#'nested-owned-long-identity [3] 3]
+           [#'loop-initializer-owned-long-identity [0] 5]
+           [#'loop-initializer-owned-long-identity [4] 9]]]
+    (let [compiled (pipeline/compile-aot caller :simd? false)]
+      (is (= expected (apply @caller inputs) (apply compiled inputs)))))
+  (let [{:keys [source facts options]} (prepared-caller #'loop-initializer-owned-long-identity)
+        expanded (entry/call-with-definition-inputs
+                  #(inline/expand-for-backends source 3 (:param-env facts) options))
+        loop-form (some #(when (and (seq? %) (= 'loop* (first %))) %)
+                        (tree-seq coll? seq expanded))]
+    (is (some? loop-form))
+    (is (= ['i 'acc] (mapv #(with-meta % nil) (take-nth 2 (second loop-form)))))))
 
 (deftest late-dispatch-resolution-preserves-segmented-fold-schedule-requests
   (let [request {:association :implementation-defined}

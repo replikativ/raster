@@ -1,9 +1,15 @@
 (ns raster.compiler.ir.invocation-plan-test
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.backend.jvm.typed-scalar :as typed-scalar]
+            [raster.compiler.core.value-completion :as completion]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.invocation-plan :as invocation]
-            [raster.compiler.ir.invocation-source :as invocation-source]))
+            [raster.compiler.ir.invocation-materialization :as materialization]
+            [raster.compiler.ir.invocation-source :as invocation-source]
+            [raster.compiler.ir.parallel-program :as program]
+            [raster.compiler.ir.semantic-fingerprint :as semantic]
+            [raster.compiler.passes.scalar.effects :as effects]
+            [raster.compiler.passes.parallel.resident-program-projection :as resident-projection]))
 
 (defn- scalar [dtype]
   (av/tensor {:dtype dtype :shape []}))
@@ -15,10 +21,276 @@
 (defn- array-value [dtype extent]
   (av/tensor {:dtype dtype :shape [extent] :representation {:kind :plain}}))
 
+(deftest canonical-reference-identities-read-obligations-without-effect-inference
+  (let [binder (with-meta 'alias {:tag 'java.lang.Object :raster.type/tag 'doubles})
+        expression (completion/complete-value completion/object-input-contract 'x)
+        query #(invocation-source/reference-identity-source binder %)
+        flag #(vary-meta % assoc :raster.effect/source-reference-cast true)
+        rebuild (fn [head contract operand]
+                  (with-meta (list head contract operand) (meta expression)))]
+    (with-redefs [effects/descriptor (fn [& _] (throw (AssertionError. "unexpected effect inference")))]
+      (is (= 'x (query expression)))
+      (is (= 'x (query (vary-meta expression assoc :raster.effect/preserve-evaluation true))))
+      (doseq [operand ['(callback) '(do x) '(long x)
+                       (completion/complete-value completion/object-input-contract 'x)]]
+        (is (nil? (query (completion/complete-value completion/object-input-contract operand)))
+            "the grammar, not an empty obligation set, excludes executable operands"))
+      (doseq [changed [(rebuild (flag completion/completion-symbol) completion/object-input-contract 'x)
+                       (rebuild completion/completion-symbol (flag completion/object-input-contract) 'x)
+                       (rebuild completion/completion-symbol completion/object-input-contract (flag 'x))
+                       (flag expression)]]
+        (is (nil? (query changed)) "all existing recursive source obligations remain visible"))
+      (is (nil? (invocation-source/reference-identity-source (flag binder) expression)))
+      (doseq [changed [(vary-meta expression assoc :raster.effect/unknown true)
+                       (rebuild completion/completion-symbol completion/object-input-contract
+                                (vary-meta 'x assoc :raster.effect/unknown true))]]
+        (is (nil? (query changed))))
+      (doseq [contract [(assoc completion/object-input-contract :extra true)
+                        (dissoc completion/object-input-contract :policy)
+                        (assoc completion/object-input-contract :policy :different)]]
+        (is (nil? (query (rebuild completion/completion-symbol contract 'x))))))
+    (doseq [failure [(IllegalStateException. "obligation traversal failed")
+                     (StackOverflowError. "obligation traversal overflow")]]
+      (with-redefs-fn {(ns-resolve 'raster.compiler.passes.scalar.effects 'source-evaluation-flags)
+                      (fn [& _] (throw failure))}
+        #(do (is (= #{:unclosed-source-obligations} (effects/source-obligation-flags expression)))
+             (is (nil? (query expression))))))))
+
+(deftest source-boxing-keeps-invocation-representation-separate-from-numerical-facts
+  (let [logical (scalar :float)
+        box (completion/complete-value completion/object-input-contract 'coefficient)
+        unbox (completion/complete-value
+               (completion/bytecode-boxed-parameter-contract Float/TYPE) 'boxed)
+        options {:id :source-boxing :parameters '[coefficient]
+                 :parameter-values {'coefficient logical}
+                 :bindings [['boxed box] ['completed unbox]]
+                 :binding-values {'boxed logical 'completed logical}
+                 :program-values {'boxed logical 'completed logical}
+                 :program-inputs '[completed] :program-outputs '[completed]}
+        plan (invocation/from-prefix options)
+        [boxed completed] (:steps plan)]
+    (is (every? invocation/source-completion? (:steps plan)))
+    (is (= :opaque (get-in boxed [:value :kind])))
+    (is (= logical (get-in plan [:values 'boxed])) "logical numerical Float facts are not overwritten")
+    (is (= :opaque (get-in plan [:values (:id boxed) :kind])))
+    (is (= logical (:value completed)))
+    (is (= :invocation-program-input-contract
+           (try (invocation/from-prefix (assoc options :program-inputs '[boxed])) nil
+                (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+        "an opaque invocation slot cannot satisfy a numerical Float port")))
+
 (defn- reason-of [thunk]
   (try (thunk) nil
        (catch clojure.lang.ExceptionInfo exception
          (:reason (ex-data exception)))))
+
+(deftest numeric-object-literals-remain-zero-operand-ordered-source-completions
+  (let [opaque (av/make {:kind :opaque :memory-space :host :ownership :borrowed})
+        options (fn [expression]
+                  {:id :literal-boxing :parameters [] :parameter-values {}
+                   :bindings [['boxed expression] ['saved 'boxed]]
+                   :binding-values {'boxed opaque 'saved opaque}
+                   :program-values {} :program-inputs [] :program-outputs []})]
+    (doseq [value [(float -0.0) (double -0.0) (int 17) (long 9007199254740993)]]
+      (let [expression (completion/complete-value completion/object-input-contract value)
+            plan (invocation/from-prefix (options expression))
+            step (first (:steps plan))
+            calls (atom 0)
+            initial (materialization/begin-materialization plan [])
+            advanced (materialization/materialize-next
+                      initial {:source-completion
+                               (fn [actual operands]
+                                 (is (identical? step actual))
+                                 (is (empty? operands))
+                                 (swap! calls inc)
+                                 value)})
+            aliased (materialization/materialize-next
+                     advanced (fn [& _] (throw (AssertionError. "saved box reevaluated"))))]
+        (is (invocation/source-completion? step))
+        (is (empty? (:operands step)))
+        (is (identical? expression (:expression step)))
+        (is (= :opaque (get-in step [:value :kind])))
+        (is (zero? (:next-step initial)))
+        (is (= 1 @calls))
+        (is (identical? value (get-in advanced [:values (:id step) :source])))
+        (is (identical? (get-in advanced [:values (:id step)])
+                        (get-in aliased [:values (:id (second (:steps plan)))])))))
+    (doseq [expression ['(+ 0.0 1.0) '(do 0.0) '(clojure.core/float 0.0)
+                        '(clojure.core/aget buffer 0) 1N 1M 1/2 "not numeric"]]
+      (let [node (completion/complete-value completion/object-input-contract expression)]
+        (is (nil? (completion/numeric-object-literal-carrier node)))
+        (is (some? (reason-of #(invocation/from-prefix (options node)))))))))
+
+(defn- result-import-fixture []
+  (let [snapshot (completion/complete-value completion/object-input-contract 'total)
+        reduction '(numerical/reduce xs)
+        values {'xs (array-value :double 4) 'total (scalar :double)}
+        opaque (av/make {:kind :opaque :memory-space :host :ownership :borrowed})
+        equation (program/map->ProgramEquation
+                  {:id :reduce :site [:binding 'total] :source reduction
+                   :operands '[xs] :results '[total] :operations [{}]
+                   :effects #{} :provenance {} :attributes {}})
+        parallel (program/make {:dialect :typed-parallel
+                                :source (list 'let* ['total reduction 'saved snapshot] 'total)
+                                :values values :inputs '[xs] :outputs '[total] :equations [equation]})
+        options {:id :result-import :parameters '[xs] :parameter-values (select-keys values '[xs])
+                 :bindings [['saved snapshot]] :binding-values {'saved opaque}
+                 :result-imports {'saved {:equation :reduce :result 'total}}
+                 :program-values values :program-inputs '[xs] :program-outputs '[total]}]
+    {:options options :plan (invocation/from-prefix options) :program parallel
+     :snapshot snapshot :equation equation :opaque opaque}))
+
+(deftest program-result-import-is-an-explicit-source-ordered-opaque-demand
+  (let [{:keys [plan program snapshot]} (result-import-fixture)
+        step (first (:steps plan))
+        order (invocation/source-order plan program)]
+    (is (invocation/program-result-import? step))
+    (is (invocation/invocation-step? step))
+    (is (= [] (:operands step)))
+    (is (= {:equation :reduce :result 'total} (select-keys step [:equation :result])))
+    (is (= snapshot (:source-expression step)))
+    (is (= :opaque (get-in step [:value :kind])))
+    (is (= :host (get-in step [:value :memory-space])))
+    (is (nil? (get-in step [:value :dtype])))
+    (is (identical? plan (invocation/validate-against! plan program)))
+    (is (= :reduce (:equation (first order))))
+    (is (= {:equation :reduce :result 'total} (:program-result-import (second order))))
+    (is (= (:id step) (:invocation-step (second order))))))
+
+(deftest result-imports-cannot-guess-or-relabel-a-source-producer
+  (let [{:keys [plan program options equation snapshot opaque]} (result-import-fixture)
+        step (first (:steps plan))
+        check-both (fn [plan program]
+                     (is (some? (reason-of #(invocation/validate-against! plan program))))
+                     (is (some? (reason-of #(invocation/source-order plan program)))))]
+    (doseq [changed [(assoc step :equation :wrong)
+                     (assoc step :result 'xs)
+                     (assoc step :operands [{:symbol 'xs :value (:id (first (:parameters plan)))}])
+                     (assoc step :value (assoc opaque :dtype :double))]]
+      (check-both (assoc plan :steps [changed]) program))
+    (doseq [source [(list 'let* ['saved snapshot 'total (:source equation)] 'total)
+                    (list 'let* ['total '(numerical/other xs) 'saved snapshot] 'total)
+                    (list 'let* ['total (:source equation) 'saved
+                                (completion/complete-value completion/object-input-contract '(aget xs 0))] 'total)
+                    (list 'let* ['total (:source equation) 'saved 'total] 'total)
+                    nil]]
+      (check-both plan (assoc program :source source)))
+    (check-both plan (update program :equations conj (assoc equation :id :duplicate)))
+    (check-both plan (assoc program :equations []))
+    (check-both plan (assoc program :equations [(assoc equation :operations [] :attributes {:host-only true})]))
+    (check-both (assoc-in plan [:values 'total] (scalar :float)) program)
+    (let [source-free (program/make
+                       {:dialect :typed-parallel :source nil :values (:values program)
+                        :inputs '[xs] :outputs '[xs] :equations []
+                        :provenance {:front-end :explicit-typed-algorithm :pass :source-free-typed-invocation}
+                        :attributes {:host-control :typed-invocation}})
+          source-free-plan (assoc plan :program-outputs '[xs]
+                                 :attributes {:source-dialect :typed-soac :algorithm-dialect :typed-soac
+                                              :target-dialect :typed-invocation})]
+      (is (invocation/source-free-program? source-free))
+      (check-both source-free-plan source-free))
+    (is (= :invocation-prefix-free-value
+           (reason-of #(invocation/from-prefix (dissoc options :result-imports)))))
+    (is (= :invocation-program-result-import
+           (reason-of #(invocation/from-prefix
+                        (assoc options :result-imports {'unknown {:equation :reduce :result 'total}})))))
+    (doseq [declaration [nil false {:equation :reduce} {:equation :reduce :result 'total :extra true}]]
+      (is (= :invocation-program-result-import
+             (reason-of #(invocation/from-prefix (assoc options :result-imports {'saved declaration}))))))
+    (is (= :invocation-program-result-import
+           (reason-of #(invocation/from-prefix
+                        (assoc options :bindings [['saved (completion/complete-value
+                                                          completion/object-input-contract '(aget xs 0))]])))))
+    (is (= :invocation-opaque-program-value
+           (reason-of #(invocation/from-prefix
+                        (assoc options :program-values (assoc (:program-values options) 'saved opaque)
+                               :program-inputs '[xs saved])))))))
+
+(deftest result-import-keeps-its-producer-across-an-intervening-numerical-stage
+  (let [{:keys [plan program snapshot]} (result-import-fixture)
+        reduction (:source (first (:equations program)))
+        other-source '(numerical/other xs)
+        other (program/map->ProgramEquation
+               {:id :other :site [:binding 'other] :source other-source
+                :operands '[xs] :results '[other] :operations [{}]
+                :effects #{} :provenance {} :attributes {}})
+        changed (-> program
+                    (assoc :source (list 'let* ['total reduction 'other other-source 'saved snapshot] 'total))
+                    (assoc-in [:values 'other] (scalar :double))
+                    (update :equations conj other))
+        order (invocation/source-order plan changed)]
+    (is (= [:reduce :other nil nil] (mapv :equation order)))
+    (is (= {:equation :reduce :result 'total} (:program-result-import (nth order 2))))
+    (is (nil? (:program-result-import (nth order 1))))))
+
+(deftest normalized-reference-identities-retain-their-exact-source
+  (let [binder (with-meta 'saved {:tag 'java.lang.Object :raster.type/tag 'doubles})
+        expression (vary-meta (completion/complete-value completion/object-input-contract 'x)
+                              assoc :raster.effect/preserve-evaluation true)
+        value (array-value :double 4)
+        options {:id :reference-identity :parameters '[x] :parameter-values {'x value}
+                 :bindings [[binder expression]] :binding-values {binder value}
+                 :program-values {binder value} :program-inputs [] :program-outputs []}
+        plan (invocation/from-prefix options)
+        step (first (:steps plan))
+        source (list 'let* [binder expression] nil)
+        parallel (program/make {:dialect :typed-parallel :source source :values {'x value binder value}})]
+    (is (invocation/value-alias? step))
+    (is (= expression (:source-expression step)))
+    (is (= (meta expression) (meta (:source-expression step))))
+    (is (= 'x (invocation-source/reference-identity-source (:symbol step) (:source-expression step))))
+    (is (identical? plan (invocation/validate! plan)))
+    (is (string? (semantic/fingerprint plan)) "normalized identities contain no process-local Class proof")
+    (is (not= (semantic/fingerprint plan)
+              (semantic/fingerprint (assoc plan :steps [(update step :source-expression
+                                                                vary-meta dissoc :raster.effect/preserve-evaluation)]))))
+    (is (= (:id step) (:invocation-step (first (invocation/source-order plan parallel))))
+        "even a numerically unused identity retains its ordered invocation step")
+    (is (= #{binder} (#'resident-projection/required-prefix-symbols plan [])))
+    (is (= :resident-projection-retained-reference-identity
+           (reason-of #(#'resident-projection/validate-descriptor-prefix! [step])))
+        "the old descriptor adapter must not erase the ordered step")
+    (let [input (double-array [1.0 2.0 3.0 4.0])
+          initial (materialization/begin-materialization plan [input])
+          public-id (:id (first (:parameters plan)))
+          before (get-in initial [:values public-id])
+          advanced (materialization/materialize-next initial
+                                                     (fn [& _] (throw (AssertionError. "alias evaluated scalar code"))))]
+      (is (= 0 (:next-step initial)))
+      (is (= 1 (:next-step advanced)))
+      (is (identical? before (get-in advanced [:values (:id step)])))
+      (is (identical? input (:source (get-in advanced [:values (:id step)]))))
+      (is (some? (materialization/finish-materialization advanced))))
+    (doseq [changed-source [(list 'let* [] nil)
+                           (list 'let* [binder (vary-meta expression dissoc :raster.effect/preserve-evaluation)] nil)
+                           (list 'let* [(vary-meta binder assoc :tag 'String) expression] nil)]]
+      (is (some? (reason-of #(invocation/source-order plan (assoc parallel :source changed-source))))
+          "removing or changing the retained binding cannot replay as the original plan"))
+    (doseq [[bad-id bad-expression]
+            [[(vary-meta binder assoc :tag 'String) expression]
+             [(vary-meta binder dissoc :tag) expression]
+             [binder (vary-meta expression assoc :raster.effect/source-reference-cast true)]
+             [binder (vary-meta expression assoc :raster.effect/preserve-evaluation :unknown)]
+             [binder (completion/complete-value
+                      (completion/bytecode-boxed-parameter-contract (.arrayType Double/TYPE)) 'x)]
+             [binder (completion/complete-value completion/object-input-contract '(do x))]]]
+      (is (= :invocation-prefix-unsupported
+             (reason-of #(invocation/from-prefix (assoc options :bindings [[bad-id bad-expression]]))))))
+    (is (= :invocation-prefix-free-value
+           (reason-of #(invocation/from-prefix
+                        (assoc options :bindings [[binder (completion/complete-value
+                                                         completion/object-input-contract 'future)]])))))
+    (is (= :invocation-value-alias-source
+           (reason-of #(invocation/from-prefix (assoc options :parameter-values {'x (scalar :double)}))))
+        "a primitive/scalar source is not a buffer reference identity")
+    (is (= :invocation-value-alias-source
+           (reason-of #(invocation/from-prefix
+                        (assoc options :bindings [[(vary-meta binder assoc :raster.type/tag 'floats)
+                                                   expression]])))))
+    (is (= :invocation-value-alias-source
+           (reason-of #(invocation/validate!
+                        (assoc plan :steps [(assoc step :source-expression
+                                                  (completion/complete-value completion/object-input-contract 'other))])))))))
 
 (deftest public-shadowing-is-explicit-ssa
   (let [public-array (array-value :double '(extent u0))

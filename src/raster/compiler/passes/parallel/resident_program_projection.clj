@@ -10,6 +10,7 @@
             [raster.compiler.ir.kernel-dispatch :as dispatch]
             [raster.compiler.ir.kernel-executable :as executable]
             [raster.compiler.ir.invocation-plan :as invocation]
+            [raster.compiler.ir.invocation-source :as invocation-source]
             [raster.compiler.ir.soac-dialect :as soac]))
 
 (defn- fail! [reason message data]
@@ -54,7 +55,13 @@
 
 (defn- required-prefix-symbols [plan graphs]
   (let [steps-by-symbol (into {} (map (juxt :symbol identity)) (:steps plan))]
-    (loop [pending (vec (mapcat :arguments graphs))
+    (loop [pending (into (vec (mapcat :arguments graphs))
+                         (keep (fn [step]
+                                 (when (and (invocation/value-alias? step)
+                                            (invocation-source/preserved-reference-identity?
+                                             (:symbol step) (:source-expression step)))
+                                   (:symbol step))))
+                         (:steps plan))
            required #{}]
       (if-let [symbol (peek pending)]
         (if (contains? required symbol)
@@ -81,6 +88,15 @@
              "resident scalar prefix step must have one result"
              {:step (:id step) :results body-results}))
     (first body-results)))
+
+(defn- validate-descriptor-prefix!
+  [steps]
+  (when-let [step (first (filter #(and (invocation/value-alias? %)
+                                     (contains? % :source-expression)) steps))]
+    (fail! :resident-projection-retained-reference-identity
+           "the resident descriptor adapter cannot execute a retained reference identity; use the direct invocation path"
+           {:step (:id step) :binding (:symbol step)}))
+  steps)
 
 (defn- step-expression [step]
   (cond
@@ -127,7 +143,8 @@
           dispatches (mapv (comp dispatch/with-registration-key graph-dispatch) (range) operations)
           graphs (mapv dispatch/default-alternative dispatches)
           required (required-prefix-symbols plan graphs)
-          prefix-steps (filterv #(contains? required (:symbol %)) (:steps plan))
+          prefix-steps (validate-descriptor-prefix!
+                        (filterv #(contains? required (:symbol %)) (:steps plan)))
           prefix-bindings (mapcat (fn [step] [(:symbol step) (step-expression step)]) prefix-steps)
           marker-bindings
           (mapcat

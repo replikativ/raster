@@ -1,6 +1,16 @@
 (ns raster.compiler.backend.jvm.literal-carrier-test
   (:require [clojure.test :refer [deftest is]]
+            [raster.compiler.core.types :as types]
             [raster.compiler.backend.jvm.bytecode :as bytecode]))
+
+(deftest shared-numeric-literal-carriers-are-physical-not-logical-tags
+  (doseq [[value carrier] [[(long 1) :long] [(int 1) :int] [(byte 1) :int]
+                          [(short 1) :int] [(float 1) :float] [(double 1) :double]
+                          [(bigint 1) nil] [(biginteger 1) nil] [1/3 nil] [(bigdec 1) nil]]]
+    (is (= carrier (types/numeric-literal-carrier value)))
+    (when carrier
+      (is (= carrier (#'bytecode/infer-arg-stack-type value {})))))
+  (is (= 'long (types/literal-tag (bigint 1))) "the existing logical tag policy is unchanged"))
 
 (defn- compile-value
   ([expression] (compile-value expression 'Object))

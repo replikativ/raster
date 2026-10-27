@@ -2,7 +2,28 @@
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.backend.gpu.kernel-body-compile-fixtures :as fixtures]
             [raster.dl.gpu-grad-parity :as gpu-probe]
-            [raster.gpu.compiled :as compiled]))
+            [raster.gpu.compiled :as compiled]
+            [raster.gpu.device-probe :as opencl]
+            [raster.gpu.value :as value]
+            [raster.nn :as nn]))
+
+(deftest source-only-allocation-does-not-add-a-numerical-zero-kernel
+  (doseq [[target available? skip!] [[:ocl:0 @opencl/opencl-available? opencl/opencl-skip!]
+                                    [:ze:0 @gpu-probe/gpu-available? gpu-probe/gpu-skip!]]]
+    (if-not available?
+      (skip! "source-only dense-gradient allocation")
+      (let [prepared (compiled/lower #'nn/dense-backward-dW
+                                     [(float-array [1.0 2.0]) (float-array [3.0 4.0 5.0])]
+                                     {:compiler :equation-first :target target :dtype :float})
+            live (compiled/instantiate! prepared)]
+        (try
+          (is (some? (:ordered-invocation prepared)))
+          (is (= 1 (count (compiled/ir prepared))))
+          (doseq [[dy x expected] [[[1.0 2.0] [3.0 4.0 5.0] [3.0 4.0 5.0 6.0 8.0 10.0]]
+                                   [[-1.0 3.0] [2.0 -4.0 1.0] [-2.0 4.0 -1.0 6.0 -12.0 3.0]]]]
+            (is (= expected
+                   (vec (value/->host (:result (live {:dy (float-array dy) :x (float-array x)})))))))
+          (finally (compiled/close! live)))))))
 
 (deftest public-fresh-scatter-reestablishes-zeros-on-every-replay
   (if-not @gpu-probe/gpu-available?

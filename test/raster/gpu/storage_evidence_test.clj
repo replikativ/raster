@@ -4,21 +4,16 @@
             [raster.compiler.backend.gpu.storage-representation :as probe]
             [raster.gpu.compiled :as compiled]
             [raster.gpu.core :as gpu]
-            [raster.gpu.test-lifecycle]
+            [raster.gpu.test-lifecycle :as lifecycle]
             [raster.gpu.link :as link])
   (:import [java.lang.foreign MemorySegment]))
 
 (defn- seal [value] (#'compiled/seal-artifact value))
 (defn- owner []
-  (let [session (atom {:device-id :ocl:unit :session-id (random-uuid)
-                      :buffers {} :kernel-graphs {} :events {}})
-        executable (raster.gpu.test-lifecycle/linked-executable
-                    {:plan {:id :unit :outputs [:out]
-                            :nodes {:out {:view {:allocation {:ownership :owned}}}}}
-                     :session session :owns-session? true :closed? (atom false)
-                     :lifetime-lock (Object.) :execution-state (atom {:value-epoch 0})
-                     :completed-replays (atom 0) :output-leases (atom 0)
-                     :output-ready? (atom true)})]
+  (let [executable (lifecycle/linked-output-executable
+                    {:id :unit :target :ocl:unit :session-id (random-uuid)
+                     :outputs [{:id :out :shape [4] :source (float-array 4)}]
+                     :session-fields {:kernel-graphs {}}})]
     (seal (compiled/map->Compiled {:executable executable :live-outputs (atom nil)}))))
 
 (defn- error-of [f] (try (f) nil (catch Throwable error error)))
@@ -46,6 +41,7 @@
                     (swap! sess assoc-in [:kernel-graphs key] artifact)
                     (gpu/->KernelGraphHandle key))
                   gpu/run-kernel-graph! (fn [& _] (hit! :run))
+                  gpu/replay! (fn [& _] nil)
                   gpu/download-range!
                   (fn [sess key destination _]
                     (hit! :download)
@@ -65,7 +61,8 @@
   (let [c (owner) executable (:executable c)]
     (simulated c {}
       (fn [trace session]
-        (let [fact (compiled/measure-storage-representation! c :f32)]
+        (let [original-buffers (:buffers @session)
+              fact (compiled/measure-storage-representation! c :f32)]
           (is (compiled/representation-evidence? fact))
           (is (identical? c (:compiled fact)))
           (is (identical? session (:session fact)))
@@ -76,7 +73,7 @@
           (is (string? (:probe-fingerprint @fact)))
           (is (string? (:device-fingerprint @fact)))
           (is (= [:allocate :bind :run :download :classify :release-graph :free] @trace))
-          (is (empty? (:buffers @session)))
+          (is (= original-buffers (:buffers @session)))
           (is (empty? (:kernel-graphs @session)))
           (is (empty? (:events @session)))
           (is (zero? @(:completed-replays executable)))
@@ -93,11 +90,12 @@
       (let [c (owner) failure (ex-info (name stage) {})]
         (simulated c {stage failure}
           (fn [trace session]
-            (is (identical? failure (error-of #(compiled/measure-storage-representation! c :float))))
+            (let [original-buffers (:buffers @session)]
+              (is (identical? failure (error-of #(compiled/measure-storage-representation! c :float))))
+              (is (= original-buffers (:buffers @session))))
             (is (identical? failure (:failure @(:execution-state (:executable c)))))
             (is (zero? @(:completed-replays (:executable c))))
             (is (false? @(:output-ready? (:executable c))))
-            (is (empty? (:buffers @session)))
             (is (empty? (:kernel-graphs @session)))
             (is (= (not= :allocate stage) (boolean (some #{:free} @trace)))))))))
   (doseq [body-failure? [true false]]
@@ -121,7 +119,7 @@
     (let [c (owner) executable (:executable c)
           c (if (= :attached scenario)
               (seal (assoc c :executable
-                           (raster.gpu.test-lifecycle/linked-executable
+                           (lifecycle/linked-executable
                             (assoc executable :owns-session? false)))) c)
           executable (:executable c)]
       (case scenario
@@ -131,26 +129,24 @@
         :closed-executable (reset! (:closed? executable) true)
         :poisoned (swap! (:execution-state executable) assoc :failure (ex-info "old" {}))
         nil)
-      (simulated c {}
-        (fn [trace _]
-          (is (some? (error-of #(compiled/measure-storage-representation! c
-                                (if (= :unsupported scenario) :half :float)))))
-          (is (empty? @trace))
-          (is (zero? (:value-epoch @(:execution-state executable))))
-          (is (true? @(:output-ready? executable))))))))
+      (let [ready @(:output-ready? executable)]
+        (simulated c {}
+          (fn [trace _]
+            (is (some? (error-of #(compiled/measure-storage-representation! c
+                                  (if (= :unsupported scenario) :half :float)))))
+            (is (empty? @trace))
+            (is (zero? (:value-epoch @(:execution-state executable))))
+            (is (= ready @(:output-ready? executable)))))))))
 
 (defn- completed-receipt [c]
   (let [executable (:executable c)
-        _ (reset! (:output-ready? executable) true)
-        lease (with-redefs [link/outputs (constantly {}) link/output-values (constantly {})]
-                (link/output-lease! executable))
+        _ (link/run! executable)
         node {:dtype :float :shape [4] :strides [1] :byte-length 16
               :representation :device-native :content :unit-content}]
-    (seal (compiled/map->CompletedEvidence
-           {:data {:program-fingerprint "unit-program" :fingerprint "unit-completion"
-                   :inputs {:in node} :outputs {:out node} :post-state {}}
-            :lease lease :executable executable :epoch (:value-epoch @(:execution-state executable))
-            :values {} :released? (atom false)}))))
+    (lifecycle/completed-evidence
+     executable
+     {:program-fingerprint "unit-program" :fingerprint "unit-completion"
+      :inputs {:in node} :outputs {:out node} :post-state {}})))
 
 (deftest typed-storage-description-requires-live-same-owner-facts
   (let [c (owner)]

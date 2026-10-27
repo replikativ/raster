@@ -11,6 +11,7 @@
             [raster.compiler.backend.jvm.par-simd :as par-simd]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.hardware :as hardware]
+            [raster.compiler.core.util :as util]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.kernel-artifact :as kernel-artifact]
             [raster.compiler.ir.emitted-parallel-equation :as emitted-equation]
@@ -50,6 +51,34 @@
             [raster.numeric :as numeric]
             [raster.gpu.program-tuning :as program-tuning]))
 
+(deftest analyzed-envelope-transports-only-fresh-read-only-inputs
+  (let [source '(let* [a (raster.par/pmap i n float (* (clojure.core/aget x i) 2.0))
+                       b (raster.par/pmap j n float (+ (clojure.core/aget a j) 1.0))] b)
+        typed (frontend/form->program source {:dtype :float :array-types {'x :float}
+                                              :scalar-types {'n :long}})
+        fused (first (fusion/fusion-fixpoint typed nil))
+        envelope (route/analyzed-program-envelope source fused {'x 'loop-result})]
+    (is (< (count (dialect/equations fused)) (count (dialect/equations typed))))
+    (is (some #{'loop-result} (:inputs envelope)))
+    (is (not-any? #{'x} (:inputs envelope)))
+    (is (some #{'x} (util/free-syms (:source envelope)))
+        "realized source retains the physical carry, not a synthetic host alias")
+    (doseq [equation (:equations envelope)]
+      (is (= equation (parallel-program/equation-for-binding
+                      envelope (second (:site equation)) (:source equation)))))
+    (doseq [mapping [{'missing 'fresh} {'missing 'missing} {'x 'b}
+                     {'x 'fresh 'n 'fresh} {'x 'n}]]
+      (is (= :typed-soac-incoming-renaming
+             (try (route/analyzed-program-envelope source fused mapping) nil
+                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))
+    (let [write-source '(let* [y (raster.par/map! out i n float (clojure.core/aget x i))] y)
+          write-program (frontend/form->program write-source
+                                               {:dtype :float :array-types {'x :float 'out :float}
+                                                :scalar-types {'n :long}})]
+      (is (= :typed-soac-incoming-renaming
+             (try (route/analyzed-program-envelope write-source write-program {'out 'fresh}) nil
+                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))))
+
 (defn- kernel-body-operations
   [artifact]
   (letfn [(walk [operations]
@@ -69,27 +98,9 @@
            (kernel-body-operations artifact)))
 
 (defn- interpret-resident-source-for-test
-  "Interpret the internal reduce-into marker for source-semantic regression only.
-
-   This is not a public raw-source JVM route. It recognizes the shared IR predicate, extracts its
-   canonical plain reduction, evaluates the destination once, stores slot zero, returns that
-   buffer, and then delegates every ordinary parallel form to the shared sequential expansion."
+  "Run the retained executable source through the ordinary sequential parallel expansion."
   [program]
-  (let [expanded
-        (par-ir/expand-par-forms
-         (walk/postwalk
-          (fn [form]
-            (if (par-ir/par-reduce-into-form? form)
-              (let [{:keys [out-buf reduce-form]} (par-ir/extract-par-reduce-into-info form)
-                    destination (gensym "resident_source_out__")
-                    result-dtype (dtype/canon (get-in program [:values out-buf :dtype]))
-                    cast (symbol "clojure.core"
-                                 (name (dtype/scalar-tag-for-dtype result-dtype)))]
-                (list 'let* [destination out-buf]
-                      (list 'clojure.core/aset destination 0 (list cast reduce-form))
-                      destination))
-              form))
-          (:source program)))]
+  (let [expanded (par-ir/expand-par-forms (:source program))]
     ;; Typed compiler hints remain available as :raster.type/tag. JVM reference eval must not
     ;; reinterpret a retained primitive binder hint after the sequential expansion changes the
     ;; initializer's host representation; explicit checked cast forms above remain untouched.
@@ -572,6 +583,241 @@
     (is (= [2.0 3.0 4.0 5.0] (mapv double a)))
     (is (= [12.0 22.0 32.0 42.0] (mapv double b)))))
 
+(deftest ordinary-map-physical-bindings-do-not-capture-ordinals-or-locals
+  (doseq [[label array capture destination local]
+          [[:capture 'x 'i 'out 'temporary]
+           [:array 'i 'gain 'out 'temporary]
+           [:destination 'x 'gain 'i 'temporary]
+           [:local 'x 'gain 'out 'gain]
+           [:parameter-reservation 'x 'gain 'element 'temporary]]]
+    (testing (name label)
+      (let [tensor (av/tensor {:dtype :float :shape [3] :ownership :owned})
+            storage [{:destination destination :access :write :host-return :buffer}]
+            facts (dialect/default-program-facts
+                   {:values {array tensor capture (av/tensor {:dtype :float :shape []})
+                             destination tensor 'result tensor}
+                    :inputs [array capture]
+                    :effects #{:memory/write}
+                    :equations {'hygienic-map
+                                (assoc (dialect/default-equation-facts)
+                                       :effects #{:memory/write}
+                                       :aliases {'result destination}
+                                       :attributes {:result-storage storage})}})
+            expression (list 'clojure.core/+
+                             (list 'clojure.core/+ local 'captured)
+                             '(clojure.core/float i))
+            equation (list '= 'hygienic-map '[result]
+                           (list 'map {:index 'i :extent 3} [array] [capture]
+                                 (dialect/lambda-form
+                                  '[element captured]
+                                  [(dialect/local-value local :float 'element)]
+                                  [expression])))
+            program (dialect/make facts [equation] '[result])
+            projected (route/functional-map-host-projection program equation)
+            realization (#'route/realize-equation program equation)
+            host-source (list 'let* (vec (mapcat identity (:pairs realization))) 'result)
+            envelope (#'route/envelope program host-source {'hygienic-map realization})
+            scheduled (:form (segop-lower/segop-lower-pass envelope {:dtype :float}))
+            operation (first (get-in scheduled [:equations 0 :operations]))
+            index (:name (first (:dims (:space operation))))
+            arguments [array capture destination]
+            host (eval (list 'fn arguments
+                             (interpret-resident-source-for-test {:source host-source})))
+            jvm (par-simd/simd-pass scheduled :min-elements 1)
+            execute (eval (list 'fn arguments (interpret-resident-source-for-test
+                                              {:source (:form jvm)})))
+            input (float-array [1.0 2.0 3.0])
+            expected [11.5 13.5 15.5]]
+        (is (= :long (dialect/map-index-dtype 'map (:index projected))))
+        (when (contains? #{:capture :array :destination} label)
+          (is (not= 'i (:index projected)))
+          (is (not= 'i index)))
+        (when (= :local label)
+          (is (not= capture (:id (first (:locals projected))))))
+        (doseq [run [host execute]]
+          (let [out (float-array 3)]
+            (is (identical? out (run input (float 10.5) out)))
+            (is (= expected (vec out)))))
+        (is (= 1 (get-in jvm [:stats :segop-reused])))
+        (doseq [target [:opencl-portable :cuda :hip]]
+          (let [artifact (segop-opencl/generate-segmap-kernel-body
+                          operation :target-dialect target
+                          :array-types {array :float destination :float}
+                          :scalar-types {capture :float})
+                parameters (into {} (map (juxt :id identity))
+                                 (get-in artifact [:attributes :kernel-body :parameters]))]
+            (is (= :kernel-body (get-in artifact [:attributes :emission-route])))
+            (is (= :float (:dtype (get parameters capture))))))))))
+
+(deftest complete-map-host-projection-retains-local-casts-and-effect-return
+  (let [source '(let* [effect
+                       (raster.par/map-void!
+                        i n
+                        (let* [^float shifted (+ (clojure.core/aget x i) 1.0)
+                               ^float squared (* shifted shifted)]
+                              (clojure.core/aset a i (float shifted))
+                              (clojure.core/aset b i (float squared))))]
+                      effect)
+        program (:program (route/attempt source :float {'x :float 'a :float 'b :float}
+                                         {:scalar-types {'n :long}}))
+        owner (first (:equations program))
+        algorithm (:algorithm owner)
+        equation (first (dialect/equations algorithm))
+        projected (route/functional-map-host-projection algorithm equation)
+        statement (:statement projected)
+        stores (filter #(and (seq? %) (= 'clojure.core/aset (first %)))
+                       (tree-seq coll? seq statement))
+        execute (eval (list 'fn '[x a b n]
+                            (interpret-resident-source-for-test {:source (:source projected)})))
+        a (float-array 2)
+        b (float-array 2)]
+    (is (= :map (:kind projected)))
+    (is (= 'n (:extent projected)))
+    (is (= '[a b] (:physical-destinations projected)))
+    (is (= [:float :float] (mapv :dtype (:locals projected))))
+    (is (= 'let* (first statement)))
+    (is (= '[clojure.core/float clojure.core/float]
+           (mapv first (take-nth 2 (rest (second statement))))))
+    (is (= '[a b] (mapv second stores)) "stores retain their complete output order")
+    (is (= 1 (count (filter #(and (seq? %) (= 'clojure.core/aget (first %))
+                                  (= 'x (second %)))
+                            (tree-seq coll? seq statement))))
+        "the shared local initializer occurs once in the complete statement")
+    (is (= {:call-result :effect :storage-returns #{:effect}}
+           (:host-return-contract projected)))
+    (is (= (:source owner) (:source projected)) "realization uses the same shared projection")
+    (is (= :float (:raster.type/elem-type (meta (:source projected)))))
+    (is (nil? (execute (float-array [1.0 2.0]) a b 2)))
+    (is (= [2.0 3.0] (vec a)))
+    (is (= [4.0 9.0] (vec b)))))
+
+(deftest complete-map-host-projection-keeps-buffer-return-separate-from-stores
+  (let [source '(let* [result (raster.par/map! out i n float
+                                            (+ (clojure.core/aget x i) 1.0))]
+                      result)
+        program (:program (route/attempt source :float {'x :float 'out :float}
+                                         {:scalar-types {'n :long}}))
+        owner (first (:equations program))
+        algorithm (:algorithm owner)
+        projected (route/functional-map-host-projection
+                   algorithm (first (dialect/equations algorithm)))
+        execute (eval (list 'fn '[x out n]
+                            (interpret-resident-source-for-test {:source (:source projected)})))
+        out (float-array 2)]
+    (is (= {:call-result :buffer :storage-returns #{:buffer}}
+           (:host-return-contract projected)))
+    (is (= '[out] (:physical-destinations projected)))
+    (is (= 'clojure.core/aset (first (:statement projected))))
+    (is (= (:source owner) (:source projected)))
+    (is (identical? out (execute (float-array [2.0 3.0]) out 2)))
+    (is (= [3.0 4.0] (vec out)))))
+
+(deftest fresh-tuple-map-host-projection-keeps-secondary-stores-before-primary
+  (let [program (:program (route/attempt horizontal-maps :float {'a :float 'b :float}
+                                         {:scalar-types {'n :long}}))
+        owner (first (:equations program))
+        algorithm (:algorithm owner)
+        projected (route/functional-map-host-projection
+                   algorithm (first (dialect/equations algorithm)))
+        statement (:statement projected)
+        primary (second statement)
+        secondary-stores (filter #(and (seq? %) (= 'clojure.core/aset (first %)))
+                                 (tree-seq coll? seq (nth statement 3)))]
+    (is (= 2 (count (:physical-destinations projected))))
+    (is (= {:call-result :buffer :storage-returns #{}}
+           (:host-return-contract projected)))
+    (is (= (first (:physical-destinations projected)) primary))
+    (is (= (vec (rest (:physical-destinations projected))) (mapv second secondary-stores))
+        "secondary stores execute in the primary value operand before its outer store")
+    (is (= (:source owner) (:source projected)))))
+
+(deftest fused-caller-buffer-map-projection-keeps-effect-call-and-buffer-aliases
+  (let [source '(let* [u (raster.par/map! u-out i n float
+                                          (* (clojure.core/aget a i) 2.0))
+                       v (raster.par/map! v-out j n float
+                                          (+ (clojure.core/aget b j) 1.0))]
+                      [u v])
+        program (:program (route/attempt source :float
+                                         {'a :float 'b :float 'u-out :float 'v-out :float}
+                                         {:scalar-types {'n :int}}))
+        owner (first (:equations program))
+        algorithm (:algorithm owner)
+        projected (route/functional-map-host-projection
+                   algorithm (first (dialect/equations algorithm)))
+        stores (filter #(and (seq? %) (= 'clojure.core/aset (first %)))
+                       (tree-seq coll? seq (:statement projected)))
+        execute (eval (list 'fn '[a b u-out v-out n]
+                            (interpret-resident-source-for-test {:source (:source projected)})))
+        execute-host (eval (list 'fn '[a b u-out v-out n]
+                                 (interpret-resident-source-for-test program)))
+        a (float-array [1.0 2.0])
+        b (float-array [4.0 5.0])
+        u-out (float-array 2)
+        v-out (float-array 2)]
+    (is (= 1 (count (:equations program))))
+    (is (true? (:multiple-buffer-results? projected)))
+    (is (= {:call-result :effect :storage-returns #{:buffer}}
+           (:host-return-contract projected)))
+    (is (= '[u-out v-out] (:physical-destinations projected)))
+    (is (= '[u-out v-out] (mapv second stores)))
+    (is (= 'raster.par/map-void! (first (:source projected))))
+    (is (= (:source owner) (:source projected)))
+    (is (nil? (execute a b u-out v-out 2)))
+    (let [result (execute-host a b u-out v-out 2)]
+      (is (identical? u-out (first result)))
+      (is (identical? v-out (second result))))
+    (is (= [2.0 4.0] (vec u-out)))
+    (is (= [5.0 6.0] (vec v-out)))))
+
+(deftest complete-effect-map-host-projection-retains-the-ordered-loop-region
+  ;; This accepted carried-effect fixture stores within the loop, so its region
+  ;; cannot be extracted as a pure map with a terminal scalar fold.
+  (let [source '(let* [effect
+                       (raster.par/map-void!
+                        row rows
+                        (do (aset scales row (float seed))
+                            (let* [^double sum
+                                   (loop* [^long k 0 ^double acc 0.25]
+                                     (if (< k width)
+                                       (let* [^float v (aget x (+ (* row width) k))]
+                                         (aset packed (+ (* row width) k) v)
+                                         (recur (inc k) (+ acc (double v))))
+                                       acc))]
+                              (aset sums row (float sum)))))]
+                      effect)
+        program (:program (route/attempt source :float
+                                         {'x :float 'packed :float 'scales :float 'sums :float}
+                                         {:scalar-types {'rows :long 'width :long 'seed :float}}))
+        owner (first (:equations program))
+        algorithm (:algorithm owner)
+        projected (route/functional-map-host-projection
+                   algorithm (first (dialect/equations algorithm)))
+        nodes (tree-seq coll? seq (:statement projected))
+        stores (filter #(and (seq? %) (= 'clojure.core/aset (first %))) nodes)
+        execute (eval (list 'fn '[x packed scales sums rows width seed]
+                            (interpret-resident-source-for-test {:source (:source projected)})))
+        packed (float-array 6)
+        scales (float-array 2)
+        sums (float-array 2)]
+    (is (= :effect-map (:kind projected)))
+    (is (= :independent (:iteration-order projected)))
+    (is (= {:call-result :effect :storage-returns #{:effect}}
+           (:host-return-contract projected)))
+    (is (= '[scales sums packed] (:physical-destinations projected))
+        "physical results retain interface order, independently of ordered effects")
+    (is (some #(and (seq? %) (= 'loop* (first %))) nodes))
+    (is (some #(and (seq? %) (= 'clojure.core/double (first %))) nodes)
+        "the retained Double carry is completed as Double, not storage Float")
+    (is (= '[scales packed sums] (mapv second stores))
+        "pre-loop, in-loop and post-loop stores keep source order")
+    (is (= (util/alpha-normalize (:source owner))
+           (util/alpha-normalize (:source projected))))
+    (is (= (:statement projected) (nth (:source projected) 3)))
+    (is (nil? (execute (float-array [1 2 3 4 5 6]) packed scales sums 2 3 (float 2.5))))
+    (is (= [1.0 2.0 3.0 4.0 5.0 6.0] (vec packed)))
+    (is (= [2.5 2.5] (vec scales)))
+    (is (= [6.25 15.25] (vec sums)))))
+
 (deftest shared-tuple-work-stays-single-copy-through-jvm-and-gpu-lowering
   (let [source '(let* [effect
                        (raster.par/map-void!
@@ -933,6 +1179,9 @@
                        z (raster.par/pmap j n float (+ (clojure.core/aget y j) 1.0))]
                       z)
         {:keys [program stats]} (route/attempt source :float {'x :float})
+        analyzed (frontend/form->program-components
+                  source {:dtype :float :array-types {'x :float} :segmented-plans? true})
+        action (some #(when (= 'side (get-in % [:description :sym])) %) (:entries analyzed))
         source-pairs (partition 2 (second (:source program)))
         lowered (segop-lower/segop-lower-pass program {:dtype :float})]
     (is (= :typed-soac (:dialect program)))
@@ -941,6 +1190,11 @@
     (is (nil? (get-in program [:values 'side]))
         "opaque host values do not pretend to be functional TypedSOAC values")
     (is (= [1] (get-in program [:attributes :host-binding-ids])))
+    (is (= :source-action (:kind action)))
+    (is (:host-boundary? action))
+    (is (= #{'y} (set (:source-reads action))))
+    (is (= [{:source-binding-id 1 :values #{'y}}]
+           (get-in analyzed [:facts :attributes :host-read-sites])))
     (is (= 2 (count (:equations program))))
     (is (= 2 (get-in lowered [:stats :typed-soac-reused]))
         "both sides of the host barrier stay on the shared typed schedule vertical")
@@ -956,14 +1210,95 @@
                                               (* (clojure.core/aget b j) 2.0))]
                       [left right])
         {:keys [program stats]}
-        (route/attempt source :float {'a :float 'b :float})]
+        (route/attempt source :float {'a :float 'b :float})
+        analyzed (frontend/form->program-components
+                  source {:dtype :float :array-types {'a :float 'b :float}
+                          :segmented-plans? true})
+        action (some #(when (= 'side (get-in % [:description :sym])) %) (:entries analyzed))]
     (is (= 2 (count (:equations program))))
     (is (zero? (:horizontal stats)))
     (is (= [1] (get-in program [:attributes :host-binding-ids])))
+    (is (= [] (:source-reads action)))
+    (is (:host-boundary? action))
     (is (some #{'println} (flatten (:source program))))))
 
 (deftest scalar-only-host-control-does-not-construct-an-empty-typed-program
   (is (nil? (route/attempt '(let* [x 1 y (println x)] y) :float))))
+
+(deftest source-action-reads-retain-shadowed-public-scalar-dependencies
+  (let [source '(let* [y (raster.par/pmap i n float (clojure.core/aget x i))
+                       side (println count y)
+                       z (raster.par/pmap j n float (+ (clojure.core/aget y j) 1.0))]
+                 z)
+        analyzed (frontend/form->program-components
+                  source {:dtype :float :array-types {'x :float}
+                          :scalar-types {'count :long 'n :long}
+                          :values {'count (av/tensor {:dtype :long :shape []})}
+                          :segmented-plans? true})
+        action (second (:entries analyzed))]
+    (is (= '[y side z] (mapv #(get-in % [:description :sym]) (:entries analyzed))))
+    (is (= :source-action (:kind action)))
+    (is (= #{'count 'y} (set (:source-reads action))))
+    (is (= [{:source-binding-id 1 :values #{'count 'y}}]
+           (get-in analyzed [:facts :attributes :host-read-sites])))
+    (is (not (contains? (:values analyzed) 'side))
+        "an explicit source action still does not acquire a numerical value contract")))
+
+(deftest generated-storage-actions-partition-causal-components-without-host-boundaries
+  (let [source '(let* [y (raster.par/pmap i n float (* (clojure.core/aget x i) 2.0))
+                       scratch (clojure.core/float-array n)
+                       alias scratch
+                       z (raster.par/pmap j n float (+ (clojure.core/aget y j) 1.0))
+                       effect (raster.par/map! alias k n float (clojure.core/aget x k))
+                       returned alias]
+                 [z returned])
+        options {:dtype :float :array-types {'x :float}
+                 :scalar-types {'n :long} :segmented-plans? true}
+        analyzed (frontend/form->program-components source options)
+        entries (:entries analyzed)
+        components (#'route/component-runs entries)
+        routed (route/attempt source :float {'x :float}
+                              {:scalar-types {'n :long} :segmented-plans? true})
+        legacy (route/attempt source :float {'x :float} {:scalar-types {'n :long}})
+        source-order (mapv first (partition 2 (second (get-in routed [:program :source]))))
+        positions (zipmap source-order (range))
+        retained-positions (mapv positions '[scratch alias z effect returned])
+        source-pairs (into {} (map vec (partition 2 (second (get-in routed [:program :source])))))]
+    (is (= [:typed-soac :source-action :source-action :typed-soac :typed-soac :source-action]
+           (mapv :kind entries)))
+    (is (= '[y scratch alias z effect returned]
+           (mapv #(get-in % [:description :sym]) entries))
+        "analysis retains the exact lexical action order")
+    (is (not-any? :host-boundary? entries)
+        "causal splitting is an optimization boundary, not opaque host-boundary metadata")
+    (is (= 2 (count components)))
+    (is (= [[:typed-soac] [:typed-soac :typed-soac]]
+           (mapv #(mapv :kind (:entries %)) components)))
+    (is (= [:typed-soac :source-action :source-action]
+           (mapv :kind (:prefix (second components))))
+        "both source actions execute before the following numerical component")
+    (is (= :source-action (get-in components [1 :suffix 0 :kind]))
+        "the real trailing alias creates no empty numerical component")
+    (is (= [] (get-in analyzed [:facts :attributes :host-binding-ids])))
+    (is (= :typed-soac (get-in routed [:program :dialect])
+           (get-in routed [:stats :route]))
+        "an ordinary authenticated component projection keeps the ordinary route identity")
+    (is (nil? (get-in routed [:program :attributes :mixed-algorithms]))
+        "component use alone does not claim an SWR/mixed-algorithm program")
+    (is (zero? (get-in routed [:stats :vertical]))
+        "the causal component boundary deliberately prevents cross-action vertical fusion")
+    (is (= :typed-soac (get-in legacy [:program :dialect])
+           (get-in legacy [:stats :route])))
+    (is (pos? (get-in legacy [:stats :vertical]))
+        "without an authenticated component projection the legacy monolithic route is unchanged")
+    (is (and (every? integer? retained-positions) (apply < retained-positions))
+        "realization removes typed-owned y but preserves retained source actions in order")
+    (is (= 'alias (get source-pairs 'returned))
+        "the trailing source completion survives whole-route realization")
+    (is (= '[z returned] (last (get-in routed [:program :source])))
+        "the retained source keeps the semantic return aliases")
+    (is (= '[effect z] (get-in routed [:program :outputs]))
+        "the typed boundary independently exposes its canonical physical output ports")))
 
 (deftest coverage-diagnostics-share-program-host-boundary-admission
   (let [source '(let* [mapped (raster.par/pmap i n float
@@ -3240,7 +3575,9 @@
         "explicit storage does not turn an ordinary reduction into a synthetic contraction")
     (is (= 1 (:resident-reductions stats)))
     (is (= [{:destination 'out :access :write :host-return :buffer}] storage))
-    (is (some #{'raster.par/reduce-into} (flatten (:source program))))
+    (is (some #{'raster.par/reduce} (flatten (:source program))))
+    (is (some #{'clojure.core/aset} (flatten (:source program))))
+    (is (not-any? #{'raster.par/reduce-into} (flatten (:source program))))
     (is (= 1 (count (filter #{'clojure.core/double-array} (flatten (:source program)))))
         "resident realization reuses the caller allocation")
     (is (contains? scheduled-outputs 'out))
@@ -3263,6 +3600,48 @@
     (is (= :plain (get-in program [:values 'total :representation :kind])))
     (is (some #{'raster.par/reduce} (flatten (:source program))))
     (is (not-any? #{'raster.par/reduce-into} (flatten (:source program))))))
+
+(deftest output-only-reduction-residency-requires-the-whole-public-return
+  (doseq [[precision initializer element-type] [[:double 0.0 'double]
+                                               [:float '(float 0.0) 'float]]
+          tuple? [false true]]
+    (let [reduction (with-meta
+                      (list 'raster.par/reduce 'acc initializer 'j 'n
+                            '(+ acc (clojure.core/aget y j)))
+                      {:raster.type/elem-type precision})
+          source (list 'let*
+                       ['y (list 'raster.par/pmap 'i 'n element-type
+                                 '(clojure.core/aget x i))
+                        'total reduction]
+                       (if tuple? '[y total] 'total))
+          options {:resident-reductions? true :scalar-types {'n :long}}
+          source-free (route/attempt source precision {'x precision} options)
+          public (route/attempt source precision {'x precision}
+                                (assoc options :public-parameters '[x n]))
+          program (:program public)
+          returned (get-in program [:attributes :public-resident-reduction-outputs])
+          output (first returned)]
+      (is (:program source-free))
+      (is (zero? (get-in source-free [:stats :resident-reductions]))
+          "a source-free route has no implicit public-return demand")
+      (doseq [refused-options [(assoc options :lexical-inputs '[x n])
+                               (assoc options :public-parameters '[x n]
+                                              :resident-reductions? false)
+                               (assoc options :public-parameters '[x n] :return-tag 'void)]]
+        (is (zero? (get-in (route/attempt source precision {'x precision} refused-options)
+                          [:stats :resident-reductions]))
+            "lexical scope alone, disabled residency, and void returns grant no public demand"))
+      (is program)
+      (is (= 1 (get-in public [:stats :resident-reductions])))
+      (is (= 1 (count returned)))
+      (is (some #{output} (:outputs program)))
+      (is (= precision (get-in program [:values output :dtype])))
+      (is (= :resident-scalar-buffer
+             (get-in program [:values output :representation :kind])))
+      (is (= (if tuple? 2 1) (count (:outputs program))))
+      (is (some #{'raster.par/reduce} (flatten (:source program))))
+      (is (some #{'clojure.core/aset} (flatten (:source program))))
+      (is (not-any? #{'raster.par/reduce-into} (flatten (:source program)))))))
 
 (deftest public-reduction-reused-on-device-keeps-a-scalar-source-return
   (let [source
@@ -3303,7 +3682,9 @@
     (is (< (Math/abs (- expected actual)) 1.0e-12)
         "checked interpretation proves the routed fused transform precedes the resident store")
     (is (= (vec (repeat 3 (float expected))) (vec out)))
-    (is (some #{'raster.par/reduce-into} (flatten (:source program))))
+    (is (some #{'raster.par/reduce} (flatten (:source program))))
+    (is (some #{'clojure.core/aset} (flatten (:source program))))
+    (is (not-any? #{'raster.par/reduce-into} (flatten (:source program))))
     (is (= [resident-output]
            (get-in (dialect/facts inner)
                    [:attributes :public-resident-reduction-outputs])))))

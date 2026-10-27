@@ -10,7 +10,8 @@
   - Tag→Class resolution
   - Name mangling
   - Warning system"
-  (:require [clojure.string :as str]))
+  (:require [clojure.string :as str]
+            [raster.compiler.support.mangled :as mangled]))
 
 ;; ================================================================
 ;; Type Utilities
@@ -26,6 +27,18 @@
    'byte    Byte
    'short   Short
    'char    Character})
+
+(defn numeric-literal-carrier
+  "Physical primitive carrier of a supported retained numeric literal, or nil.
+   Byte/Short use the JVM int stack. This establishes neither reference boxing
+   identity nor permission to narrow a Long or reinterpret a logical dtype."
+  [value]
+  (cond
+    (instance? Long value) :long
+    (or (instance? Integer value) (instance? Byte value) (instance? Short value)) :int
+    (instance? Float value) :float
+    (instance? Double value) :double
+    :else nil))
 
 (defn literal-tag
   "Primitive source-language tag for a literal value, or nil.
@@ -54,6 +67,12 @@
    'shorts  (Class/forName "[S")
    'chars   (Class/forName "[C")
    'booleans (Class/forName "[Z")})
+
+(defn builtin-array-hint-class
+  "Interpret a builtin JVM array declaration, not the Class of an expression's value."
+  [hint]
+  (or (get primitive-array-info hint)
+      (when (= 'objects hint) (Class/forName "[Ljava.lang.Object;"))))
 
 (def tag->java-class
   "Map type tags to java.lang.Class for gen-interface descriptors."
@@ -430,13 +449,22 @@
         params annotations))
 
 (defn has-primitive-annotations?
-  "Check if any annotations involve typed dispatch — primitive types,
+  "Check if any annotations involve typed dispatch — primitive scalars/arrays,
    (Fn [...]) annotations, or concrete reference types (not Object/nil).
-   When true, a typed IFn__ interface is generated for devirtualization."
+   Argument and return arrays use the same annotation->tag declaration contract.
+   Object/nominal arrays do not acquire primitive-array entry semantics here.
+   When true, the original producer generates a typed IFn__ interface, including
+   its entry/return checks and deferred source owner; this never upgrades an
+   already retained plain frontend."
   [annotations ret-type]
   (some (fn [ann]
           (or (and ann (contains? boxed->primitive-tag ann))
               (and ann (sequential? ann) (= 'Fn (first ann)))
+              (and ann
+                   (let [base (unwrap-leaf-wrapper ann)]
+                     (and (or (symbol? base)
+                              (and (sequential? base) (= 'Array (first base))))
+                          (contains? primitive-array-info (annotation->tag ann nil)))))
               (and ann (symbol? ann)
                    (not= ann 'Object)
                    (not (contains? #{'doubles 'floats 'longs 'ints
@@ -588,9 +616,8 @@
 ;; ================================================================
 
 (def op-name-map
-  "Map operator characters to safe identifier names."
-  {\+ "plus", \- "minus", \* "star", \/ "div", \< "lt", \> "gt",
-   \= "eq", \! "bang", \? "pred", \& "amp", \| "pipe", \~ "tilde"})
+  "Compatibility alias for the shared structural operator codec table."
+  mangled/op-name-map)
 
 (defn- flatten-tag
   "Flatten a tag for mangling."
@@ -602,10 +629,7 @@
 (defn mangle
   "Mangle name: foo + [long String] -> foo_m_long_String"
   [base-name tags]
-  (let [safe-name (let [n (name base-name)]
-                    (if (every? #(contains? op-name-map %) n)
-                      (str "_" (str/join "" (map op-name-map n)) "_")
-                      n))]
+  (let [safe-name (mangled/encode-operator-name base-name)]
     (symbol (str safe-name "_m_"
                  (str/join "_" (map flatten-tag tags))))))
 
@@ -771,7 +795,8 @@
 (def ^:const preserved-type-keys
   "Metadata keys that CSE must preserve during normalization.
   These carry type information that downstream passes need."
-  [:raster.type/tag :raster.type/fn-info :raster.type/element :raster.type/source])
+  [:raster.type/tag :raster.type/fn-info :raster.type/element :raster.type/source
+   :raster.source/binding-declaration])
 
 ;; --- JVM numeric widening (used by dispatch and inference) ---
 

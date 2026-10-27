@@ -3,29 +3,121 @@
             [clojure.test :refer [deftest testing is]]
             [pattern.nanopass.dialect :as nanopass]
             [raster.compiler.pipeline :as pipeline]
+            [raster.compiler.core.method-entry :as method-entry]
             [raster.compiler.passes.scalar.simplify :as simplify]
             [raster.compiler.passes.scalar.inline :as inline]
             [raster.compiler.passes.scalar.soa-lower :as soa-lower]
             [raster.compiler.passes.scalar.local-products :as local-products]
+            [raster.compiler.passes.scalar.source-import :as source-import]
+            [raster.compiler.ir.segmented-weighted-reduction :as swr]
             [raster.compiler.passes.parallel.structured-control-route :as structured-route]
+            [raster.compiler.passes.parallel.typed-soac-frontend :as typed-frontend]
             [raster.compiler.passes.parallel.typed-soac-route :as typed-route]
             [raster.compiler.ir.semantic-fingerprint :as semantic-fingerprint]
             [raster.compiler.ad.flatten :as flat]
             [raster.compiler.ir.dialects :as dialects]
             [raster.ad.reverse :as rad]))
 
-(defn- isolated-fixpoint [input expand]
+(defn- isolated-fixpoint
   ;; Isolate termination from producer behavior. Real compiled workloads remain
   ;; covered by pipeline-quality-test; these controls exercise metadata invisible
   ;; to Clojure = without asking another pass to invent that metadata for us.
-  (with-redefs-fn
+  ([input expand] (isolated-fixpoint input expand #(#'pipeline/pass-fixpoint % {})))
+  ([input expand run!]
+   (with-redefs-fn
     {#'inline/expand-for-backends (fn [form & _] (expand form))
      #'soa-lower/lower-local-constructors (fn [form & _] form)
-     #'local-products/lower-local-products identity
+     #'local-products/lower-local-products (fn [form _context] form)
      #'pipeline/tag-binding-types (fn [form & _] form)
      #'pipeline/carry-void-binding-contracts identity
      #'pipeline/record-fixpoint-census! (fn [& _])}
-    #(#'pipeline/pass-fixpoint input {})))
+    #(run! input))))
+
+(deftest optional-input-frames-do-not-emit-protected-numerical-source
+  (let [plain '(let* [scratch (clojure.core/float-array (clojure.core/* width width))] scratch)
+        marker '(raster.compiler/segmented-weighted-reduction! scratch [] [])
+        protected (list 'let* (into (second plain) ['result marker]) 'result)
+        preparations (atom 0)
+        stopped (Exception. "reached physical source preparation")
+        construct (#'pipeline/contextual-reduction-constructor {:source-var #'identity})]
+    (is (source-import/contextual-invocation-argument-candidate? plain))
+    (is (source-import/contextual-invocation-argument-candidate? protected))
+    (with-redefs [method-entry/demand-original-source-frontend! (fn [_] {})
+                  source-import/prepare-contextual-source-witness
+                  (fn [& _] (swap! preparations inc) (throw stopped))]
+      (is (nil? (construct {:kind :ordered-invocation-arguments :source protected})))
+      (is (zero? @preparations))
+      (is (identical? stopped
+                      (try (construct {:kind :ordered-invocation-arguments :source plain})
+                           nil (catch Exception failure failure))))
+      (is (= 1 @preparations)))
+    (is (not (#'pipeline/protected-semantic-source? (list 'quote marker))))
+    (is (not (#'pipeline/protected-semantic-source? (list 'clojure.core/quote marker))))
+    ;; Abstaining cannot certify even this correctly shaped but proof-free
+    ;; marker. The unchanged semantic validator still refuses it.
+    (is (= :segmented-reduction-marker-missing-plan
+           (try (swr/protected-marker-plan marker :float) nil
+                (catch clojure.lang.ExceptionInfo failure (:reason (ex-data failure))))))))
+
+(deftest admitted-constructor-counts-do-not-start-optional-source-emission
+  (let [count-expression (list 'clojure.core/* 'width 'width)
+        source (list 'let* ['scratch (list 'clojure.core/float-array count-expression)] 'scratch)
+        options {:source-var #'identity :scalar-types {'width :long}}
+        retained (typed-frontend/retained-allocation-count-expressions source options)
+        frame-options {:required? true
+                       ::source-import/retained-allocation-counts retained}
+        preparations (atom 0)
+        projections (atom 0)
+        construct (#'pipeline/contextual-reduction-constructor options)]
+    (is (source-import/contextual-invocation-argument-candidate? source)
+        "the global/default SourceImport candidate remains unchanged")
+    (is (not (source-import/contextual-invocation-argument-candidate?
+              source frame-options)))
+    (with-redefs [source-import/prepare-contextual-source-witness
+                  (fn [& _] (swap! preparations inc) (throw (Exception. "unexpected emission")))
+                  source-import/project-contextual-invocation-arguments
+                  (fn [& _] (swap! projections inc) {:frames [:forged]})]
+      (is (nil? (construct {:kind :ordered-invocation-arguments :source source}))))
+    (is (zero? @preparations))
+    (is (zero? @projections)
+        "a denial can avoid proof construction but cannot manufacture a projection")))
+
+(deftest gpu-target-metadata-does-not-authorize-source-construction
+  (let [constructed (atom 0)
+        source '(let* [result 1.0] result)
+        options {:target-device :ocl:0 :source-var #'identity}
+        attempt #(do (#'pipeline/semantic-program-attempt source options nil))]
+    ;; Only dispatch is isolated. The public construction scope and its actual
+    ;; definition-input owner are real; no fabricated physical proof is issued.
+    (with-redefs-fn
+      {#'pipeline/contextual-reduction-constructor
+       (fn [_] (swap! constructed inc) (fn [_] nil))
+       #'pipeline/semantic-program-attempt* (fn [form _ _] {:source form})}
+      (fn []
+        (is (= {:source source} (attempt)))
+        (is (zero? @constructed) "a target-tagged optional query remains nonconstructing")
+        (is (= {:source source} (pipeline/call-with-gpu-source-construction :ocl:0 attempt)))
+        (is (= 1 @constructed) "only the explicit public construction scope authorizes its service")))))
+
+(deftest registered-fixpoint-runs-the-definition-analysis-owner-through-public-pipeline
+  (let [input '(let* [x 1.0] x)
+        owner (atom {:static [] :values []})
+        calls (atom 0)
+        analysis! method-entry/call-with-definition-analysis]
+    ;; pass-specs stores function VALUES: replacing/reloading only the private
+    ;; Var can otherwise leave public orchestration on an obsolete function.
+    (is (identical? @#'pipeline/pass-fixpoint (get-in @#'pipeline/pass-specs [:fixpoint :fn])))
+    (binding [method-entry/*emission-inputs* owner]
+      (with-redefs [method-entry/call-with-definition-analysis
+                    (fn [construct]
+                      (swap! calls inc)
+                      (analysis! construct))]
+        (is (= input
+               (isolated-fixpoint
+                input identity
+                #(pipeline/run-passes % [:fixpoint] {} :structured-reductions))))))
+    (is (= 1 @calls))
+    (is (method-entry/assert-definition-inputs-current! @owner))))
 
 (deftest fixpoint-consumes-metadata-only-repairs
   (let [input '(let* [value 1.0] value)
@@ -52,21 +144,38 @@
                        [(with-meta 'value {:raster.type/tag 'float})
                         (with-meta 'value {:raster.type/tag 'double})]
                        [(with-meta '[x] {:raster.type/element 'float})
-                        (with-meta '[x] {:raster.type/element 'double})]]]
+                        (with-meta '[x] {:raster.type/element 'double})]
+                       [(with-meta 'value {:tag Double})
+                        (with-meta 'value {:tag Float})]
+                       [(with-meta 'value {:tag Double})
+                        (with-meta 'value {:tag 'java.lang.Double})]
+                       [(with-meta 'call {:raster.op/original 'left})
+                        (with-meta 'call {:raster.op/original 'right})]]]
     (is (not (#'pipeline/fixpoint-equivalent? left right))))
   (is (#'pipeline/fixpoint-equivalent? Double/NaN Double/NaN)))
 
-(deftest unsupported-fixpoint-evidence-does-not-certify-stability
+(deftest fixpoint-converges-with-exact-retained-class-identity
   (let [input (with-meta '(let* [value 1.0] value) {:tag Double})
+        seen (atom 0)
+        result (isolated-fixpoint input
+                 (fn [form] (vary-meta form assoc :line (swap! seen inc))))]
+    (is (= 1 @seen) "an unchanged physical Class is valid process-local source evidence")
+    (is (zero? (get-in result [:stats :fixpoint-iterations])))
+    (is (= 1 (:line (meta (:form result)))))
+    (is (identical? Double (:tag (meta (:form result)))))))
+
+(deftest unsupported-fixpoint-evidence-does-not-certify-stability
+  (let [opaque (Object.)
+        input (with-meta '(let* [value 1.0] value) {:opaque opaque})
         seen (atom 0)
         result (isolated-fixpoint input
                  (fn [form] (vary-meta form assoc :line (swap! seen inc))))]
     (is (= 5 @seen) "unsupported runtime metadata uses the existing iteration cap")
     (is (= 5 (get-in result [:stats :fixpoint-iterations])))
     (is (= 5 (:line (meta (:form result)))))
-    (is (identical? Double (:tag (meta (:form result))))))
+    (is (identical? opaque (:opaque (meta (:form result))))))
   (let [failure (ex-info "unexpected fingerprint failure" {:reason :different-error})]
-    (with-redefs [semantic-fingerprint/equivalent? (fn [& _] (throw failure))]
+    (with-redefs [semantic-fingerprint/retained-source-equivalent? (fn [& _] (throw failure))]
       (is (identical? failure
                      (try (#'pipeline/fixpoint-equivalent? 'x 'x)
                           (catch clojure.lang.ExceptionInfo error error)))))))

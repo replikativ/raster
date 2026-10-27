@@ -1,5 +1,43 @@
 (ns raster.compiler.support.mangled
-  "Shared helpers for compiler-facing deftm and impl symbol mangling.")
+  "Shared helpers for compiler-facing deftm and impl symbol mangling."
+  (:require [clojure.string :as str]))
+
+(def op-name-map
+  "Operator-character encoding shared by deftm and specialized names.
+   This is a structural identifier codec, never semantic or dispatch evidence."
+  {\+ "plus", \- "minus", \* "star", \/ "div", \< "lt", \> "gt",
+   \= "eq", \! "bang", \? "pred", \& "amp", \| "pipe", \~ "tilde"})
+
+(defn encode-operator-name
+  "Encode a wholly operator-character name; ordinary helper names stay intact."
+  [base-name]
+  (let [n (name base-name)]
+    (if (every? #(contains? op-name-map %) n)
+      (str "_" (apply str (map op-name-map n)) "_")
+      n)))
+
+(def ^:private operator-tokens
+  (mapv (fn [[character token]] [token character]) op-name-map))
+
+(defn decode-operator-name
+  "Decode a COMPLETE canonical operator encoding, or return nil.
+   No partial token match changes an ordinary source helper's name."
+  [encoded]
+  (when (and (string? encoded) (> (count encoded) 2)
+             (str/starts-with? encoded "_") (str/ends-with? encoded "_"))
+    (loop [remaining (subs encoded 1 (dec (count encoded))) decoded ""]
+      (if (empty? remaining)
+        decoded
+        (when-let [[token character] (some #(when (str/starts-with? remaining (first %)) %) operator-tokens)]
+          (recur (subs remaining (count token)) (str decoded character)))))))
+
+(def ^:private legacy-name-replacements
+  ;; Preserve previously accepted partial/legacy spellings without making
+  ;; them the codec for new multi-character operators. Canonical replacements
+  ;; still derive from the one forward table; qmark predates its pred token.
+  (concat (map (fn [operator] [(encode-operator-name operator) operator])
+               ["+" "-" "*" "/" "<" ">" "<=" ">=" "="])
+          [[(str "_" (op-name-map \!)) "!"] ["_qmark" "?"]]))
 
 (defn strip-impl-suffix
   "Strip the -impl suffix from a function name string."
@@ -41,10 +79,8 @@
   (when (and (symbol? sym) (namespace sym)
              (pos? (.indexOf ^String (name sym) "_m_")))
     (let [base (unqualified-base-name sym)
-          decoded (reduce (fn [s [encoded original]]
-                            (.replace ^String s ^CharSequence encoded ^CharSequence original))
-                          base [["_plus_" "+"] ["_minus_" "-"] ["_star_" "*"]
-                                ["_div_" "/"] ["_lt_" "<"] ["_gt_" ">"]
-                                ["_lteq_" "<="] ["_gteq_" ">="] ["_eq_" "="]
-                                ["_bang" "!"] ["_qmark" "?"]])]
+          decoded (or (decode-operator-name base)
+                      (reduce (fn [s [encoded original]]
+                                (.replace ^String s ^CharSequence encoded ^CharSequence original))
+                              base legacy-name-replacements))]
       (symbol (namespace sym) decoded))))

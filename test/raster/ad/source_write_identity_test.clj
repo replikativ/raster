@@ -4,6 +4,7 @@
             [raster.numeric :as n]
             [raster.par :as par]
             [raster.ad.reverse :as rev]
+            [raster.compiler.core.value-completion :as completion]
             [raster.compiler.pipeline :as pipeline]))
 
 (deftm ^:no-inline opaque-buffer [ys :- (Array double)] :- (Array double) ys)
@@ -84,7 +85,12 @@
                    (.close ^java.lang.AutoCloseable compiled))
                  nil)
                (catch clojure.lang.ExceptionInfo e (ex-data e)))]
-    ;; The same fixture already refused its backward tuple before this change;
-    ;; it now refuses earlier on the retained guard. No native acceptance claim.
-    (is (= :unsupported-c-family-ir (:reason data)))
-    (is (= "Reverse AD replay input aliases a later write" (:expression data)))))
+    ;; The completion gate now precedes the unsupported guard/tuple checks.
+    ;; Neither the conversion nor the private-destination alias obligation may
+    ;; be erased just to reach a later gate. No native acceptance claim.
+    (is (= :unclosed-c-family-value-completion (:reason data)))
+    (is (completion/contains-completion? (:expression data)))
+    (is (some #{"Reverse AD replay input aliases a later write"}
+              (tree-seq coll? seq (:expression data))))
+    (is (some #{:ad-replayed-array-alias}
+              (tree-seq coll? seq (:expression data))))))

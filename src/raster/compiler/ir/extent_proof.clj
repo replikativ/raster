@@ -176,3 +176,61 @@
                    (reduce #(advance %1 inner %2) environment (dialect/equations algorithm))
                    environment)))))
          initial (take position equations))))))
+
+(def ^:private scalar-value-facets
+  [:kind :dtype :shape :representation :logical-layout])
+
+(defn- scalar-facets
+  [values id]
+  (let [value (get values id)]
+    (when (and (= :tensor (:kind value)) (= [] (:shape value)))
+      (select-keys value scalar-value-facets))))
+
+(defn- component-boundary-equation?
+  [parallel-values component-values equation subprogram]
+  (let [inner-equations (dialect/equations subprogram)
+        inner (when (= 1 (count inner-equations)) (first inner-equations))
+        operands (:inputs (dialect/facts subprogram))
+        results (dialect/outputs subprogram)
+        scalar-ids (distinct (concat operands results))]
+    (and inner
+         (= (:id equation) (second inner))
+         (= (:operands equation) operands)
+         (= (:results equation) results)
+         (semantic-equivalent? (:algorithm equation) subprogram)
+         (every? (fn [id]
+                   (= (scalar-facets parallel-values id)
+                      (scalar-facets component-values id)))
+                 scalar-ids))))
+
+(defn component-environment-before
+  "Return predecessor equality witnesses for one exact retained TypedSOAC component.
+
+   The component must occur as one unique contiguous sequence of its single-equation
+   subprograms in the enclosing ParallelProgram. Equation IDs, algorithms, ordered
+   operands/results and every boundary scalar's AV facets must agree. Only the first
+   component equation is used as the predecessor boundary; current and future equations
+   never contribute. A missing, foreign, reordered or ambiguous component yields no proof."
+  [{:keys [parallel-program component]}]
+  (if-not (and (map? parallel-program) (dialect/program-form? component))
+    {}
+    (let [parallel-equations (vec (:equations parallel-program))
+          component-equations (vec (dialect/equations component))
+          subprograms (vec (dialect/equation-subprograms component))
+          width (count component-equations)
+          component-values (:values (dialect/facts component))
+          parallel-values (:values parallel-program)
+          matches
+          (when (and (pos? width) (= width (count subprograms)))
+            (keep (fn [position]
+                    (let [candidate (subvec parallel-equations position (+ position width))]
+                      (when (every? true?
+                                    (map #(component-boundary-equation?
+                                           parallel-values component-values %1 %2)
+                                         candidate subprograms))
+                        position)))
+                  (range (inc (- (count parallel-equations) width)))))]
+      (if (= 1 (count matches))
+        (parallel-environment-before parallel-program
+                                     (nth parallel-equations (first matches)))
+        {}))))

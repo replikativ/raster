@@ -1,11 +1,15 @@
 (ns raster.compiler.core.definition-proof-inputs-test
   (:require [clojure.test :refer [deftest is]]
             [raster.ad.reverse :as reverse]
+            [raster.core :as core :refer [deftm]]
             [raster.compiler.core.inference :as inference]
             [raster.compiler.core.method-entry :as entry]
             [raster.compiler.passes.scalar.local-products :as products]
             [raster.compiler.passes.scalar.normal-return :as normal]
-            [raster.numeric :as n]))
+            [raster.numeric :as n]
+            [raster.runtime.callsites :as callsites]))
+
+(deftm nullable-array-allocator [input :- (Array float)] :- (Array float) nil)
 
 (defn- reason [f]
   (try (f) nil (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))
@@ -57,21 +61,35 @@
                             (raster.ad.reverse/grad-acc a b))))))))
 
 (deftest transitive-empty-array-allocation-proof-retains-actual-definitions
+  ;; Materialize the real typed callees before retaining the history under
+  ;; test. A legitimate lazy promotion is not the mutation this test targets.
+  (is (= [] (vec (n/+ (float-array 0) (float-array 0)))))
   (let [inputs (atom {:static [] :values []})
         signature (inference/registered-call-signature 'raster.numeric/similar '[floats])
-        allocator (find-var (:mangled-sym signature))]
+        allocator (find-var (:mangled-sym signature))
+        receiver (entry/call-with-definition-inputs
+                  #(get-in (entry/source-var-body-entry-carriers allocator) [:definition :receiver-var]))
+        replacement-source (core/resolve-deftm-var #'nullable-array-allocator)
+        replacement-receiver (ns-resolve (.ns replacement-source)
+                                         (symbol (str (.sym replacement-source) "-impl")))
+        replacement (:implementation (core/ensure-current-owned-bytecode! replacement-receiver))]
     (binding [entry/*emission-inputs* inputs]
       (is (= {:presence :present :array-tag 'floats} (array-sum-proof))))
     (is (contains? (:definition-proofs @inputs) allocator)
         "the transitive allocation helper, not merely numeric/+, owns the proof")
     (is (true? (entry/assert-definition-inputs-current! @inputs)))
-    (is (= [] (vec (n/+ (float-array 0) (float-array 0)))))
-    (with-redefs-fn {allocator (fn [_] nil)}
-      #(do
-         (is (nil? (n/+ (float-array 0) (float-array 0)))
-             "empty inputs expose the nullable allocator without a store throwing")
-         (is (= :stale-definition-proof-input
-                (reason (fn [] (entry/assert-definition-inputs-current! @inputs)))))))
+    ;; A compiled invk calls the actual typed receiver, not the old plain
+    ;; mangled Var. Replace that receiver with a genuine same-interface typed
+    ;; implementation; invalidate linked sites just as normal publication does.
+    (try
+      (with-redefs-fn {receiver replacement}
+        #(do
+           (callsites/invalidate! receiver replacement)
+           (is (nil? (n/+ (float-array 0) (float-array 0)))
+               "empty inputs expose the nullable allocator without a store throwing")
+           (is (= :stale-semantic-frontend-selection
+                  (reason (fn [] (entry/assert-definition-inputs-current! @inputs)))))))
+      (finally (callsites/invalidate! receiver (var-get receiver))))
     (is (true? (entry/assert-definition-inputs-current! @inputs)))))
 
 (deftest static-owner-rejects-a-transitive-change-before-publication
@@ -136,6 +154,48 @@
         (is (identical? original (get-in @inputs [:definition-proofs v :value])))
         (finally (alter-var-root v (constantly original)))))))
 
+(deftest repeated-definition-observation-preserves-the-exact-collector-until-a-new-lookup
+  (let [scope (create-ns (gensym "raster.proof-noop."))
+        caller (create-ns (gensym "raster.proof-noop-caller."))
+        v (intern scope 'input (Object.))
+        _ (.setDynamic ^clojure.lang.Var v)
+        owner (atom {:static [] :values []})]
+    (try
+      (binding [*ns* caller] (alias 'chosen (ns-name scope)))
+      (binding [entry/*emission-inputs* owner]
+        (entry/observe-definition-input! v scope 'input)
+        (let [first-observation @owner]
+          (entry/observe-definition-input! v scope 'input)
+          (is (identical? first-observation @owner))
+          (let [metadata (meta v)]
+            (try
+              (alter-meta! v assoc ::changed true)
+              (is (= :unstable-definition-proof-input
+                     (reason #(entry/observe-definition-input! v scope 'input))))
+              (is (identical? first-observation @owner))
+              (finally (reset-meta! v metadata))))
+          (with-redefs-fn {v (Object.)}
+            #(is (= :unstable-definition-proof-input
+                    (reason (fn [] (entry/observe-definition-input! v scope 'input))))))
+          (with-bindings {v (Object.)}
+            (is (= :unstable-definition-proof-input
+                   (reason #(entry/observe-definition-input! v scope 'input)))))
+          (is (identical? first-observation @owner))
+          (entry/observe-definition-input! v caller 'chosen/input)
+          (is (not (identical? first-observation @owner)))
+          (is (= 1 (count (:values @owner))))
+          (is (= #{[scope 'input] [caller 'chosen/input]}
+                 (get-in @owner [:definition-proofs v :lookups])))
+          (is (identical? (first (:values @owner)) (get-in @owner [:definition-proofs v])))
+          (let [with-alias @owner]
+            (entry/observe-definition-input! v caller 'chosen/input)
+            (is (identical? with-alias @owner)))
+          (is (entry/assert-definition-inputs-current! @owner))
+          (ns-unalias caller 'chosen)
+          (is (= :stale-definition-proof-input
+                 (reason #(entry/assert-definition-inputs-current! @owner))))))
+      (finally (remove-ns (ns-name caller)) (remove-ns (ns-name scope))))))
+
 (deftest emission-handoff-preserves-every-consulted-lookup-site
   (let [scope (create-ns (gensym "raster.proof-lookup."))
         inputs (atom {:static [] :values []})]
@@ -153,6 +213,249 @@
         (is (not (every? entry/var-snapshot-current? transported))
             "the second lookup remains necessary after emission artifact handoff"))
       (finally (remove-ns (ns-name scope))))))
+
+(defn- with-analysis-input [run!]
+  (let [scope (create-ns (gensym "raster.analysis-input."))
+        caller (create-ns (gensym "raster.analysis-caller."))
+        v (intern scope 'input (Object.))
+        _ (.setDynamic ^clojure.lang.Var v)
+        owner (atom {:static [] :values []})]
+    (try
+      (binding [*ns* caller] (alias 'chosen (ns-name scope)))
+      (binding [entry/*emission-inputs* owner]
+        (entry/observe-definition-input! v caller 'chosen/input)
+        (run! {:scope scope :caller caller :var v :owner owner}))
+      (finally (when (find-ns (ns-name caller)) (remove-ns (ns-name caller)))
+               (when (find-ns (ns-name scope)) (remove-ns (ns-name scope)))))))
+
+(deftest isolated-query-retains-first-history-and-every-older-lookup-edge
+ (doseq [result [:proved nil false]]
+  (with-analysis-input
+    (fn [{:keys [scope caller var owner]}]
+      (let [prior (get-in @owner [:definition-proofs var])]
+        (entry/call-with-definition-analysis
+         #(entry/call-with-isolated-definition-query
+           (fn []
+             (entry/observe-definition-input! var scope 'input)
+             (is (identical? (:value prior) (get-in @entry/*emission-inputs* [:definition-proofs var :value])))
+             result) false))
+        (is (= #{[caller 'chosen/input] [scope 'input]}
+               (get-in @owner [:definition-proofs var :lookups])))
+        (is (entry/assert-definition-inputs-current! @owner)))))))
+
+(deftest isolated-query-cannot-refresh-stale-history-even-when-it-declines
+  (doseq [change [:root :metadata :thread-binding :alias :namespace :reintern]]
+    (with-analysis-input
+      (fn [{:keys [scope caller var owner]}]
+        (let [before @owner root (var-get var) metadata (meta var)
+              query #(entry/call-with-isolated-definition-query
+                      (fn [] (entry/observe-definition-input! var scope 'input) nil))]
+          (try
+            (is (contains? #{:unstable-definition-proof-input :stale-definition-proof-input}
+                           (reason
+                            #(entry/call-with-definition-analysis
+                              (fn []
+                                (case change
+                                  :root (alter-var-root var (constantly (Object.)))
+                                  :metadata (alter-meta! var assoc ::changed true)
+                                  :alias (ns-unalias caller 'chosen)
+                                  :namespace (do (remove-ns (ns-name caller)) (create-ns (ns-name caller)))
+                                  :reintern (do (ns-unmap scope 'input) (intern scope 'input (Object.)))
+                                  nil)
+                                ;; The immediate parent is still EMPTY: nested decline
+                                ;; must consult the original enclosing baseline too.
+                                (entry/call-with-isolated-definition-query
+                                 (fn []
+                                   (if (= change :thread-binding)
+                                     (with-bindings {var (Object.)} (query))
+                                     (query))))))))
+                (str change))
+            (is (identical? before @owner))
+            (finally (alter-var-root var (constantly root)) (reset-meta! var metadata))))))))
+
+(deftest isolated-query-decline-throw-and-owner-conflict-never-partially-adopt
+  (doseq [outcome [:decline :throw :owner-change :non-query-state :opaque-producer]]
+    (with-analysis-input
+      (fn [{:keys [scope var owner]}]
+        (let [before @owner failure (Exception. "query failed")
+              observed
+              (try
+                (entry/call-with-definition-analysis
+                 (fn []
+                   (let [local-owner entry/*emission-inputs*]
+                     (entry/call-with-isolated-definition-query
+                      (fn []
+                        (entry/observe-definition-input! var scope 'input)
+                        (case outcome
+                          :decline nil
+                          :throw (throw failure)
+                          :owner-change (do (swap! local-owner assoc ::concurrent true) :proved)
+                          :non-query-state (do (swap! entry/*emission-inputs* assoc :static [:not-analysis]) :proved)
+                          :opaque-producer (do (swap! entry/*emission-inputs* assoc :producer-inputs
+                                                     [(reify entry/RetainedProducerInput
+                                                        (assert-producer-current! [_] true))])
+                                               :proved)))))))
+                (catch Exception error error))]
+          (case outcome
+            :decline (is (nil? observed))
+            :throw (is (identical? failure observed))
+            :owner-change (is (= :unstable-definition-proof-input (:reason (ex-data observed))))
+            (:non-query-state :opaque-producer)
+            (is (= :invalid-definition-query-state (:reason (ex-data observed)))))
+          (is (identical? before @owner)))))))
+
+(deftest isolated-query-imports-cannot-refresh-an-older-observation
+  (with-analysis-input
+    (fn [{:keys [scope var owner]}]
+      (let [before @owner root (var-get var)]
+        (try
+          (is (= :unstable-definition-proof-input
+                 (reason #(entry/call-with-definition-analysis
+                           (fn []
+                             (alter-var-root var (constantly (Object.)))
+                             (entry/call-with-isolated-definition-query
+                              (fn []
+                                (let [fresh (assoc (entry/emission-definition-snapshot var) :lookups #{[scope 'input]})]
+                                  (entry/adopt-definition-inputs! {:definition-proofs {var fresh} :values [fresh]}))
+                                nil)))))))
+          (is (identical? before @owner))
+          (finally (alter-var-root var (constantly root))))))))
+
+(deftest isolated-query-conditional-merge-preserves-concurrent-parent-updates
+  (with-analysis-input
+    (fn [{:keys [scope var owner]}]
+      (let [before @owner assert! entry/assert-definition-inputs-current!
+            query-inputs (atom nil) query-parent (atom nil) inject? (atom true)]
+        (is (= :unstable-definition-proof-input
+               (reason
+                #(entry/call-with-definition-analysis
+                  (fn []
+                    (reset! query-parent entry/*emission-inputs*)
+                    (with-redefs [entry/assert-definition-inputs-current!
+                                  (fn [inputs]
+                                    (let [result (assert! inputs)]
+                                      (when (and (identical? inputs @query-inputs)
+                                                 (compare-and-set! inject? true false))
+                                        (swap! @query-parent assoc ::concurrent true))
+                                      result))]
+                      (entry/call-with-isolated-definition-query
+                       (fn []
+                         (entry/observe-definition-input! var scope 'input)
+                         (reset! query-inputs @entry/*emission-inputs*)
+                         :proved))))))))
+        (is (true? (::concurrent @@query-parent)))
+        (is (empty? (:definition-proofs @@query-parent)))
+        (is (identical? before @owner))))))
+
+(deftest unregistered-children-retain-ordinary-query-and-observation-behavior
+  (with-analysis-input
+    (fn [{:keys [scope var owner]}]
+      (let [before @owner root (var-get var)
+            optional! entry/call-with-optional-definition-inputs
+            fallbacks (atom 0) declined? (atom false)]
+        (with-redefs [entry/call-with-optional-definition-inputs
+                      (fn [prove!] (swap! fallbacks inc) (optional! prove!))]
+          (entry/call-with-definition-analysis
+           #(do
+              (entry/call-with-independent-definition-inputs
+               (fn [] (entry/call-with-isolated-definition-query (constantly nil))))
+              (is (= 1 @fallbacks) "general independent children are not isolated query owners")
+              (entry/call-with-isolated-definition-query
+               (fn []
+                 (entry/call-with-independent-definition-inputs
+                  (fn []
+                    ;; Independent children sever the read-only observation
+                    ;; chain too; their optional child has ordinary empty history.
+                    (try
+                      (alter-var-root var (constantly (Object.)))
+                      (entry/call-with-optional-definition-inputs
+                       (fn []
+                         (entry/observe-definition-input! var scope 'input)
+                         (reset! declined? true)
+                         nil))
+                      (finally (alter-var-root var (constantly root))))))
+                 nil)))))
+        (is @declined?)
+        (reset! declined? false)
+        (entry/call-with-definition-analysis
+         #(entry/call-with-isolated-definition-query
+           (fn []
+             (try
+               (alter-var-root var (constantly (Object.)))
+               (entry/call-with-independent-definition-inputs
+                (fn []
+                  ;; An explicitly fresh analysis inside an UNREGISTERED child
+                  ;; must not inherit the surrounding query's historical chain.
+                  (entry/call-with-definition-analysis
+                   (fn []
+                     (entry/call-with-isolated-definition-query
+                      (fn []
+                        (entry/observe-definition-input! var scope 'input)
+                        (reset! declined? true)
+                        nil))))))
+               (finally (alter-var-root var (constantly root))))
+             nil)))
+        (is @declined?)
+        (is (identical? before @owner))))))
+
+(deftest optional-query-children-preserve-historical-observations-even-on-decline
+  (doseq [change [:root :metadata :alias]]
+    (with-analysis-input
+      (fn [{:keys [scope caller var owner]}]
+        (let [before @owner root (var-get var) metadata (meta var)
+              passed-observation? (atom false)]
+          (entry/call-with-definition-analysis
+           (fn []
+             (entry/call-with-isolated-definition-query
+              (fn []
+                (let [failure
+                      (try
+                        (case change
+                          :root (alter-var-root var (constantly (Object.)))
+                          :metadata (alter-meta! var assoc ::changed true)
+                          :alias (ns-unalias caller 'chosen))
+                        (entry/call-with-optional-definition-inputs
+                         (fn []
+                           (entry/call-with-optional-definition-inputs
+                            (fn []
+                              (entry/observe-definition-input! var scope 'input)
+                              (reset! passed-observation? true)
+                              nil))))
+                        nil
+                        (catch clojure.lang.ExceptionInfo error error)
+                        (finally
+                          ;; Restore BEFORE the session's final fence: only the
+                          ;; observation bridge can reject this declined query.
+                          (alter-var-root var (constantly root))
+                          (reset-meta! var metadata)
+                          (binding [*ns* caller] (alias 'chosen (ns-name scope)))))]
+                  (is (contains? #{:unstable-definition-proof-input :stale-definition-proof-input}
+                                 (:reason (ex-data failure))))
+                  (is (false? @passed-observation?)))
+                nil))))
+          (is (identical? before @owner)))))))
+
+(deftest isolated-queries-reuse-exact-original-qualification-guards-not-new-lookup-sites
+  (with-analysis-input
+    (fn [{:keys [scope caller var owner]}]
+      (let [alias-decision {:kind :symbol-resolution :source-ns caller :symbol 'chosen/input :result var}
+            direct-decision {:kind :symbol-resolution :source-ns scope :symbol 'input :result var}]
+        (entry/observe-source-reference! alias-decision)
+        (let [original (first (:producer-inputs @owner))]
+          (entry/call-with-definition-analysis
+           (fn []
+             (dotimes [_ 16]
+               (entry/call-with-isolated-definition-query
+                (fn []
+                  ;; Match the real frontend's ordinary optional-child seam.
+                  (entry/call-with-optional-definition-inputs
+                   (fn []
+                     (entry/observe-source-reference! alias-decision)
+                     (entry/observe-source-reference! direct-decision)
+                     :proved)))))))
+          (is (= 2 (count (:producer-inputs @owner))))
+          (is (identical? original (first (:producer-inputs @owner))))
+          (is (entry/assert-definition-inputs-current! @owner)))))))
 
 (defn- generated-with-consulted-proof [consult!]
   ;; Fault-inject a real consulted definition into normalization, not into the

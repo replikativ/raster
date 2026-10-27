@@ -6,9 +6,11 @@
 
 (deftest head-layout-permutations-use-the-direct-typed-route
   (doseq [[operation scalar-equations]
-          [[#'ops/pack-heads 2]
-           [#'ops/unpack-heads 2]
-           [#'ops/pack-heads-strided 2]
+          ;; Strict extent normalization names an already evaluated Long product;
+          ;; this changes host SSA size, not the single fused numerical operation.
+          [[#'ops/pack-heads 3]
+           [#'ops/unpack-heads 3]
+           [#'ops/pack-heads-strided 3]
            [#'ops/unpack-heads-strided 2]]]
     (let [compiled (pipeline/show-pipeline operation :target-device :ze:0 :dtype :float)
           compiler-report (report/from-pipeline compiled)]

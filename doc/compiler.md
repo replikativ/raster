@@ -54,9 +54,24 @@ them into shared storage, reducing peak memory usage.
 
 ### Lazy JIT
 
-Every `deftm` function is bytecode-compiled on first call. This happens
-transparently — the first invocation triggers compilation, subsequent calls
-use the compiled code.
+`deftm` supports lazy JVM compilation: normally the first invocation triggers
+compilation and subsequent calls use the compiled code. Explicit compiler
+preparation can materialize an implementation before numerical execution.
+
+Before emission takes dependency snapshots, a separate preparation step closes
+missing source-walk caches of referenced callees from their frozen frontends.
+Discovery respects lexical bindings and quoted data; unrelated functions are
+not warmed. Earlier observations are not refreshed: a preparation-induced change
+requires a whole construction retry. Source preparation and executable-callee
+readiness are distinct obligations; neither permits retrying numerical execution
+or accepting an old artifact after its retained definitions change.
+
+Executable preparation uses the emitter's actual global typed calls, not every
+source dependency. Calls are prepared in emission order before publication;
+source-only dependencies need not acquire a JVM implementation. Source-indexed
+call observations remain distinct from private physical-call records: cloning
+can deny source reconstruction without hiding either emitted call. Both use the
+same emission ledger, and private records grant no additional source authority.
 
 ### AOT via `compile-aot`
 
@@ -70,10 +85,30 @@ gives HotSpot C2 full visibility for optimization across function boundaries:
 ```
 
 Options:
+
 - `:inline?` — inline `deftm` calls (default `true`)
 - `:simd?` — apply SIMD optimization (default `true`)
 - `:dtype` — numeric dtype (`:double` or `:float`)
 - `:target-device` — device for GPU backend (e.g. `:cuda:0`, `:ze:0`)
+
+### Native C and scalar product storage
+
+Use `(pipeline/compile-aot #'my-fn :target :c :dtype :double)` for native C.
+Non-escaping scalar product intermediates can be eliminated when the actual
+JVM entry, selected helper implementations, and every consumer establish the
+same Double value. This removes box storage, not operand evaluation; arithmetic
+and source order remain unchanged. A type hint alone is not sufficient evidence.
+
+This storage-elimination path currently requires Double-only parameters and
+result, Double emission policy, and a closed scalar body. Identity observations,
+checked integral work, arrays, and unclosed AD entry conversions are not admitted
+by this path. Other native lowering retains its existing coverage.
+
+The admitted path checks exact call arity, converts every argument in source
+order (including unused arguments), then checks retained source/producer
+freshness before the native call. A stale compiled function must be recompiled;
+the guard does not restamp it. Argument conversion failures retain precedence
+over stale-program errors.
 
 ### Diagnostics
 

@@ -85,6 +85,80 @@
     (or (when (symbol? bound) (algebra/digit-radix index extent locals bound))
         (if inclusive? (list 'clojure.core/+ bound 1) bound))))
 
+(def ^:private proof-division-ops
+  '#{quot clojure.core/quot rem clojure.core/rem mod clojure.core/mod})
+
+(def ^:private proof-arithmetic-ops
+  '#{+ clojure.core/+ - clojure.core/- * clojure.core/*
+     long clojure.core/long int clojure.core/int})
+
+(defn- proof-index-coordinate
+  "Let-normalize only index-dependent quotient/remainder forms for the structural read proof.
+
+   This does not rewrite executable source. Synthetic locals are deterministic within this read,
+   deduplicate identical pure divisions, and stay private to `index-form`. Opaque calls, records,
+   binders and quoted data are not traversed, so normalization cannot make an unsupported address
+   look algebraic."
+  ([coordinate index extent locals loop-indices]
+   (proof-index-coordinate coordinate index extent locals loop-indices #{}))
+  ([coordinate index extent locals loop-indices scalar-identities]
+   (binding [util/*shadowing-locals*
+             (into (set scalar-identities)
+                   (concat [index] (map :id locals) (keys loop-indices)))]
+    (let [dependent
+        (:dependent
+         (reduce (fn [{:keys [dependent] :as state} {:keys [id init]}]
+                   (if (seq (set/intersection dependent (util/free-syms init)))
+                     (assoc state :dependent (conj dependent id))
+                     state))
+                 {:dependent #{index}} locals))
+        occupied
+        (reduce into
+                (into #{index} (concat (map :id locals) (keys loop-indices)))
+                (map util/free-syms
+                     (concat [coordinate extent] (map :init locals) (vals loop-indices))))
+        fresh-id
+        (fn [occupied ordinal]
+          (loop [ordinal ordinal]
+            (let [candidate (symbol (str "rstr_proof_div_" ordinal))]
+              (if (contains? occupied candidate)
+                (recur (inc ordinal))
+                [candidate (inc ordinal)]))))]
+    (letfn [(normalize-seq [form state]
+              (let [operation (first form)]
+                (if-not (or (contains? proof-division-ops operation)
+                            (contains? proof-arithmetic-ops operation))
+                  [form state]
+                  (let [[arguments state]
+                        (reduce (fn [[arguments state] argument]
+                                  (let [[argument state] (normalize argument state)]
+                                    [(conj arguments argument) state]))
+                                [[] state] (rest form))
+                        form (with-meta (list* operation arguments) (meta form))]
+                    (if-not (and (= 2 (count arguments))
+                                 (contains? proof-division-ops operation)
+                                 (seq (set/intersection (:dependent state)
+                                                        (util/free-syms form))))
+                      [form state]
+                      (if-let [id (get (:divisions state) form)]
+                        [id state]
+                        (let [[id ordinal] (fresh-id (:occupied state) (:ordinal state))]
+                          [id (-> state
+                                  (assoc :ordinal ordinal)
+                                  (update :occupied conj id)
+                                  (update :dependent conj id)
+                                  (assoc-in [:divisions form] id)
+                                  (update :locals conj {:id id :dtype :long :init form})
+                                  (update :synthetic conj id))])))))))
+            (normalize [form state]
+              (if (and (seq? form) (not (record? form)))
+                (normalize-seq form state)
+                [form state]))]
+      (let [[expression state]
+            (normalize coordinate {:occupied occupied :dependent dependent :divisions {}
+                                   :locals (vec locals) :synthetic #{} :ordinal 0})]
+        {:expression expression :locals (:locals state) :synthetic (:synthetic state)}))))))
+
 (defn- lexical-read-sites
   "Collect array reads with the exact lexical locals and counted-loop domains at each site."
   [expression index extent initial-locals expand]
@@ -150,6 +224,17 @@
               (map? form) (mapcat #(collect % locals loops) (apply concat form))
               :else []))]
     (vec (collect expression initial-locals {}))))
+
+(declare capacity-covers?)
+
+(defn- join-read-spans
+  [prior span]
+  (cond
+    (nil? prior) span
+    (capacity-covers? prior span) prior
+    (capacity-covers? span prior) span
+    :else (launch/maximum prior span)))
+
 (defn symbolic-read-certificate
   "Certify exact symbolic spans for the flat reads of a typed one-dimensional map.
 
@@ -187,19 +272,26 @@
                         projected-coordinate
                         (algebra/canonical-arithmetic
                          (util/subst-syms (address-substitutions site-locals idx) idx))
+                        proof-site-locals
+                        (mapv #(update % :init (comp algebra/canonical-arithmetic expand))
+                              site-locals)
+                        proof-coordinate
+                        (proof-index-coordinate
+                         coordinate index bound proof-site-locals loop-indices
+                         (segop/operation-scalars operation))
                         form (algebra/index-form
-                              coordinate
-                              index bound
-                              (mapv #(update % :init (comp algebra/canonical-arithmetic expand))
-                                    site-locals)
+                              (:expression proof-coordinate) index bound
+                              (:locals proof-coordinate)
                               loop-indices)]
                     (when-let [span (algebra/zero-based-dense-span form)]
+                      (when (empty? (set/intersection (:synthetic proof-coordinate)
+                                                     (set (:factors span))))
                        {:buffer sym :source-coordinate idx
                        :coordinate coordinate
                        :projected-coordinate projected-coordinate
                        :address-locals (local-dependencies site-locals idx)
                        :loop-indices loop-indices :form form
-                       :span (span-expression span)})))
+                       :span (span-expression span)}))))
                 read-sites)
           span-references (reduce set/union #{}
                                   (map #(launch/expression-references (:span %))
@@ -224,12 +316,7 @@
          :locals locals :reads read-facts
          :requirements
          (reduce (fn [result {:keys [buffer span]}]
-                  (update result buffer
-                          (fn [prior]
-                            (cond
-                              (nil? prior) span
-                              (= prior span) prior
-                              :else (launch/maximum prior span)))))
+                  (update result buffer join-read-spans span))
                  {} read-facts)}))))
 
 (defn symbolic-read-requirements

@@ -11,6 +11,11 @@
   (par/reduce acc 0.0 i count
     (let [v (aget theta (+ offset (* stride (long i))))]
       (n/+ acc (n/* v v)))))
+(deftm explicitly-wrapping-packed-prior
+  [theta :- (Array double) count :- Long stride :- Long offset :- Long] :- Double
+  (par/reduce acc 0.0 i count
+    (let [v (aget theta (unchecked-int (+ offset (* stride (long i)))))]
+      (n/+ acc (n/* v v)))))
 (deftm let-bound-packed-prior [theta :- (Array double) count :- Long] :- Double
   (let [total (par/reduce acc 0.0 i count
                 (let [v (aget theta (+ 1 (long i)))] (n/+ acc (n/* v v))))]
@@ -52,11 +57,21 @@
         (is (= (reduce + 0.0 (map #(let [v (aget theta %)] (* v v)) indices)) value))
         (is (= expected (vec actual)))
         (is (every? nil? [inactive-count inactive-stride inactive-offset]))))
-    (is (= [4.0 [4.0] nil nil nil]
-           (let [[v g & rest] (gradient (double-array [2.0]) 1 1 4294967296)]
-             (into [v (vec g)] rest))))
+    (let [source-read (fn [^doubles values ^long index] (aget values index))]
+      (is (thrown? ArithmeticException (source-read (double-array [2.0]) 4294967296)))
+      (is (thrown? ArithmeticException
+                   (gradient (double-array [2.0]) 1 1 4294967296))))
     (is (thrown? ArrayIndexOutOfBoundsException (gradient (double-array [2.0]) 1 1 -1)))
     (is (thrown? NullPointerException (gradient nil 1 1 0)))))
+
+(deftest explicit-index-wrapping-retains-its-primal-and-array-cotangent
+  (let [gradient (#'reverse/compile-prepared-value+grad
+                   (reverse/prepare-owned-bytecode-value+grad
+                    #'explicitly-wrapping-packed-prior [0]))
+        theta (double-array [2.0])
+        [value cotangent & inactive] (gradient theta 1 1 4294967296)]
+    (is (= 4.0 (explicitly-wrapping-packed-prior theta 1 1 4294967296)))
+    (is (= [4.0 [4.0] nil nil nil] (into [value (vec cotangent)] inactive)))))
 
 (deftest empty-reduction-does-not-evaluate-array-reads
   (let [gradient (#'reverse/compile-prepared-value+grad

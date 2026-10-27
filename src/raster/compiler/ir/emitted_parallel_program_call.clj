@@ -1,8 +1,9 @@
 (ns raster.compiler.ir.emitted-parallel-program-call
   "Pure runtime binding for one equation-first emitted parallel program.
 
-   Construction evaluates only effect-free host scalar equations that are independent of device
-   results. Every numerical equation is then bound from its emitted ABI and retained physical
+   Construction evaluates effect-free host scalar equations, never device-produced contents.
+   Exact length queries may depend on a bound resident buffer's stable metadata, not its data.
+   Every numerical equation is then bound from its emitted ABI and retained physical
    result contracts. The resulting call owns no driver handles and never reads retained source."
   (:require [clojure.set :as set]
             [raster.compiler.core.dtype :as dtype]
@@ -15,6 +16,7 @@
             [raster.compiler.ir.kernel-graph-call :as graph-call]
             [raster.compiler.ir.numerical-contract :as numerics]
             [raster.compiler.ir.parallel-program :as program]
+            [raster.compiler.ir.invocation-source :as invocation-source]
             [raster.compiler.ir.semantic-fingerprint :as semantic-fingerprint]
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.ir.structured-control :as control]
@@ -355,9 +357,27 @@
              "device-produced storage cannot be supplied as an evaluated host scalar"
              {:values (set shadowed)}))))
 
-(defn- validate-host-device-dependencies! [equation device-results]
+(defn ^:no-doc metadata-only-buffer-source
+  "Classify an exact shape query, not its value or permission to execute it early.
+   Actual length still comes from the checked runtime buffer view at its source position."
+  [equation values buffers]
+  (let [expression (invocation-source/scalar-equation-source equation)
+        source (when expression (invocation-source/shape-projection-source expression))
+        buffer (get values source)
+        result (when (= 1 (count (:results equation))) (get values (first (:results equation))))]
+    (when (and source (= [source] (:operands equation))
+               (= :tensor (:kind buffer)) (= 1 (count (:shape buffer)))
+               (some? (get buffers source))
+               (= :tensor (:kind result)) (empty? (:shape result))
+               (contains? #{:int :long} (:dtype result))
+               (invocation-source/projection-corresponds? expression result))
+      source)))
+
+(defn- validate-host-device-dependencies! [equation device-results values buffers]
   (let [dependencies (set/intersection device-results (set (:operands equation)))]
-    (when (seq dependencies)
+    (when (and (seq dependencies)
+               (not= dependencies (when-let [source (metadata-only-buffer-source equation values buffers)]
+                                    #{source})))
       (fail! :emitted-program-host-device-dependency
              "a host scalar equation cannot be staged before a device result"
              {:equation (:id equation) :values dependencies}))))
@@ -380,7 +400,7 @@
        (if-not (true? (get-in equation [:attributes :host-only]))
          (update state :device-results into (device-equation-results equation projections))
          (do
-           (validate-host-device-dependencies! equation device-results)
+           (validate-host-device-dependencies! equation device-results values buffers)
            (let [step (evaluate-host-step equation values buffers scalars evaluate-host)
                  results (:results step)]
              (-> state
@@ -431,7 +451,8 @@
             (when-not (= equation (:equation step))
               (fail! :emitted-program-call-step-equation
                      "evaluated host step changed equation identity" {:equation (:id equation)}))
-            (validate-host-device-dependencies! equation @prior-device-results)
+            (validate-host-device-dependencies! equation @prior-device-results
+                                                (:values parallel-program) @current-buffers)
             (let [expected (host-operand-bindings equation (:values parallel-program)
                                                 @current-buffers @current-scalars)]
               (doseq [[id value] expected]
@@ -653,16 +674,15 @@
       (loop-call/validate! remapped)
       (loop-call/validate! remapped caller-options))))
 
-(defn- buffer-bindings-for-request
+(defn- buffer-bindings-from-checked-call
   "Return every compiler-value/storage pair referenced by an emitted call boundary.
 
    A zero-trip structured loop can retain a dead carry-output token that is intentionally absent
    from the call's effective top-level `:buffers`. It is still part of the nested call structure
    and must therefore participate in total storage-identity projections. Graph-owned temporaries
    are not call-boundary storage and are excluded."
-  [call caller-options]
-  (let [call (if (nil? caller-options) (validate! call) (validate! call caller-options))
-        output-bindings (fn [outputs]
+  [call]
+  (let [output-bindings (fn [outputs]
                           (remove (comp typed-scalar? second) outputs))
         step-bindings
         (fn [step]
@@ -691,6 +711,17 @@
                            (:loop-scratch call)
                            (output-bindings (:outputs call))
                            (mapcat step-bindings (:steps call)))))))
+
+(defn- buffer-bindings-for-request [call caller-options]
+  (buffer-bindings-from-checked-call
+   (if (nil? caller-options) (validate! call) (validate! call caller-options))))
+
+(defn ^:no-doc buffer-bindings-with-retained-program
+  "Recheck runtime bindings using exact static program evidence, then enumerate all identities.
+   This is not the subset requiring resident storage; retained host snapshots remain included."
+  [call retained-validation caller-options]
+  (buffer-bindings-from-checked-call
+   (validate-retained-for-request! call retained-validation caller-options)))
 
 (defn buffer-bindings
   "Return compiler-value/storage pairs after independent request-aware validation."
@@ -852,7 +883,8 @@
     (assoc inputs :scalars scalars :host-steps host-steps)))
 
 (defn ^:no-doc make-equation-call
-  "Bind one retained numerical equation using the ordinary checked ABI/dispatch path.
+  "Low-level graph-call constructor for one retained non-loop numerical equation.
+   Ordered invocation owners use make-equation-program-call to retain semantic write coverage.
    No host equation is evaluated and no driver resource is acquired. This proves the selected
    call, not that preceding source work completed: the enclosing invocation cursor owns order,
    storage initialization and lifetime. Structured loops retain their bounded call constructor.
@@ -886,10 +918,20 @@
               {:equation equation-id}))
      (validate-host-device-dependencies!
       equation (into #{} (mapcat #(device-equation-results % projections caller-options))
-                     (take-while #(not= equation-id (:id %)) (:equations program))))
+                     (take-while #(not= equation-id (:id %)) (:equations program)))
+      (:values program) buffers)
      (let [step (evaluate-host-step equation (:values program) buffers scalars evaluate-host)]
        (merge-host-results scalars equation (:results step))
        step))))
+
+(defn- prepare-loop-call [equation buffers scalars loop-scratch caller-options]
+  (let [operation (first (:operations equation))
+        emitted (if (nil? caller-options)
+                  (emitted-loop/validate! operation)
+                  (emitted-loop/validate! operation caller-options))]
+    (if (nil? caller-options)
+      (loop-call/make (:schedule emitted) (:graph emitted) buffers scalars loop-scratch)
+      (loop-call/make (:schedule emitted) (:graph emitted) buffers scalars loop-scratch caller-options))))
 
 (defn- construct-staged-call
   "Construct only from inputs just staged by this namespace. Host evaluation remains outside
@@ -905,14 +947,7 @@
              {:buffers buffers :steps (conj steps (get host-steps (:id equation)))}
 
              (emitted-loop/emitted-loop? (first (:operations equation)))
-             (let [operation (first (:operations equation))
-                   emitted (if (nil? caller-options)
-                             (emitted-loop/validate! operation)
-                             (emitted-loop/validate! operation caller-options))
-                   call (if (nil? caller-options)
-                          (loop-call/make (:schedule emitted) (:graph emitted) buffers scalars loop-scratch)
-                          (loop-call/make (:schedule emitted) (:graph emitted)
-                                          buffers scalars loop-scratch caller-options))]
+             (let [call (prepare-loop-call equation buffers scalars loop-scratch caller-options)]
                {:buffers (merge buffers (:outputs call))
                 :steps (conj steps call)})
 
@@ -939,13 +974,62 @@
       {:execution :stage-once-host-repetition :source-inspected false})
      parallel-program validated-equation-calls caller-options projections)))
 
+(defn ^:no-doc make-equation-program-call
+  "Bind a retained numerical equation as an independently checked program fragment.
+   This evaluates no host equation and acquires no resources. The fragment has no source-entry
+   completion authority and never borrows the enclosing program's validation seal. Required
+   preceding host equations retain their already-evaluated steps, not an evaluator callback.
+   The optional fragment evidence is its OWN previously sealed validation; parent bindings and
+   host-prefix receipts are still checked freshly before that evidence is considered."
+  ([parallel-program equation-id inputs retained-validation caller-options]
+   (make-equation-program-call parallel-program equation-id inputs retained-validation nil
+                               caller-options))
+  ([parallel-program equation-id
+    {:keys [buffers scalar-values loop-scratch result-views host-steps]
+     :or {buffers {} scalar-values {} loop-scratch {} result-views {} host-steps {}}}
+    retained-validation fragment-validation caller-options]
+  (let [{:keys [program buffers scalars]}
+        (checked-stage-inputs parallel-program buffers scalar-values loop-scratch result-views
+                              retained-validation caller-options)
+        equation (some #(when (= equation-id (:id %)) %) (:equations program))]
+    (when-not (and equation (not (true? (get-in equation [:attributes :host-only]))))
+      (fail! :emitted-program-ready-equation
+             "one program stage requires an existing retained numerical equation"
+             {:equation equation-id}))
+    (let [host-prefix (if (emitted-loop/emitted-loop? (first (:operations equation))) []
+                       (filterv #(true? (get-in % [:attributes :host-only]))
+                                (take-while #(not= equation-id (:id %)) (:equations program))))
+          _ (doseq [host host-prefix]
+              (when-not (and (evaluated-host-equation? (get host-steps (:id host)))
+                             (= host (:equation (get host-steps (:id host)))))
+                (fail! :emitted-program-ready-host-prefix
+                       "a numerical fragment requires its exact completed host prefix"
+                       {:equation equation-id :host-equation (:id host)})))
+          ;; Reused evidence owns this exact fragment. On a miss, construct and independently
+          ;; validate the fragment as before. Neither path borrows the parent seal.
+          validation
+          (if fragment-validation
+            (emitted-program/checked-equation-fragment-validation!
+             program equation-id fragment-validation caller-options)
+            (let [fragment (emitted-program/equation-fragment program equation-id)]
+              (if (nil? caller-options)
+                (emitted-program/validate-with-physical-results! fragment)
+                (emitted-program/validate-with-physical-results! fragment caller-options))))
+          fragment (:program validation)
+          inputs (checked-stage-inputs fragment buffers scalars
+                                       (select-keys loop-scratch (:results equation))
+                                       (select-keys result-views (:results equation)) validation caller-options)
+          call (construct-staged-call (assoc inputs :host-steps (select-keys host-steps (map :id host-prefix))))]
+      {:call call :buffers (:buffers call) :retained-validation validation}))))
+
 (defn make
   "Prepare a source-independent, target-neutral call of an emitted parallel program.
 
    `buffers` may include preallocated intermediate and output storage in addition to inputs.
    `scalar-values` contains typed runtime scalars. `loop-scratch` maps loop output IDs to alternate
-   carry buffers. `evaluate-host` is called only for effect-free scalar equations that do not
-   depend on device results.
+   carry buffers. `evaluate-host` is called only for effect-free scalar equations without
+   device-content dependencies. Exact metadata-only length queries still require current buffer
+   bindings; this constructor grants no permission to execute source work early.
    Optional `result-views` maps logical results to their prefix-producing physical destinations.
    This declares a storage relation, not proof that arbitrary runtime tokens alias: LinkPlan
    validates concrete views, and runtime preparation requires checked view resolution.

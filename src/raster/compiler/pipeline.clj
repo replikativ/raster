@@ -21,6 +21,8 @@
   (:require [clojure.string]
             [clojure.pprint :as pp]
             [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.source-policy :as source-policy]
+            [raster.compiler.core.source-declaration :as source-declaration]
             [raster.compiler.core.dispatch :as dispatch]
             [raster.compiler.ir.kernel-launch :as klaunch]
             [raster.compiler.passes.scalar.dce :as dce]
@@ -42,6 +44,7 @@
             [raster.compiler.backend.gpu.wgsl :as wgsl-emit]
             [raster.compiler.passes.scalar.soa-lower :as soa-lower]
             [raster.compiler.passes.scalar.local-products :as local-products]
+            [raster.compiler.passes.scalar.source-import :as source-import]
             [raster.compiler.passes.parallel.structured-control-route :as structured-route]
             [raster.compiler.passes.parallel.resident-program-projection :as resident-projection]
             [raster.compiler.passes.parallel.typed-soac-frontend :as typed-soac-frontend]
@@ -65,6 +68,8 @@
             [raster.compiler.core.hoist :as hoist]
             [raster.compiler.core.types :as types]
             [raster.compiler.core.value-completion :as value-completion]
+            [raster.compiler.core.binding-completion :as binding-completion]
+            [raster.compiler.backend.jvm.source-owner :as source-owner]
             [raster.compiler.core.op-descriptor :as op]
             [raster.compiler.core.walker :as walker]
             [raster.compiler.core.inference :as inf]
@@ -127,7 +132,8 @@
   stamped onto loop* forms — silent double/float divergence inside one compile
   (the GPU emitters' `WARN loop-value-ctype` firings)."
   [body params tags annotations source-ns element-dtype]
-  (let [type-env (inf/build-param-type-env params tags annotations)
+  (let [body (source-declaration/capture-body body)
+        type-env (inf/build-param-type-env params tags annotations)
         ;; Run TC for per-binding type inference
         tc-binding-tags (when annotations
                           (inf/safe-tc-binding-tags '<compile> params annotations body source-ns))
@@ -135,6 +141,12 @@
                     (seq tc-binding-tags) (assoc :tc-binding-tags tc-binding-tags)
                     (#{:float :double} element-dtype) (assoc :element-dtype element-dtype))]
     (mapv #(walker/walk-body % walk-opts) body)))
+
+(defn normalize-source-bindings
+  "Scope normalization shared by fresh and retained typed source; never retypes it."
+  [body params]
+  (let [param-syms (map #(if (symbol? %) (symbol (name %)) %) params)]
+    (mapv #(util/uniquify-rebindings param-syms %) body)))
 
 (defn get-walked-body [f-var & [dtype]]
   (let [resolved (or (resolve-deftm-var f-var dtype) f-var)
@@ -159,7 +171,8 @@
                 element-dtype (or dtype (infer-dtype resolved))
                 ;; Available source is authoritative. A failed fresh walk is a compiler failure,
                 ;; not permission to execute a stale definition-time body with older type facts.
-                walked (walk-body-with-tc (vec raw-body) params tags annotations src-ns element-dtype)]
+                walked (source-policy/call-with-owner
+                        m #(walk-body-with-tc (vec raw-body) params tags annotations src-ns element-dtype))]
             ;; SSA-normalize let* rebindings (seeded with the params) BEFORE the
             ;; pass pipeline: a rebinding like `x = (alloc-op x)` otherwise
             ;; conflates the op's input and freshly-allocated output buffer in
@@ -167,8 +180,7 @@
             ;; body's read of `x` hits the uninitialized output). Distinct names
             ;; remove the hazard; non-shadowing bindings are untouched.
             (when walked
-              (let [param-syms (map #(if (symbol? %) (symbol (name %)) %) params)]
-                (mapv #(util/uniquify-rebindings param-syms %) walked)))))
+              (normalize-source-bindings walked params))))
         ;; Legacy source-less metadata: use a pre-walked body only when no source was available.
         (:raster.core/deftm-walked-body-typed m)
         (:raster.core/deftm-walked-body m)
@@ -219,7 +231,46 @@
      :param-env param-env
      :param-specs (mapv (fn [p] {:sym p :tag (get param-env p)}) parameters)
      :effective-dtype effective-dtype :source-ns source-ns
+     :source-policy (:raster.core/source-policy metadata)
      :return-tag (:raster.core/return-tag metadata)}))
+
+(defn ^:no-doc call-with-deftm-source-inputs
+  "Run one exact dtype-selected source root under the definition-input owner.
+
+   A genuinely outer compiler request prepares only the immutable semantic
+   frontend before acquiring the owner.  A nested compiler request never
+   prepares that frontend: it can only reselect and validate source already made
+   available by its parent.  In both cases the source is freshly reselected
+   inside the owner, and the constructor receives those fresh facts rather than
+   repeating its own overload choice.  Legacy/anonymous roots without a semantic
+   frontend keep their existing path; absence grants no source-import authority."
+  ([f-var requested-dtype construct!]
+   (call-with-deftm-source-inputs f-var requested-dtype construct! nil))
+  ([f-var requested-dtype construct! discard!]
+   (let [initial (deftm-frontend-facts f-var requested-dtype)
+         selected (:resolved-var initial)
+         outer? (nil? me/*emission-inputs*)
+         prepared? (boolean (when outer?
+                              (rcore/prepare-deftm-frontend! selected)))]
+     (me/call-with-definition-inputs
+      (fn []
+        (let [fresh (deftm-frontend-facts f-var requested-dtype)
+              current (:resolved-var fresh)]
+          (when-not (identical? selected current)
+            (throw (ex-info "dtype-selected source changed before compiler ownership"
+                            {:reason :retained-frontend-entry-mismatch
+                             :expected selected :actual current
+                             :dtype requested-dtype})))
+          (let [frontend (when (var? current)
+                           (me/original-source-frontend current))]
+            (when (and prepared? (nil? frontend))
+              (throw (ex-info "prepared source has no current original frontend"
+                              {:reason :retained-frontend-entry-mismatch
+                               :source current :dtype requested-dtype})))
+            (when frontend
+              (me/assert-frontend-semantic-selection! frontend current))
+            (construct! fresh))))
+      discard!))))
 
 ;; ================================================================
 ;; Dialect validation — formal structural invariants via nanopass
@@ -286,7 +337,8 @@
    Tags let/let* forms (recurse into bindings), par forms (from init/buffer),
    and loop forms. Does not descend into opaque calls."
   [expr env]
-  (cond
+  (let [constructed
+   (cond
     (not (seq? expr)) (inf/mask-unknown-local expr env)
     ;; let/let*: tag binding symbols + recurse into init exprs and body
     (form/binding-form? expr)
@@ -296,12 +348,22 @@
           (reduce
            (fn [[env acc] [sym init-expr]]
              (let [tagged-init (tag-expr-types init-expr env)
-                   tag (or (inf/hint-tag sym) (inf/infer-arg-tag tagged-init env))
-                   tagged-sym (cond-> sym
-                                tag (vary-meta assoc :tag tag :raster.type/tag tag)
+                   object-input? (and (value-completion/canonical-form? tagged-init)
+                                      (= value-completion/object-input-contract
+                                         (:contract (value-completion/canonical-parts tagged-init))))
+                   object-storage? (or object-input?
+                                       (and (symbol? tagged-init)
+                                            (= Object (get-in env [tagged-init :physical-carrier]))))
+                   tag (if object-input?
+                         (inf/infer-arg-tag tagged-init env)
+                         (or (inf/hint-tag sym) (inf/infer-arg-tag tagged-init env)))
+                   tagged-sym (source-declaration/retain-hint (cond-> sym
+                                tag (vary-meta assoc :tag (if object-storage? 'Object tag)
+                                               :raster.type/tag tag)
                                 (util/void-form? tagged-init)
-                                (vary-meta assoc :raster.effect/effectful true))
-                   new-env (assoc env sym tag)]
+                                (vary-meta assoc :raster.effect/effectful true)))
+                   new-env (assoc env sym (if object-storage?
+                                           {:tag tag :physical-carrier Object} tag))]
                [new-env (conj acc tagged-sym tagged-init)]))
            [env []]
            pairs)
@@ -317,7 +379,8 @@
       (if (and tag (not (:tag (meta expr))))
         (try (with-meta expr (assoc (or (meta expr) {}) :tag tag))
              (catch Exception _ expr))
-        expr))))
+        expr)))]
+    constructed))
 
 (defn- tag-binding-types
   "Walk a form and attach :tag metadata to binding symbols and expressions.
@@ -332,12 +395,12 @@
    nested binder. This pass attaches only the authoritative void contract of the immediate RHS;
    it performs no type inference and leaves value-producing expressions untouched."
   [form]
-  (clojure.walk/postwalk
+  (util/postwalk-preserving-meta
    (fn [expression]
      (if-not (form/binding-form? expression)
        expression
-       (let [[head bindings & body] expression
-             pairs (vec (partition 2 bindings))
+       (let [[head original-bindings & body] expression
+             pairs (vec (partition 2 original-bindings))
              bindings
              (vec
               (mapcat
@@ -349,10 +412,12 @@
                        statement? (or (util/void-form? initializer)
                                       (and unused? (util/effect-loop-statement? initializer)))]
                    [(cond-> symbol
-                      statement? (vary-meta assoc :raster.effect/effectful true))
+                      (and statement? (not (true? (:raster.effect/effectful (meta symbol)))))
+                      (vary-meta assoc :raster.effect/effectful true))
                     initializer]))
                (range) pairs))]
-         (with-meta (list* head bindings body) (meta expression)))))
+         (util/remake-if-changed
+          expression (list* head (util/remake-if-changed original-bindings bindings) body)))))
    form))
 
 (defn- pass-region-copy
@@ -362,6 +427,12 @@
   [form opts]
   (region-copy/expand-region-copies form :param-env (:param-env opts)))
 
+(defn- validate-target-array-declarations! [form opts]
+  (when (or (contains? #{:c :wasm} (:target opts))
+            (device/gpu-target? (:target-device opts)))
+    (source-declaration/validate-native-array-declarations! form))
+  form)
+
 (defn- pass-lower
   "Lower compound deftm ops into primitive ops for AD.
   Stops at rrule template boundaries — ops with templates are kept as calls.
@@ -370,11 +441,13 @@
   Tags all binding symbols with inferred types via metadata.
   (=> :walked :lowered)"
   [form opts]
+  (validate-target-array-declarations! form opts)
   (let [;; Normalize multi-body let FIRST — before inlining can drop effects
         normalized (normalize-let-body form)
         result (if (:inline? opts)
                  (with-bindings {#'inline/*param-env* (:param-env opts)}
-                   (inline/lower-to-ad-primitives normalized))
+                   (inline/call-with-source-input-completions
+                    normalized opts #(inline/lower-to-ad-primitives normalized)))
                  normalized)
         ;; Ensure result is a let* form (dialect requirement)
         let-form (if (form/binding-form? result)
@@ -397,7 +470,7 @@
   Runs after buffer-fuse so rewritten ops (e.g. transpose-2d!) get inlined too.
   (=> :buffer-fused :expanded)"
   [form opts]
-  (let [expanded (inline/expand-for-backends form 3 (:param-env opts))]
+  (let [expanded (inline/expand-for-backends form 3 (:param-env opts) opts)]
     (if (= expanded form)
       form
       {:form expanded
@@ -443,11 +516,12 @@
 
 (defn- fixpoint-equivalent?
   "Convergence includes retained type/operation metadata and numeric carriers.
-   Runtime objects have no portable semantic encoding: keep iterating up to the
-   existing cap rather than treating printing, class names or Clojure = as proof."
+   This is a process-local source comparison, not a portable cache fingerprint:
+   retained Class tags compare by actual identity. Other unsupported runtime
+   objects still force the existing cap; no metadata is stripped to claim stability."
   [left right]
   (try
-    (semantic-fingerprint/equivalent? left right)
+    (semantic-fingerprint/retained-source-equivalent? left right)
     (catch clojure.lang.ExceptionInfo error
       (if (= :semantic-fingerprint-unsupported (:reason (ex-data error)))
         false
@@ -486,7 +560,9 @@
   ;; arg tags nil so try-parametric-specialize! could not fire. Re-expanding here
   ;; would never have fixed that; declaring the template's float signature up
   ;; front does (dispatch/parametric-tc-sigs). The census is the messenger.
-  (let [max-iters 5
+  (me/call-with-definition-analysis
+   (fn []
+    (let [max-iters 5
         ;; Force simplify mode for the fixpoint — we always want normalize+rewalk
         opts (assoc opts :simplify? true)]
     (reset! fixpoint-census [])
@@ -500,17 +576,21 @@
           (record-fixpoint-census! :final final opts)
           {:form final :stats total-stats})
         (let [;; Step 1: Expand (inline deftm calls + value+grad AD inlining)
-              expanded (inline/expand-for-backends current 3 (:param-env opts))
+              expanded (inline/expand-for-backends current 3 (:param-env opts) opts)
               ;; Local nonescaping value products have the same scalar meaning
               ;; on JVM, C and accelerators. Preserve escaping objects, exact
               ;; factory ownership and ordered argument/conversion obligations.
+              _ (validate-target-array-declarations! expanded opts)
               expanded (soa-lower/lower-local-constructors
                         expanded {:source-ns (:source-ns opts)
                                   :locals (keys (:param-env opts))})
               ;; Literal presence and nonescaping local products are physical
               ;; representation facts, shared by JVM/C/GPU. Do not invoke broad
               ;; arithmetic PE or rewalk merely to remove a known presence arm.
-              expanded (local-products/lower-local-products expanded)
+              expanded (local-products/lower-local-products
+                        expanded (cond-> {}
+                                   (contains? opts :active-params)
+                                   (assoc :lexical-inputs (:active-params opts))))
               ;; Step 2: Normalize + Rewalk only if expand introduced NEW
               ;; undevirtualized calls (e.g. from composable AD body inlining).
               ;; Regular expand (compound deftm inlining) produces pre-walked code
@@ -523,7 +603,8 @@
                          ;; and rounding, including inside nested loops/maps.
                          (let [rw-result (rewalk/pe-rewalk expanded opts)]
                            (if (map? rw-result) (:form rw-result) rw-result))
-                         expanded)]
+                         expanded)
+              _ (validate-target-array-declarations! rewalked opts)]
           (if (fixpoint-equivalent? rewalked current)
             (let [final (-> (ensure-let*-result rewalked)
                             (tag-binding-types (:param-env opts))
@@ -534,7 +615,7 @@
             (do
               (record-fixpoint-census! iter rewalked opts)
               (recur rewalked (inc iter)
-                     (assoc total-stats :fixpoint-iterations (inc iter))))))))))
+                     (assoc total-stats :fixpoint-iterations (inc iter))))))))))))
 
 (defn- pass-mode-select
   "Analyze Jacobian structure and annotate form with recommended AD mode.
@@ -847,19 +928,125 @@
       (core-hw/abstract-machine (or target-descriptor (core-hw/descriptor-for target-device)))
       (catch Throwable _ nil))))
 
-(defn- semantic-program-attempt
+(defn- source-binding-resolution-context
+  "Capture an already-loaded source emitter policy, without loading a backend
+   during an optional query. Declined proof observations stay request-local."
+  [source]
+  (when (and me/*emission-inputs* (form/binding-form? source)
+             (vector? (second source))
+             (some (fn [[_ expression]]
+                     (or (value-completion/object-input-parts expression)
+                         (value-completion/reference-input-parts expression)))
+                   (partition 2 (second source))))
+    (when-let [source-emitter (find-ns 'raster.compiler.backend.jvm.bytecode)]
+      (when-let [policy (ns-resolve source-emitter 'binding-completion-plan)]
+        (binding-completion/capture-resolution-context policy)))))
+
+(def ^:private ^:dynamic *gpu-source-construction* false)
+
+(defn- protected-semantic-source?
+  "A protected numerical operation is not an executable JVM source witness.
+   Quoted data is inert. This is only an abstention boundary for optional source
+   normalization, never validation or permission to execute a protected plan."
+  [source]
+  (cond
+    (and (seq? source) (contains? '#{quote clojure.core/quote} (first source))) false
+    (swr-fuse/marker? source) true
+    (coll? source) (boolean (some protected-semantic-source? source))
+    :else false))
+
+(defn- contextual-reduction-constructor
+  "One attempt-local owner service shared by map projection and reductions.
+   Each exact current source candidate has at most one witness, not one per call."
+  [opts]
+  (let [owners (java.util.IdentityHashMap.)
+        original (volatile! nil)
+        parameters (or (:public-parameters opts) (:active-params opts))
+        options (assoc opts :lexical-inputs parameters)
+        original! (fn []
+                    (let [source-var (:source-var opts)]
+                      (if-let [prepared @original]
+                        (do (me/assert-frontend-source! prepared source-var)
+                            (me/assert-frontend-selection! prepared source-var)
+                            prepared)
+                        ;; Source queries consume physical evidence, never
+                        ;; prepare it. Do that explicitly in orchestration
+                        ;; before the first current-source witness, including
+                        ;; reduction requests preceding the public footer.
+                        (let [prepared (me/demand-original-source-frontend! source-var)]
+                          (vreset! original prepared)
+                          prepared))))
+        owner! (fn [source]
+                 (or (.get owners source)
+                     (let [_ (original!)
+                           created (source-import/prepare-contextual-source-witness source options)]
+                       (.put owners source created)
+                       created)))]
+    (fn [{:keys [kind source ordinal binder expression accept?]}]
+      (cond
+        (= kind :closed-prefix-reference-helpers)
+        (when (source-import/contextual-reference-helper-candidate? source)
+          (source-import/project-contextual-reference-helpers (owner! source)))
+
+        (= kind :ordered-invocation-arguments)
+        (let [retained-counts
+              (typed-soac-frontend/retained-allocation-count-expressions source options)
+              frame-options {:required? true
+                             ::source-import/retained-allocation-counts retained-counts}]
+          (when (and (source-import/contextual-invocation-argument-candidate?
+                      source frame-options)
+                     (not (protected-semantic-source? source)))
+            ;; The current source may already contain schedule-neutral protected
+            ;; operations. Keep it unchanged rather than physically emitting a
+            ;; compiler marker to invent a JVM observation. Required final source
+            ;; adapters still need their own exact executable witness.
+            (source-import/project-contextual-invocation-arguments
+             (owner! source) frame-options)))
+
+        (= kind :checked-array-length-source)
+        (when (source-import/contextual-array-length-candidate? source)
+          (source-import/project-contextual-array-lengths (owner! source)))
+
+        (= kind :direct-double-map-payloads)
+        (when (and (source-import/direct-double-map-helper-candidate? source)
+                   (dtype/known? (:dtype opts)) (= :double (dtype/canon (:dtype opts))))
+          (let [owner (try (owner! source)
+                           (catch clojure.lang.ExceptionInfo error
+                             (if (= :contextual-source-witness-entry (:reason (ex-data error)))
+                               nil (throw error))))]
+            (when owner (source-import/project-direct-double-map-results owner))))
+
+        (= kind :terminal-float-publication)
+        (when (source-import/terminal-float-publication-candidate? source)
+          (me/call-with-optional-definition-inputs
+           (fn []
+             (let [original (original!)
+                   bridge (me/frontend-boxed-entry-bridge original)]
+               ;; Actual return ABI, not a frontend annotation, selects this
+               ;; construction. Original preparation must precede a new witness.
+               (when (identical? Float/TYPE (:payload-carrier bridge))
+                 (let [returned (source-import/original-public-float-return-contract original (owner! source))
+                       publication (try (source-import/observe-terminal-float-publication returned)
+                                        (catch clojure.lang.ExceptionInfo error
+                                          (if (= :terminal-float-publication (:reason (ex-data error)))
+                                            nil (throw error))))]
+                   (when publication
+                     (source-import/construct-terminal-float-publication publication))))))))
+
+        :else
+        (let [owner (owner! source)]
+        (if (= kind :reference-provenance)
+          (source-import/observe-reference-provenance! owner ordinal binder expression accept?)
+          (source-import/observe-contextual-reduction! owner ordinal binder expression)))))))
+
+(defn- semantic-program-attempt*
   "Try the finite semantic-program variants in specificity order.
 
    Structured control is currently GPU-only until the equation-first JVM schedule lands. A
    coverage decline preserves the original source and remains visible beside any later TypedSOAC
    decline; certified contradictions are never converted into fallback."
   [source opts abstract-machine]
-  (let [;; Late buffer/representation rewrites can introduce whole sequential
-        ;; wrappers after expansion. Normalize those once at shared semantic
-        ;; admission, without moving work out of calls or vector operands.
-        source (if (device/gpu-target? (:target-device opts))
-                 (inline/flatten-nested-lets source)
-                 source)
+  (let [binding-context (source-binding-resolution-context source)
         ;; A public array's backing capacity is independent of each traversal.
         ;; Semantic owners must prove their logical access footprint separately.
         values (merge (when (device/gpu-target? (:target-device opts))
@@ -869,6 +1056,14 @@
                               (:array-types opts)))
                       (:values opts))
         common {:dtype (:dtype opts)
+                :resident-reductions? (or (true? (:resident-reductions? opts))
+                                           (device/gpu-target? (:target-device opts)))
+                :resident-initialization? (device/gpu-target? (:target-device opts))
+                :resident-uniform-input-loads? (device/gpu-target? (:target-device opts))
+                :source-ns (:source-ns opts)
+                :source-var (:source-var opts)
+                :source-binding-context binding-context
+                :return-tag (:return-tag opts)
                 :preserve-declared-array-storage? (:preserve-declared-array-storage? opts)
                 :values values
                 :array-types (:array-types opts)
@@ -881,15 +1076,22 @@
       structured
       (let [typed (typed-soac-route/attempt
                    source (:dtype opts) (:array-types opts)
-                   {:resident-reductions? (or (true? (:resident-reductions? opts))
+                   (cond-> {:resident-reductions? (or (true? (:resident-reductions? opts))
                                               (device/gpu-target? (:target-device opts)))
                     :resident-initialization? (device/gpu-target? (:target-device opts))
                     :resident-uniform-input-loads? (device/gpu-target? (:target-device opts))
                     :segmented-plans? (true? (:segmented-plans? opts))
                     :preserve-declared-array-storage? (:preserve-declared-array-storage? opts)
                     :scalar-types (:scalar-types opts)
+                    :public-parameters (:public-parameters common)
+                    :return-tag (:return-tag common)
                     :values values
-                    :abstract-machine abstract-machine})
+                    :source-ns (:source-ns opts)
+                    :source-var (:source-var opts)
+                    :source-binding-context binding-context
+                    :abstract-machine abstract-machine}
+                     (some? (:public-parameters common))
+                     (assoc :lexical-inputs (:public-parameters common))))
             ;; Mixed source construction shares the ordinary frontend but cannot depend on
             ;; this route's validator without a namespace cycle. Certify the closed algorithm
             ;; union here, before exposing it as an accepted semantic program.
@@ -901,6 +1103,32 @@
         (cond-> (or typed {})
           (:declined structured)
           (assoc :structured-control-declined (:declined structured)))))))
+
+(defn- semantic-program-attempt
+  [source opts abstract-machine]
+  ;; Normalize exactly once BEFORE either owner sees the candidate. Rebuilding
+  ;; again inside admission would defeat the shared identity-keyed witness.
+  (let [source (if (device/gpu-target? (:target-device opts))
+                 (inline/flatten-nested-lets source) source)]
+   (if (and *gpu-source-construction*
+            (device/gpu-target? (:target-device opts)) (var? (:source-var opts)))
+    (let [construct (contextual-reduction-constructor opts)
+          references (construct {:kind :closed-prefix-reference-helpers :source source})
+          source (if references (inline/flatten-nested-lets (:form references)) source)
+          frames (construct {:kind :ordered-invocation-arguments :source source})
+          source (if frames (inline/flatten-nested-lets (:form frames)) source)
+          projection (construct {:kind :direct-double-map-payloads :source source})
+          source (or (:form projection) source)
+          lengths (construct {:kind :checked-array-length-source :source source})
+          source (or (:form lengths) source)]
+      (typed-soac-frontend/call-with-contextual-reduction-constructor
+       construct
+       #(cond-> (semantic-program-attempt* source opts abstract-machine)
+          references (assoc-in [:stats :owned-reference-helpers] (count (:applications references)))
+          frames (assoc-in [:stats :owned-input-frames] (count (:frames frames)))
+          lengths (assoc-in [:stats :owned-array-lengths] (count (:rewrites lengths)))
+          projection (assoc-in [:stats :owned-map-payloads] (count (:applications projection))))))
+    (semantic-program-attempt* source opts abstract-machine))))
 
 (defn- unfused-compatibility
   "Keep unsupported source byte-for-byte while exposing why no certified fusion ran."
@@ -1314,6 +1542,21 @@
     (let [result (gensym "parallel_result_")]
       (with-meta (list 'let* [result source] result) (meta source)))))
 
+(defn ^:no-doc call-with-gpu-source-construction
+  "Share one local generated-source constructor across a GPU frontend request.
+   Derived AD code carries executable return computations, not early-node proof
+   metadata. Cached AD/runtime programs stay unchanged. Numerical admission and
+   current-region emission still have to consume and validate that source."
+  [target consume!]
+  (if (or *gpu-source-construction* (not (device/gpu-target? target)))
+    (consume!)
+    (me/call-with-definition-inputs
+     #(raster.ad.reverse/call-with-generated-source-construction
+       source-import/construct-contextual-terminal-return
+       (fn []
+         (binding [*gpu-source-construction* true]
+           (inline/call-with-helper-source-demands consume!)))))))
+
 (defn schedule-parallel-form
   "Construct the same TypedSOAC/SegOp boundary used by the ordinary compiler for an already
    walked form whose caller needs scheduled kernels rather than a compiled host function.
@@ -1324,7 +1567,10 @@
    in the counted compatibility `ParallelProgram`; supported map/reduce/scan forms retain their
    validated TypedSOAC algorithm and are scheduled exactly once before backend emission."
   [source {:keys [dtype array-types scalar-types target-device] :as opts}]
-  (let [source (top-level-binding-form source)
+  (call-with-gpu-source-construction
+   target-device
+   (fn []
+    (let [source (top-level-binding-form source)
         ;; GPU sessions enter with a walked deftm body, bypassing the forward pipeline's
         ;; fixpoint/expand stages. Reuse that same shared expansion here so scalar helpers
         ;; and source constants reach TypedSOAC as expressions, not opaque calls/vars.
@@ -1332,8 +1578,9 @@
                          inline/*preserve-canonical-intrinsics?* true]
                  (-> source
                      (inline/resolve-generic-deftm-calls (:param-env opts))
-                     (inline/expand-for-backends 3 (:param-env opts))
+                     (inline/expand-for-backends 3 (:param-env opts) opts)
                      (inline/resolve-generic-deftm-calls (:param-env opts))))
+        _ (source-declaration/validate-native-array-declarations! source)
         typed (semantic-program-attempt source opts
                                         (abstract-machine-for-target target-device
                                                                      (:target-descriptor opts)))
@@ -1351,7 +1598,7 @@
               (assoc :typed-soac-declined (:declined typed))
               (:structured-control-declined typed)
               (assoc :typed-structured-control-declined
-                     (:structured-control-declined typed))))))
+                     (:structured-control-declined typed))))))))
 
 ;; ================================================================
 ;; Mode configurations (declarative pass vectors)
@@ -1392,7 +1639,7 @@
 ;; Diagnostic runner for show-pipeline
 ;; ================================================================
 
-(defn- run-passes-diagnostic
+(defn ^:no-doc run-passes-diagnostic
   "Run passes with full intermediate recording for diagnostics.
   Returns {:form final-form :stages {stage-key form} :stats {stage-key stats}}."
   ([form passes opts]
@@ -1434,7 +1681,10 @@
 (declare compile-aot-jvm)
 
 (defn compile-aot
-  "Compile a deftm var into an optimized forward function with buffer fusion.
+  "Compile a deftm var or capture-free ftm into an optimized forward function.
+   Anonymous ftm currently uses the JVM path with checked source arithmetic;
+   lexical captures and unchecked source arithmetic require their own retained
+   lowering authority and are refused rather than reinterpreted in the caller.
 
   Pipeline: walker → inline → DCE → buffer-fuse → typed SOAC fusion → backend
             → mem-merge → hoist → eval
@@ -1468,7 +1718,22 @@
   [f-var & {:keys [inline? simd? dtype target-device target preserve-declared-array-storage?
                    reuse-buffers? no-alias?]
             :or {inline? true simd? true no-alias? true}}]
-  (if (= target :c)
+  (let [anonymous? (not (var? f-var))
+        metadata (meta f-var)
+        policy (:raster.core/source-policy metadata)]
+    (when anonymous?
+      (source-owner/assert-portable-source! metadata)
+      (when-not (and (:raster.core/anonymous-function metadata)
+                     (value-completion/source-policy? policy)
+                     (some-> (:raster.core/deftm-source-ns metadata) find-ns))
+        (throw (ex-info "Anonymous AOT requires retained ftm source context"
+                        {:reason :unclosed-anonymous-aot-source})))
+      (when (or target target-device)
+        (throw (ex-info "Anonymous AOT target requires its own retained source owner"
+                        {:reason :unsupported-anonymous-aot-target :target target :device target-device}))))
+  (source-owner/call-with-source-context metadata
+   (fn []
+   (if (= target :c)
     ;; Native CPU-C backend: emit the whole fused body as one C function (no
     ;; per-op JVM dispatch) + Panama FFM. Bypasses the bytecode/hoist path.
     ((requiring-resolve 'raster.compiler.backend.cpu.aot/compile-aot-c)
@@ -1476,7 +1741,7 @@
     (compile-aot-jvm f-var :inline? inline? :simd? simd? :dtype dtype
                      :target-device target-device
                      :preserve-declared-array-storage? preserve-declared-array-storage?
-                     :reuse-buffers? reuse-buffers?)))
+                     :reuse-buffers? reuse-buffers?))))))
 
 (defn- retained-compilation-loader
   "Preserve retained class identities when defining AOT bytecode.
@@ -1526,45 +1791,30 @@
   [f-var & {:keys [inline? simd? dtype target-device preserve-declared-array-storage?
                    reuse-buffers?]
             :or {inline? true simd? true}}]
-  (me/call-with-definition-inputs
-   (fn []
-  (let [;; Use the classloader that defined the target function's defrecord types.
-        ;; Creating a child DCL causes class identity issues: defrecord classes
-        ;; loaded through a child resolve to DIFFERENT Class objects than those
-        ;; in the dispatch table, because Clojure DCL branches can't see each
-        ;; other's defineClass'd classes. Using the same DCL avoids this.
-        ;; The cost is compiled classes can't be GC'd separately — acceptable
-        ;; since users compile a handful of functions, not thousands.
-        parent-cl (let [tcl (.getContextClassLoader (Thread/currentThread))]
+  ;; Use the classloader that defined the target function's defrecord types.
+  ;; Creating a child DCL causes class identity issues: defrecord classes loaded
+  ;; through a child resolve to DIFFERENT Class objects than those in the dispatch
+  ;; table, because Clojure DCL branches can't see each other's defineClass'd
+  ;; classes. The semantic frontend preparation is itself a typed source walk, so
+  ;; it must run under this same retained parent rather than the caller's ambient
+  ;; loader. The cost is compiled classes can't be GC'd separately — acceptable
+  ;; since users compile a handful of functions, not thousands.
+  (let [parent-cl (let [tcl (.getContextClassLoader (Thread/currentThread))]
                     (if (instance? clojure.lang.DynamicClassLoader tcl)
                       tcl
                       ;; Find a DCL from the f-var's namespace
-                      (let [root (try (.getRawRoot ^clojure.lang.Var f-var)
+                      (let [root (try (if (var? f-var) (.getRawRoot ^clojure.lang.Var f-var) f-var)
                                       (catch Exception _ nil))
                             var-cl (when root (.getClassLoader (class root)))]
                         (if (instance? clojure.lang.DynamicClassLoader var-cl)
                           var-cl
                           tcl))))]
     (binding [me/*compilation-classloader* parent-cl]
-      (let [params (get-params f-var dtype)
-            walked-body (get-walked-body f-var dtype)
-            active-params (clean-params params)
-            param-env (build-param-env f-var dtype)
-          ;; Get the declared return type from the deftm var
-            resolved-var (or (resolve-deftm-var f-var dtype) f-var)
-            return-tag (:raster.core/return-tag (meta resolved-var))
-            effective-dtype (or dtype (infer-dtype resolved-var)
-                              ;; Scalar-only functions (no array params) default to
-                              ;; double precision — the JVM's native floating-point type.
-                                :double)
-            ;; The deftm's defining namespace — threaded into the passes so any
-            ;; re-walk (pe-rewalk) recognizes deftm calls and devirtualizes them.
-            ;; Without it the re-walk runs under *ns* and silently leaves deftm
-            ;; calls un-devirtualized (and bare in lifted closure helpers).
-            source-ns (let [m (meta resolved-var)]
-                        (or (when-let [s (:raster.core/deftm-source-ns m)]
-                              (try (the-ns s) (catch Exception _ nil)))
-                            (when (var? resolved-var) (.ns ^clojure.lang.Var resolved-var))))
+      (call-with-deftm-source-inputs
+       f-var dtype
+       (fn [{:keys [resolved-var parameters param-env effective-dtype source-ns return-tag]}]
+         (let [walked-body (get-walked-body resolved-var dtype)
+            active-params parameters
             ;; Param annotations ({sym -> typedclojure annotation}), so the PE
             ;; re-walk reconstructs the SAME type-env as walk-1 (array :element,
             ;; (Fn ...) :fn-info) instead of a tag-only env that under-devirtualizes.
@@ -1585,6 +1835,7 @@
                              effective-dtype
                              {:preserve-declared-array-storage? preserve-declared-array-storage?})
             opts (cond-> {:inline? inline? :simd? simd? :target-device target-device
+                          :source-var resolved-var
                           :owned-jvm-calls? (nil? target-device)
                           :active-params active-params :dtype effective-dtype
                           :preserve-declared-array-storage? preserve-declared-array-storage?}
@@ -1597,8 +1848,10 @@
                        (let [raw-form (if (= 1 (count walked-body))
                                         (first walked-body)
                                         (list* 'do walked-body))
-                             form (run-passes raw-form forward-passes opts)
-                             hoist-opts (cond-> {:dtype effective-dtype :reuse-buffers? reuse-buffers?}
+                             form (call-with-gpu-source-construction
+                                   target-device #(run-passes raw-form forward-passes opts))
+                             hoist-opts (cond-> {:dtype effective-dtype :reuse-buffers? reuse-buffers?
+                                                :prepare-static-source rcore/prepare-original-static-source!}
                                           param-env (assoc :param-env param-env)
                                           return-tag (assoc :return-tag return-tag)
                                           ;; Thread the deftm's defining namespace so the bytecode
@@ -1622,16 +1875,16 @@
                                            (list 'let* [] form)
                                            active-params active-params hoist-opts))))]
                        ;; Store diagnostics on the compiled function's metadata
-                         (alter-meta! f-var assoc
-                                      ::compiled-diagnostics
-                                      (dissoc result :fn))
-                         (:fn result)))]
+                         (when (var? f-var)
+                           (alter-meta! f-var assoc ::compiled-diagnostics (dissoc result :fn)))
+                         (if (var? f-var) (:fn result)
+                             (vary-meta (:fn result) assoc ::compiled-diagnostics (dissoc result :fn)))))]
         (if target-device
           ((requiring-resolve 'raster.gpu.ze-runtime/make-gpu-fn) compile!)
-          (compile!))))))
-   (when target-device
-     (fn [compiled]
-       ((requiring-resolve 'raster.gpu.ze-runtime/close!) compiled)))))
+          (compile!))))
+       (when target-device
+         (fn [compiled]
+           ((requiring-resolve 'raster.gpu.ze-runtime/close!) compiled)))))))
 
 ;; ================================================================
 ;; Resident GPU program extraction (Option A: bound-dispatch path)
@@ -2000,6 +2253,54 @@
      form)
     @found))
 
+(defn- reject-resident-host-only!
+  [candidate device-id dtype specialized?]
+  (when (dispatch/host-only? candidate)
+    (throw (ex-info (if specialized?
+                      "GPU specialization resolved to an explicitly host-only deftm method"
+                      "GPU compilation was requested for an explicitly host-only deftm")
+                    (cond-> {:reason :gpu-compiler-host-only
+                             :function (if (var? candidate)
+                                         (symbol (str (ns-name (:ns (meta candidate))))
+                                                 (str (:name (meta candidate))))
+                                         candidate)
+                             :device device-id}
+                      specialized? (assoc :dtype dtype))))))
+
+(defn- resident-compilation-preflight!
+  "Reject source-independent resident requests before selecting or preparing source.
+   Returns the one normalized schedule consumed by the later specialized compiler."
+  [f-var device-id dtype schedule gemm-precision]
+  (reject-resident-host-only! f-var device-id dtype false)
+  ;; S6 schedule: derive the descriptor-default schedule, deep-merge the user :schedule override
+  ;; (:gemm-precision is deprecated sugar -> the precision policy), and run the register-budget
+  ;; feasibility gate before source selection or emission.
+  (let [resolved-schedule ((requiring-resolve 'raster.gpu.schedule/compilation-schedule)
+                           (core-hw/descriptor-for device-id)
+                           {:schedule schedule :gemm-precision gemm-precision})]
+    (when (= :dispatch-reassociated
+             (get-in resolved-schedule [:segmented-weighted-reduction :strategy]))
+      (throw (ex-info
+              "reassociated equation dispatch requires the equation-first compiler"
+              {:reason :reassociated-equation-dispatch-requires-equation-first
+               :device device-id})))
+    (when (= :f32-storage-f64-arithmetic-rte-f32 (:precision resolved-schedule))
+      (throw (ex-info "widened contraction arithmetic requires the equation-first compiler"
+                      {:reason :widened-contraction-requires-equation-first
+                       :device device-id :fallback :none})))
+    (when (= :dispatch-register-tiled
+             (get-in resolved-schedule [:typed-contraction :strategy]))
+      (throw (ex-info
+              "contraction equation dispatch requires the equation-first compiler"
+              {:reason :contraction-equation-dispatch-requires-equation-first
+               :device device-id})))
+    ;; Retain the old cheap dtype-selection admission without asking the shared
+    ;; frontend for parameter/source facts. Schedule policy is checked first so
+    ;; an equation-first-only request cannot trigger parametric specialization.
+    (reject-resident-host-only! (or (resolve-deftm-var f-var dtype) f-var)
+                                device-id dtype true)
+    resolved-schedule))
+
 (defn compile-gpu-program
   "Compile f-var through the SAME fused GPU pipeline as compile-aot :target-device, but return a
    RESIDENT program descriptor for the session bound-dispatch path instead of make-gpu-fn's
@@ -2061,55 +2362,18 @@
   [f-var device-id & {:keys [dtype on-non-resident gemm-precision schedule compiler-report?
                             preserve-declared-array-storage?]
                       :or {on-non-resident :throw gemm-precision :mixed-f16-f32}}]
-  (me/call-with-definition-inputs
-   (fn []
-  (when (dispatch/host-only? f-var)
-    (throw (ex-info "GPU compilation was requested for an explicitly host-only deftm"
-                    {:reason :gpu-compiler-host-only
-                     :function (if (var? f-var)
-                                 (symbol (str (ns-name (:ns (meta f-var))))
-                                         (str (:name (meta f-var))))
-                                 f-var)
-                     :device device-id})))
-  ;; S6 schedule: derive the descriptor-default schedule, deep-merge the user :schedule override
-  ;; (:gemm-precision is deprecated sugar → the precision policy), and run the register-budget
-  ;; FEASIBILITY GATE before any emission — an infeasible schedule (e.g. register double-buffering
-  ;; that would spill the GRF file) is a loud compile error, not a measurement-time regression.
-  (let [resolved-schedule ((requiring-resolve 'raster.gpu.schedule/compilation-schedule)
-                           (core-hw/descriptor-for device-id)
-                           {:schedule schedule :gemm-precision gemm-precision})
-        _ (when (= :dispatch-reassociated
-                   (get-in resolved-schedule [:segmented-weighted-reduction :strategy]))
-            (throw (ex-info
-                    "reassociated equation dispatch requires the equation-first compiler"
-                    {:reason :reassociated-equation-dispatch-requires-equation-first
-                     :device device-id})))
-        _ (when (= :f32-storage-f64-arithmetic-rte-f32 (:precision resolved-schedule))
-            (throw (ex-info "widened contraction arithmetic requires the equation-first compiler"
-                            {:reason :widened-contraction-requires-equation-first
-                             :device device-id :fallback :none})))
-        _ (when (= :dispatch-register-tiled
-                   (get-in resolved-schedule [:typed-contraction :strategy]))
-            (throw (ex-info
-                    "contraction equation dispatch requires the equation-first compiler"
-                    {:reason :contraction-equation-dispatch-requires-equation-first
-                     :device device-id})))
-        gemm-precision (:precision resolved-schedule)
-        resolved-var (or (resolve-deftm-var f-var dtype) f-var)
-        _ (when (dispatch/host-only? resolved-var)
-            (throw (ex-info "GPU specialization resolved to an explicitly host-only deftm method"
-                            {:reason :gpu-compiler-host-only
-                             :function (if (var? resolved-var)
-                                         (symbol (str (ns-name (:ns (meta resolved-var))))
-                                                 (str (:name (meta resolved-var))))
-                                         resolved-var)
-                             :device device-id :dtype dtype})))
-        frontend (deftm-frontend-facts resolved-var dtype)
-        walked-body  (get-walked-body f-var dtype)
-        active-params (:parameters frontend)
-        param-env    (:param-env frontend)
-        effective-dtype (:effective-dtype frontend)
-        source-ns    (:source-ns frontend)
+  (let [resolved-schedule
+        (resident-compilation-preflight! f-var device-id dtype schedule gemm-precision)]
+    (call-with-deftm-source-inputs
+     f-var dtype
+     (fn [{:keys [resolved-var parameters param-env effective-dtype source-ns]
+           :as frontend}]
+      (call-with-gpu-source-construction device-id
+     (fn []
+  (let [gemm-precision (:precision resolved-schedule)
+        _ (reject-resident-host-only! resolved-var device-id dtype true)
+        walked-body  (get-walked-body resolved-var dtype)
+        active-params parameters
         ;; --- soa-lower (resident GPU value-type explosion) ----------------------------------
         ;; Run the front half to :write-read-fused, explode any Params-container / value-type param
         ;; into per-field array params, then construct TypedSOAC and resume to the backend. Gated on a value-type param
@@ -2129,6 +2393,7 @@
            (mapv :sym param-specs) (mapv :tag param-specs) effective-dtype
            {:preserve-declared-array-storage? preserve-declared-array-storage?}))
         pre-opts (cond-> {:inline? true :simd? false :target-device device-id
+                          :source-var resolved-var
                           :active-params active-params :dtype effective-dtype
                           ;; Resident reduction realization is a TypedSOAC transform. The logical
                           ;; scalar remains rank zero while its explicit representation and SegOp
@@ -2184,6 +2449,7 @@
                          :leaves leaves}]))
               soa-expansion))
         post-opts (cond-> {:inline? true :simd? false :target-device device-id
+                           :source-var resolved-var
                            :resident-gpu? true
                            :preserve-declared-array-storage? preserve-declared-array-storage?
                            :active-params active-params :dtype effective-dtype
@@ -2495,7 +2761,7 @@
          (report/with-residency
            (report/from-pipeline
             (diagnostic->pipeline-map raw-form :opencl compiler-diagnostic))
-           (count (:allocs prog))))})))))
+           (count (:allocs prog))))}))))))))
 
 (defn- realize-identity-tail
   "Expose an uncoerced final initializer at the source projection's tail.
@@ -2529,7 +2795,7 @@
                         (or (when-let [s (:raster.core/deftm-source-ns m)]
                               (try (the-ns s) (catch Exception _ nil)))
                             (when (var? resolved) (.ns ^clojure.lang.Var resolved))))
-        opts (cond-> {:inline? true :simd? false :dtype dtype :active-params active-params}
+        opts (cond-> {:target :wasm :inline? true :simd? false :dtype dtype :active-params active-params}
                param-env (assoc :param-env param-env)
                source-ns (assoc :source-ns source-ns))
         raw-form (if (= 1 (count walked-body)) (first walked-body) (list* 'do walked-body))
@@ -2709,44 +2975,36 @@
                    simd? target-device dtype preserve-declared-array-storage? values]
             :or {mode :forward
                  simd? true}}]
-  (let [inline? (if (nil? inline?) true inline?)
-        params (get-params f-var dtype)
-        active-params (clean-params params)
-        walked-body (get-walked-body f-var dtype)
-        raw-form (if (= 1 (count walked-body))
-                   (first walked-body)
-                   (list* 'do walked-body))
-        passes forward-passes
-        resolved-var (or (resolve-deftm-var f-var dtype) f-var)
-        effective-dtype (or dtype (infer-dtype resolved-var)
-                            ;; Scalar-only functions default to double precision
-                            :double)
-        source-ns (let [m (meta resolved-var)]
-                    (or (when-let [s (:raster.core/deftm-source-ns m)]
-                          (try (the-ns s) (catch Exception _ nil)))
-                        (when (var? resolved-var) (.ns ^clojure.lang.Var resolved-var))))
-        param-env (build-param-env f-var dtype)
-        ;; Declared parameter types are middle-end facts, not GPU-emitter hints.  Production
-        ;; compilation supplies them for every backend; diagnostics must do the same or a
-        ;; target-free `show-pipeline` can misclassify proven identity casts as throwing.
-        parameter-types (opencl-pass/derive-param-types
-                         (:raster.core/deftm-params (meta resolved-var))
-                         (:raster.core/deftm-tags (meta resolved-var))
-                         effective-dtype
-                         {:preserve-declared-array-storage? preserve-declared-array-storage?})
-        opts (cond-> {:inline? inline?
-                      :diagnostic? true
-                      :values values
-                      :active-params active-params
-                      :simd? simd? :target-device target-device
-                      :dtype effective-dtype
-                      :preserve-declared-array-storage? preserve-declared-array-storage?}
-               param-env (assoc :param-env param-env)
-               source-ns (assoc :source-ns source-ns)
-               parameter-types (assoc :scalar-types (:scalar-types parameter-types)
-                                      :array-types (:array-types parameter-types)))
-        diagnostic (run-passes-diagnostic raw-form passes opts)]
-    (diagnostic->pipeline-map raw-form (if simd? :simd :scalar) diagnostic)))
+  (call-with-deftm-source-inputs
+   f-var dtype
+   (fn [{:keys [resolved-var parameters param-env effective-dtype source-ns]}]
+     (let [inline? (if (nil? inline?) true inline?)
+           walked-body (get-walked-body resolved-var dtype)
+           raw-form (if (= 1 (count walked-body))
+                      (first walked-body)
+                      (list* 'do walked-body))
+           passes forward-passes
+           ;; Declared parameter types are middle-end facts, not GPU-emitter hints.  Production
+           ;; compilation supplies them for every backend; diagnostics must do the same or a
+           ;; target-free `show-pipeline` can misclassify proven identity casts as throwing.
+           parameter-types (opencl-pass/derive-param-types
+                            (:raster.core/deftm-params (meta resolved-var))
+                            (:raster.core/deftm-tags (meta resolved-var))
+                            effective-dtype
+                            {:preserve-declared-array-storage? preserve-declared-array-storage?})
+           opts (cond-> {:inline? inline?
+                         :diagnostic? true
+                         :values values
+                         :active-params parameters
+                         :simd? simd? :target-device target-device
+                         :dtype effective-dtype
+                         :preserve-declared-array-storage? preserve-declared-array-storage?}
+                  param-env (assoc :param-env param-env)
+                  source-ns (assoc :source-ns source-ns)
+                  parameter-types (assoc :scalar-types (:scalar-types parameter-types)
+                                         :array-types (:array-types parameter-types)))
+           diagnostic (run-passes-diagnostic raw-form passes opts)]
+       (diagnostic->pipeline-map raw-form (if simd? :simd :scalar) diagnostic)))))
 
 (defn compile-report
   "Compile once through the diagnostic pipeline and return its normalized compatibility report.

@@ -14,6 +14,7 @@
             [raster.compiler.ir.numerical-contract :as numerics]
             [raster.compiler.ir.axis-map :as axis-map]
             [raster.compiler.ir.kernel-launch :as launch]
+            [raster.compiler.ir.reduction :as reduction]
             [raster.compiler.ir.soac-dialect :as dialect]))
 
 (defn contraction-binding
@@ -61,26 +62,37 @@
         (list 'let* (vec (concat reads parameters)) form))
       form)))
 
-(defn instantiate-effect-region
-  "Instantiate a validated effect-map's lexical parameters against its physical interface.
+(defn instantiate-map-region
+  "Instantiate a validated map/effect-map's lexical parameters against its physical interface.
    Return the hygienic map index and canonical region, without reconstructing host source.
+   Physical destinations reserve caller-owned storage names even for functional maps.
    Scheduled lowering and host realization must use this same binding operation."
-  [equation]
+  ([equation] (instantiate-map-region equation []))
+  ([equation physical-destinations]
   (let [{:keys [kind attributes arrays captures destinations lambda]}
         (dialect/operation-parts equation)
         {:keys [elements capture-parameters destination-parameters]}
         (dialect/parameter-layout equation)]
-    (when-not (= 'effect-map kind)
-      (throw (ex-info "effect-region instantiation requires an effect-map"
-                      {:reason :typed-soac-effect-map-subset :equation equation})))
+    (when-not (contains? '#{map effect-map} kind)
+      (throw (ex-info "map-region instantiation requires a map or effect-map"
+                      {:reason :typed-soac-map-region-subset :equation equation})))
     (binding [util/*shadowing-locals*
-              (into util/*shadowing-locals* (filter symbol? (concat arrays captures destinations)))]
+              (into util/*shadowing-locals*
+                    (filter symbol? (concat arrays captures destinations
+                                            physical-destinations (nth equation 2))))]
       ;; Reserve the index before synthesizing reads: those reads refer to this bound index,
       ;; not a free capture of its old spelling. Core-named physical values remain locals.
       (let [interface-substitutions (into (zipmap capture-parameters captures)
                                          (concat (map vector elements arrays)
                                                  (map vector destination-parameters destinations)))
-            index-scope (util/subst-scoped interface-substitutions [(:index attributes)] [])
+            ;; Output storage may not occur in the lambda's explicit parameters.
+            ;; Its physical name still must not become the loop's lexical ordinal.
+            reservations (merge (zipmap (concat destinations physical-destinations
+                                                (nth equation 2))
+                                       (concat destinations physical-destinations
+                                               (nth equation 2)))
+                                interface-substitutions)
+            index-scope (util/subst-scoped reservations [(:index attributes)] [])
             map-index (first (:binders index-scope))
             region (util/subst-syms {(:index attributes) map-index} (nth lambda 2))
             substitutions (into (zipmap capture-parameters captures)
@@ -88,7 +100,7 @@
                                                [parameter (list 'clojure.core/aget array map-index)])
                                              elements arrays)
                                         (map vector destination-parameters destinations)))]
-        {:index map-index :region (util/subst-syms substitutions region)}))))
+        {:index map-index :region (util/subst-syms (merge reservations substitutions) region)})))))
 
 (declare materialize-region)
 
@@ -191,16 +203,17 @@
 (defn- scalar-fold-parts
   [attributes expression]
   (let [accumulator (first (:accumulators attributes))
-        arguments (vec (when (seq? expression) (descriptor/call-args expression)))]
+        {:keys [combine element accumulator-position]}
+        (reduction/scalar-recurrence-view
+         {:acc accumulator :init (first (:identities attributes)) :lambda expression}
+         (first (:dtypes attributes)))]
     ;; `par/contract` spells the fold as (combine accumulator element).  Reversing a merely
     ;; associative, non-commutative fold here would be a semantic change, so refuse that shape.
-    (when-not (and (seq? expression) (= 2 (count arguments))
-                   (= accumulator (first arguments)))
+    (when-not (= 0 accumulator-position)
       (throw (ex-info "segmented reduction has no ordered scalar contract projection"
                       {:reason :typed-soac-contract-projection
                        :accumulator accumulator :expression expression})))
-    {:combine (descriptor/semantic-op expression)
-     :element (second arguments)}))
+    {:combine combine :element element}))
 
 (defn- result-transform-epilogue
   [transform]

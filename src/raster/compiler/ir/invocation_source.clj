@@ -6,10 +6,15 @@
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.scalar-conversion :as scalar-conversion]
             [raster.compiler.core.types :as types]
+            [raster.compiler.core.method-entry :as method-entry]
+            [raster.compiler.core.binding-completion :as binding-completion]
+            [raster.compiler.core.intrinsic-source :as intrinsic-source]
+            [raster.compiler.support.mangled :as mangled]
             [raster.compiler.core.util :as util]
             [raster.compiler.core.value-completion :as completion]
             [raster.compiler.ir.form :as form]
             [raster.compiler.ir.index-expression :as index-expression]
+            [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.parallel-program :as parallel-program]
             [raster.compiler.ir.semantic-fingerprint :as semantic]
             [raster.compiler.ir.soac-dialect :as dialect]
@@ -21,6 +26,73 @@
    :int ['clojure.core/int-array 'ints 'int]
    :long ['clojure.core/long-array 'longs 'long]
    :byte ['clojure.core/byte-array 'bytes 'byte]})
+
+(defn program-result-source
+  "The numerical port of a closed Object-return recipe, without executing it.
+   In addition to a direct snapshot, a constructed helper may retain its actual
+   ref-to-FP compute-return conversion before boxing. This grammar establishes
+   neither the port's payload Class nor permission to read or adapt device data;
+   an owned runtime importer still has to discharge those obligations."
+  [expression]
+  (when-let [object (completion/object-input-parts expression)]
+    (let [operand (:operand object)
+          returned (completion/canonical-parts operand)
+          contract (:contract returned)
+          source (if (and (= :jvm-bytecode-floating-input (:source-context contract))
+                          (= :ref (:expected-input-carrier contract)))
+                   (:operand returned)
+                   operand)]
+      (when (symbol? source) source))))
+
+(defn reference-identity-source
+  "The explicit normalized reference-identity grammar, not a JVM Class proof.
+   Source admission owns normalization of the binder's physical completion.
+   Consumers additionally require compatible preceding BUFFER values. Unknown
+   evaluation obligations and implicit binder checks are not admitted here."
+  [binder expression]
+  (let [parts (completion/object-input-parts expression)
+        operand (:operand parts)
+        allowed? (fn [node]
+                   (and (not-any? (fn [[key value]]
+                                    (and value (keyword? key) (= "raster.effect" (namespace key))
+                                         (or (not= key :raster.effect/preserve-evaluation)
+                                             (not (true? value)))))
+                                  (meta node))
+                        ;; Below, the grammar is the reserved canonical Object
+                        ;; completion over one bare symbol, not an arbitrary
+                        ;; function call. Only source obligations remain to read;
+                        ;; do not re-run general effect inference on its marker.
+                        (every? #{:preserve-source-evaluation}
+                                (effects/source-obligation-flags node))))]
+    (when (and (symbol? binder) (= 'java.lang.Object (:tag (meta binder)))
+               (some? (dtype/dtype-for-array-tag (:raster.type/tag (meta binder))))
+               (symbol? operand) (every? allowed? [binder expression operand]))
+      operand)))
+
+(defn preserved-reference-identity?
+  [binder expression]
+  (and (some? (reference-identity-source binder expression))
+       (or (true? (:raster.effect/preserve-evaluation (meta binder)))
+           (true? (:raster.effect/preserve-evaluation (meta expression))))))
+
+(defn capacity-reference-aliases
+  "Combine explicit identities with caller-certified whole-buffer return sources.
+   Private graph destinations are not source-visible host references. The capacity
+   transfer must still check that a preceding source has an actual buffer AV."
+  [pairs lexical-inputs certified-sources]
+  (:aliases
+   (reduce
+    (fn [{:keys [visible] :as state} [id expression]]
+      (let [explicit (reference-identity-source id expression)
+            certified (get certified-sources id)]
+        (when (and explicit certified (not= explicit certified))
+          (throw (ex-info "source identity and certified buffer return disagree"
+                          {:reason :source-capacity-reference-conflict
+                           :binding id :explicit explicit :certified certified})))
+        (let [reference (or explicit (when (contains? visible certified) certified))]
+          (cond-> (update state :visible conj id)
+            reference (assoc-in [:aliases id] reference)))))
+    {:visible (set lexical-inputs) :aliases {}} pairs)))
 
 (defn shape-projection-source
   [expression]
@@ -46,10 +118,26 @@
     (second dimension)
     dimension))
 
+(defn dimension-references
+  "Lexical dependencies of a retained shape dimension, not source evaluation.
+   A bare dimension is always a value ID, even when it names a clojure.core Var.
+   The existing value wrapper and whole-buffer extent root name one dependency;
+   recognizing their syntax neither resolves that value nor validates its kind.
+   Compound algebra uses the caller's declared lexical scope for the same distinction."
+  [dimension scope]
+  (let [dimension (dimension-expression dimension)
+        extent-id (when (seq? dimension) (launch/backing-extent-id dimension))]
+    (cond
+      (symbol? dimension) #{dimension}
+      (symbol? extent-id) #{extent-id}
+      :else
+      (binding [util/*shadowing-locals* (into util/*shadowing-locals* scope)]
+        (util/free-syms dimension)))))
+
 (defn- host-computable-dimension?
   [program-values dimension]
   (let [dimension (dimension-expression dimension)
-        references (util/free-syms dimension)]
+        references (dimension-references dimension (keys program-values))]
     (or (integer? dimension)
         (and (symbol? dimension) (scalar-value? (get program-values dimension)))
         (and (seq? dimension)
@@ -115,9 +203,126 @@
                           (meta expression))))))]
     (project expression)))
 
+(declare projection-corresponds?)
+
+(defn- selected-length-expression
+  "Derive a length expression from the selected source, never its Object return tag.
+   The actual input interface, original body and lookup history must agree."
+  ([expression value values] (selected-length-expression expression value values nil))
+  ([expression value values actual-array-class]
+  (let [{:keys [dispatch? semantic-op implementation-op arguments lexical-callee]}
+        (descriptor/call-description expression)]
+    (when (and dispatch? (not lexical-callee) (= 1 (count arguments))
+               (or actual-array-class
+                   (and (= :tensor (:kind value)) (= [] (:shape value))
+                        (contains? #{:int :long} (:dtype value))))
+               (descriptor/alength-op? semantic-op)
+               (= semantic-op (mangled/impl->op implementation-op)))
+      (method-entry/call-with-definition-inputs
+       #(method-entry/call-with-optional-definition-inputs
+         (fn []
+           (when-let [definition (method-entry/observed-selected-definition
+                                 :typed semantic-op implementation-op 1)]
+             (let [entry (method-entry/selected-source-entry-carriers
+                          semantic-op implementation-op 1 (:source-var definition))
+                   carrier (first (:parameter-carriers entry))
+                   operand (first arguments)
+                   actual (get values operand)
+                   storage-dtype (dtype/dtype-for-jvm-array-class carrier)
+                   context (when entry (method-entry/selected-typed-entry-body definition))
+                   [body & more] (:body context)
+                   parameters (set (:parameters definition))]
+               (when (and storage-dtype (symbol? operand)
+                          (if actual-array-class
+                            (identical? actual-array-class carrier)
+                            (and (= storage-dtype (:dtype actual)) (= 1 (count (:shape actual)))
+                                 (= {:kind :plain} (:representation actual))
+                                 (nil? (:logical-layout actual))))
+                          body (empty? more))
+                 (let [policy (delay (some-> (find-ns 'raster.compiler.backend.jvm.bytecode)
+                                            (ns-resolve 'binding-completion-plan)
+                                            binding-completion/capture-resolution-context))
+                       reference-compatible?
+                       (fn [node]
+                         (or (nil? (binding-completion/declared-binding-hint node))
+                             (binding-completion/reference-binding-without-check?
+                              node (:source-ns context) @policy carrier)))
+                       ;; Caller aliases have no source-namespace authority here.
+                       ;; Only bootstrap reference hints can use the body namespace.
+                       caller-hint (binding-completion/declared-binding-hint operand)
+                       caller-hint? (or (nil? caller-hint)
+                                        (dtype/dtype-for-array-tag caller-hint)
+                                        (contains? '#{objects Object java.lang.Object} caller-hint))
+                       projected
+                       (letfn [(project [node]
+                                 (when (and (seq? node) (= 2 (count node)))
+                                   (when-let [operation (method-entry/observed-body-operation
+                                                        context (first node) parameters)]
+                                     (when (or (= 'clojure.core/alength operation)
+                                               (and (= "clojure.core" (namespace operation))
+                                                    (descriptor/cast-op? operation)))
+                                       (intrinsic-source/observe-original!
+                                        (:source-ns context) (first node) operation)
+                                       (if (= 'clojure.core/alength operation)
+                                         (when (and (= (second node) (first (:parameters definition)))
+                                                    (reference-compatible? (second node)))
+                                           ;; Build pure target syntax, not source-owned metadata.
+                                           (list operation (with-meta operand nil)))
+                                         (when-let [inner (project (second node))]
+                                           (list operation inner)))))))]
+                         (when (and caller-hint? (reference-compatible? operand)) (project body)))]
+                   (when (and projected (or actual-array-class (projection-corresponds? projected value)))
+                     projected))))))))))))
+
+(defn ^:no-doc selected-array-length-body
+  "Derive only the selected source's core length/cast body, conditional on an
+   independently proved actual array Class. The caller still owns the exact
+   invocation/input completion, callback-free prefix, result publication and
+   use context. This grants neither that Class nor a shape/range/motion proof.
+   Ordinary shape canonicalization keeps its narrower final-algebra gate."
+  [expression actual-array-class]
+  (when (dtype/dtype-for-jvm-array-class actual-array-class)
+    (selected-length-expression expression nil nil actual-array-class)))
+
+(defn- checked-int-array-length-chain [expression]
+  (when (and (seq? expression) (= 'clojure.core/int (first expression)))
+    (loop [node expression]
+      (when (and (seq? node) (= 2 (count node)))
+        (case (first node)
+          (clojure.core/int clojure.core/long) (recur (second node))
+          clojure.core/alength (when (symbol? (second node)) (second node))
+          nil)))))
+
+(defn checked-int-array-length-projection
+  "One complete checked Int chain over a canonical array length. source-views
+   MUST contain causal full source-view contracts, not numerical read domains.
+   This conditional algebra grants no such contract or source correspondence.
+   Runtime still produces/checks the final Int from the visible buffer shape at
+   this source cursor; an out-of-range virtual view is never silently narrowed."
+  [expression value source-views]
+  (when-let [source (checked-int-array-length-chain expression)]
+    (let [view (get source-views source)
+          hint (binding-completion/declared-binding-hint source)
+          hinted-dtype (or (dtype/dtype-for-array-tag hint)
+                           (when (class? hint) (dtype/dtype-for-jvm-array-class hint)))]
+      (when (and (= :tensor (:kind value)) (= [] (:shape value)) (= :int (:dtype value))
+                 (= :tensor (:kind view)) (= 1 (count (:shape view)))
+                 (= {:kind :plain} (:representation view)) (nil? (:logical-layout view))
+                 (get-in dtype/dtype-info [(:dtype view) :jvm-array-class-name])
+                 (or (nil? hint) (= hinted-dtype (:dtype view))
+                     (contains? '#{Object java.lang.Object} hint) (identical? Object hint)))
+        source))))
+
 (defn canonicalize-shape-projection
   [program-values public-inputs symbol expression]
-  (let [source (shape-projection-source expression)
+  (if (checked-int-array-length-chain expression)
+    ;; Retaining checked source is not an admission grant. Its caller must use
+    ;; the full-view theorem above; do not replace this chain by an internal
+    ;; dimension and thereby discard the original Int production/check.
+    expression
+    (let [expression (or (selected-length-expression expression (get program-values symbol) program-values)
+                       expression)
+        source (shape-projection-source expression)
         dimension (when (and source (not (contains? public-inputs source)))
                     (certified-shape-dimension program-values source))]
     (if-not dimension
@@ -127,7 +332,7 @@
                               (:dtype (get program-values dimension)))]
         (if (or (nil? dimension-dtype) (= result-dtype dimension-dtype))
           dimension
-          (list (dtype/scalar-tag-for-dtype result-dtype) dimension))))))
+          (list (dtype/scalar-tag-for-dtype result-dtype) dimension)))))))
 
 (defn allocation-pair
   [values result extent]
@@ -174,19 +379,19 @@
                (every? (fn [{:keys [binding expression]}]
                          (and (not= primary binding)
                               (= 1 (count (filter #(and (= binding (first %))
-                                                         (semantic/equivalent? [binding expression] (vec %)))
+                                                         (semantic/retained-source-equivalent? [binding expression] (vec %)))
                                                    source-pairs)))))
                        witness)
                (some (fn [{binding :binding generated :expression kind :kind}]
                        (and (= symbol binding)
-                            (semantic/equivalent? [symbol expression] [binding generated])
+                            (semantic/retained-source-equivalent? [symbol expression] [binding generated])
                             (case kind
                               :result-allocation
                               (and (some #{binding} (:results equation))
                                    (dialect/program-form? (:algorithm equation))
                                    (some (fn [inner]
                                            (and (some #{binding} (nth inner 2))
-                                                (semantic/equivalent?
+                                                (semantic/retained-source-equivalent?
                                                  [binding generated]
                                                  (equation-allocation-pair
                                                   (:values program) inner binding))))
@@ -280,27 +485,75 @@
           tag (dtype/scalar-tag-for-dtype dtype)]
       (typed-store-value (symbol "clojure.core" (name tag)) expression))))
 
+(defn- allocation-source-attempt
+  [expression values]
+  (let [{:keys [status projection] :as attempt}
+        (descriptor/direct-allocation-projection-attempt expression values)]
+    (case status
+      :missing-source attempt
+      :projection
+      (let [{:keys [constructor]} projection
+            operation (descriptor/semantic-op constructor)
+            tag (get descriptor/alloc-sym->array-tag operation)
+            initializations (descriptor/allocation-projection-initializations projection)]
+        (if (and tag initializations)
+          {:status :projection
+           :projection
+           (assoc projection :extent (descriptor/array-allocation-size constructor)
+                             :dtype (some-> tag dtype/dtype-for-array-tag dtype/canon)
+                             ;; The executable leaf may be a zeroing JVM constructor
+                             ;; while its authenticated outer allocator deliberately
+                             ;; promises only fresh unspecified storage. Keep both;
+                             ;; readiness follows the public source contract.
+                             :initialization (:public initializations)
+                             :realized-initialization (:realized initializations))}
+          {:status :unsupported}))
+      {:status :unsupported})))
+
 (defn allocation-source
   "Project one definition-derived allocation to its exact source constructor. The caller must
    retain and compare helper correspondence with its compilation; this is not a check-hoisting
    or definition-lifetime witness. Constructor conversions remain executable source operations."
   [expression values]
-  (when-let [{:keys [constructor] :as projection}
-             (descriptor/direct-allocation-projection expression values)]
-    (let [operation (descriptor/semantic-op constructor)
-          tag (get descriptor/alloc-sym->array-tag operation)]
-      (when tag
-        (assoc projection :extent (descriptor/array-allocation-size constructor)
-                          :dtype (some-> tag dtype/dtype-for-array-tag dtype/canon)
-                          :initialization (descriptor/allocation-initialization operation))))))
+  (let [attempt (allocation-source-attempt expression values)]
+    (when (= :projection (:status attempt)) (:projection attempt))))
+
+(defn ^:no-doc required-allocation-source!
+  "Project an allocation required by actual typed source construction.
+
+   An exact pending selected source may request one bounded preparation phase.
+   The outer definition owner restarts and rederives the complete projection;
+   the opaque request is never retained as allocation or execution authority."
+  [expression values]
+  (let [{:keys [status projection request]} (allocation-source-attempt expression values)]
+    (case status
+      :projection projection
+      :missing-source
+      (do (method-entry/demand-selected-source-preparation! request)
+          (throw (ex-info "source prerequisite demand unexpectedly returned"
+                          {:reason :source-prerequisite-no-progress})))
+      nil)))
+
+(defn ^:no-doc allocation-definition-projection
+  "Return the complete retained definition proof from a freshly rederived allocation-source.
+   Extent, dtype and :initialization are consumer projections checked independently against
+   storage. Every constructor/helper field, including public and realized initialization,
+   remains exact correspondence material; missing historical fields are never reconstructed."
+  [source]
+  (when (map? source)
+    (dissoc source :extent :dtype :initialization)))
 
 (defn- same-integral-extent? [source dimension values]
-  (or (semantic/equivalent? source dimension)
+  (or (semantic/retained-source-equivalent? source dimension)
       (try
         (let [decline! (fn [& _] (throw (ex-info "not an exact typed extent" {:reason ::extent})))
               project #(index-expression/lower-typed % (set (keys values))
                                                     (fn [id] (:dtype (get values id))) :long decline!)]
-          (semantic/equivalent? (project source) (project dimension)))
+          ;; Successful projection has only integral literals, scoped SSA leaves and explicit
+          ;; IndexExpr/IndexCast fields. Source metadata on a leaf is not a different SSA value;
+          ;; widths and overflow remain in the typed tree. This is size equality, not permission
+          ;; to erase source evaluation or compare arbitrary source with metadata-blind equality.
+          (= (project source) (project dimension)))
         (catch clojure.lang.ExceptionInfo error
           (if (= ::extent (:reason (ex-data error))) false (throw error))))))
 

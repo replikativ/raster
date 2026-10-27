@@ -1,5 +1,6 @@
 (ns raster.compiler.ir.semantic-fingerprint-test
   (:require [clojure.test :refer [deftest is testing]]
+            [raster.compiler.core.reference-completion-test :as reference]
             [raster.compiler.ir.semantic-fingerprint :as fingerprint]))
 
 (defrecord Example [a b])
@@ -43,7 +44,42 @@
 
 (deftest runtime-objects-cannot-enter-semantic-identities
   (testing "identity, printing and closure internals are not compiler semantics"
-    (is (= :semantic-fingerprint-unsupported
-           (reason-of #(fingerprint/fingerprint (fn [] nil)))))
-    (is (= :semantic-fingerprint-unsupported
-           (reason-of #(fingerprint/fingerprint (Object.)))))))
+    (doseq [value [(fn [] nil) (Object.) #'fingerprint/schema
+                   (.getMethod String "length" (make-array Class 0))]
+            encode [fingerprint/canonical-bytes fingerprint/fingerprint
+                    #(fingerprint/equivalent? % %)
+                    #(fingerprint/retained-source-equivalent? % %)]]
+      (is (= :semantic-fingerprint-unsupported (reason-of #(encode value)))))))
+
+(deftest retained-source-classes-use-pair-local-identity-in-every-position
+  (let [[left right] (#'reference/duplicate-interface-classes)]
+    (is (= (.getName ^Class left) (.getName ^Class right)))
+    (is (not (identical? left right)))
+    (is (fingerprint/retained-source-equivalent? [left right left] [left right left]))
+    (is (not (fingerprint/retained-source-equivalent? [left right] [right left])))
+    (is (not (fingerprint/retained-source-equivalent? left right)))
+    (is (fingerprint/retained-source-equivalent?
+         (array-map left #{right left} right Double/TYPE)
+         (array-map right Double/TYPE left #{left right})))
+    (is (fingerprint/retained-source-equivalent?
+         (with-meta 'x {:tag left :line 1}) (with-meta 'x {:line 9 :tag left})))
+    (is (not (fingerprint/retained-source-equivalent?
+              (with-meta 'x {:tag left}) (with-meta 'x {:tag right})))))
+  (doseq [value [Double/TYPE [Double/TYPE] {:x Double/TYPE} #{Double/TYPE}
+                 (with-meta 'x {:tag Double/TYPE})]
+          encode [fingerprint/canonical-bytes fingerprint/fingerprint
+                  #(fingerprint/equivalent? % %)]]
+    (is (= :semantic-fingerprint-unsupported (reason-of #(encode value)))
+        "portable APIs remain strict even when the process-local comparison accepts Classes")))
+
+(deftest retained-source-comparison-preserves-the-pure-encoding-rules
+  (let [nan-a (Double/longBitsToDouble 0x7ff8000000000001)
+        nan-b (Double/longBitsToDouble 0x7ff8000000000002)]
+    (doseq [[left right expected]
+            [[nan-a nan-a true] [nan-a nan-b false] [0.0 -0.0 false]
+             [(int 1) (long 1) false]
+             [(with-meta 'x {:tag 'long :line 1}) (with-meta 'x {:tag 'long :line 2}) true]
+             [(with-meta 'x {:tag 'long}) (with-meta 'x {:tag 'int}) false]
+             [(array-map :a 1 :b #{3 2}) (array-map :b #{2 3} :a 1) true]]]
+      (is (= expected (fingerprint/equivalent? left right)
+             (fingerprint/retained-source-equivalent? left right))))))

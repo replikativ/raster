@@ -6,18 +6,22 @@
    control expression and retained as first-class algorithms in a ParallelProgram."
   (:require [clojure.set :as set]
             [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.method-entry :as me]
             [raster.compiler.core.op-descriptor :as descriptor]
+            [raster.compiler.core.value-completion :as completion]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.invocation-source :as invocation-source]
             [raster.compiler.ir.axis-map :as axis-map]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.parallel-program :as parallel-program]
+            [raster.compiler.ir.par :as par]
             [raster.compiler.ir.numerical-contract :as numerics]
             [raster.compiler.ir.semantic-fingerprint :as semantic]
             [raster.compiler.ir.segmented-weighted-reduction :as swr]
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.passes.parallel.device-scalar-schedule :as device-scalar]
             [raster.compiler.passes.parallel.effect-source :as effect-source]
+            [raster.compiler.passes.parallel.source-result :as source-result]
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
             [raster.compiler.passes.parallel.typed-soac-fusion :as fusion]
             [raster.compiler.passes.parallel.typed-soac-initialization :as initialization]
@@ -28,15 +32,17 @@
             [raster.compiler.core.util :as util]))
 
 (defn- scalar-region
-  [equation]
+  ([equation] (scalar-region equation nil))
+  ([equation typed-values] (scalar-region equation typed-values []))
+  ([equation typed-values physical-destinations]
   (let [{:keys [kind attributes arrays captures destinations lambda element-lambda]}
         (dialect/operation-parts equation)]
     (cond
       (contains? #{'segmented-fold-map 'contract} kind)
       {:locals [] :bodies []}
 
-      (= 'effect-map kind)
-      (let [{:keys [index region]} (projection/instantiate-effect-region equation)
+      (contains? '#{map effect-map} kind)
+      (let [{:keys [index region]} (projection/instantiate-map-region equation physical-destinations)
             {:keys [locals body-results]}
             (dialect/lambda-parts (list 'lambda [] (projection/scalar-folds->source region)))]
         {:index index :locals locals :bodies body-results})
@@ -50,7 +56,14 @@
             (into (into (zipmap capture-parameters captures)
                         (zipmap destination-parameters destinations))
                   (map (fn [parameter array]
-                         [parameter (list 'clojure.core/aget array (:index attributes))])
+                         (let [read (list 'clojure.core/aget array (:index attributes))
+                               ;; An explicit TypedSOAC element parameter owns
+                               ;; its scalar dtype through the operand AV. Keep
+                               ;; that fact on the generated read result; this
+                               ;; is neither reference-Class inference nor a
+                               ;; consumer/kernel-dtype fallback.
+                               tag (some-> (get typed-values array) :dtype dtype/info :scalar-tag)]
+                           [parameter (cond-> read tag (with-meta {:tag tag :raster.type/tag tag}))]))
                        elements arrays))
             project-expression
             (fn [expression]
@@ -59,7 +72,7 @@
         {:locals (mapv #(update % :init (fn [init]
                                           (project-expression init)))
                        locals)
-         :bodies (mapv project-expression body-results)}))))
+         :bodies (mapv project-expression body-results)})))))
 
 (defn- storage-only-dtype?
   "A dtype with device storage but no JVM scalar: its values move bit-exactly between arrays
@@ -80,7 +93,7 @@
           body)
     body))
 
-(defn- materialize-functional-result-transform
+(defn materialize-functional-result-transform
   "Project a completed functional reduction's typed scalar transform back to host source.
 
    Device schedules execute this region at their terminal store.  JVM scalar/SIMD lowering still
@@ -127,6 +140,194 @@
                    (map (juxt :parameter :value) (:scalars transform))))]
         (util/subst-syms substitutions expression)))))
 
+(defn functional-reduction-host-projection
+  "Project a validated full scalar reduction without substituting its evaluation
+   into the terminal transform. Native consumers can evaluate the raw fold once
+   in a private target temporary and reuse the same authoritative host boundary."
+  [program equation]
+  (let [{:keys [kind attributes]} (dialect/operation-parts equation)
+        results (nth equation 2)
+        values (:values (dialect/facts program))
+        {locals :locals bodies :bodies} (scalar-region equation values)]
+    (when (= 'reduce kind)
+      (when-not (and (= 1 (count results)) (= 1 (count (:accumulators attributes)))
+                     (= 1 (count (:identities attributes))) (= 1 (count (:dtypes attributes)))
+                     (= 1 (count bodies))
+                     (= [] (:shape (get values (first results))))
+                     (not (resident/resident-scalar-value? (get values (first results)))))
+        (throw (ex-info "native host projection requires one nonresident scalar reduction"
+                        {:reason :unsupported-native-owned-reduction :equation (second equation)})))
+      {:source (list 'raster.par/reduce (first (:accumulators attributes))
+                     (first (:identities attributes)) (:index attributes) (:extent attributes)
+                     (materialize-region locals (first bodies)))
+       :raw-dtype (first (:dtypes attributes))
+       :result-dtype (:dtype (get values (first results)))
+       :transform (:result-transform attributes)})))
+
+(defn functional-map-host-projection
+  "Project a complete map/effect-map's iteration and host return contract.
+   Allocations, binding placement and scheduling remain the caller's responsibility.
+   :statement includes its typed locals and storage completions exactly once;
+   :locals is informative and MUST NOT be emitted again by a consumer.
+   The input is a validated TypedSOAC program; other operation kinds abstain."
+  [program equation]
+  (let [equation-id (second equation)
+        results (nth equation 2)
+        {:keys [kind attributes]} (dialect/operation-parts equation)
+        values (:values (dialect/facts program))
+        {region-locals :locals bodies :bodies region-index :index}
+        (when (contains? '#{map effect-map} kind)
+          (scalar-region equation nil (dialect/physical-results program equation)))]
+    (case kind
+      map
+      (let [attributes (assoc attributes :index region-index)]
+        (when-not (and (seq results) (= (count results) (count bodies)))
+          (throw (ex-info "the production TypedSOAC route requires one body per map result"
+                          {:reason :typed-soac-production-subset
+                           :equation equation-id :results results})))
+        (let [result (first results)
+              result-dtypes (mapv #(:dtype (get values %)) results)
+              casts (mapv #(nth (get invocation-source/dtype->allocation %) 2 nil) result-dtypes)
+              projected-source-casts
+              (mapv (fn [body result-dtype]
+                      (when (and (seq? body) (= 2 (count body))
+                                 (descriptor/cast-op? (descriptor/semantic-op body))
+                                 (= result-dtype
+                                    (some-> (descriptor/semantic-op body)
+                                            descriptor/cast-result-tag
+                                            dtype/dtype-for-scalar-tag dtype/canon)))
+                        (descriptor/semantic-op body)))
+                    bodies result-dtypes)
+              casts (mapv #(or %1 %2) projected-source-casts casts)
+              bodies (mapv (fn [body source-cast]
+                             (if source-cast (second body) body))
+                           bodies projected-source-casts)
+              ;; A storage-only dtype (`:half` in `short[]`) has no JVM scalar cast; its map
+              ;; results are stored bit-exactly, so only dtypes with a scalar need one.
+              _ (when (some (fn [[cast dtype]] (and (nil? cast) (not (storage-only-dtype? dtype))))
+                            (map vector casts result-dtypes))
+                  (throw (ex-info "TypedSOAC materialization has no scalar cast for map output"
+                                  {:reason :typed-soac-materialization-dtype
+                                   :results results :dtypes result-dtypes})))
+              cast (first casts)
+              storage (dialect/result-storage (dialect/facts program) equation-id)
+              physical-results (dialect/physical-results (dialect/facts program) equation)
+              host-returns (set (map :host-return storage))
+              multiple-buffer-results? (and (= #{:buffer} host-returns)
+                                            (< 1 (count physical-results)))
+              _ (when (and storage
+                           (not (or (= #{:effect} host-returns)
+                                    (= #{:buffer} host-returns))))
+                  (throw (ex-info "stored map results require one coherent host return contract"
+                                  {:reason :typed-soac-production-subset
+                                   :equation equation-id :storage storage})))
+              secondary-stores
+              (mapv (fn [secondary secondary-cast body]
+                      (list 'clojure.core/aset secondary (:index attributes)
+                            (invocation-source/typed-store-value secondary-cast body)))
+                    (rest physical-results) (rest casts) (rest bodies))
+              body (materialize-region
+                    region-locals
+                    (if (seq secondary-stores)
+                      (list* 'do (concat secondary-stores [(first bodies)]))
+                      (first bodies)))
+              void-statement
+              (when (or (= #{:effect} host-returns) multiple-buffer-results?)
+                (materialize-region
+                 region-locals
+                 (list* 'do
+                        (map (fn [destination result-cast result-body]
+                               (list 'clojure.core/aset destination (:index attributes)
+                                     (invocation-source/typed-store-value result-cast result-body)))
+                             physical-results casts bodies))))
+              value-body (if (= #{:buffer} host-returns)
+                           (materialize-region region-locals (first bodies))
+                           body)
+              target (if (= #{:buffer} host-returns) (first physical-results) result)
+              statement (or void-statement
+                            (list 'clojure.core/aset target (:index attributes)
+                                  (invocation-source/typed-store-value cast value-body)))
+              source (with-meta
+                       (if void-statement
+                         (list 'raster.par/map-void! (:index attributes) (:extent attributes)
+                               void-statement)
+                         (list 'raster.par/map! target (:index attributes) (:extent attributes)
+                               cast value-body))
+                       {:raster.type/elem-type (first result-dtypes)})]
+          {:kind :map :index (:index attributes) :extent (:extent attributes)
+           :locals region-locals :statement statement :source source
+           :physical-destinations physical-results :result-dtypes result-dtypes
+           :storage storage :multiple-buffer-results? multiple-buffer-results?
+           :host-return-contract {:call-result (if void-statement :effect :buffer)
+                                  :storage-returns host-returns}}))
+
+      effect-map
+      (let [storage (dialect/result-storage (dialect/facts program) equation-id)
+            physical-results (dialect/physical-results (dialect/facts program) equation)
+            result-dtypes (mapv #(:dtype (get values %)) results)
+            casts (mapv #(nth (get invocation-source/dtype->allocation %) 2 nil) result-dtypes)
+            dtype-by-destination (zipmap physical-results result-dtypes)
+            cast-by-destination (zipmap physical-results casts)
+            effects (mapv dialect/scheduled-effect bodies)
+            strict-effects? (dialect/strict-effect-scalar-policy? effects)
+            generated-cast (partial effect-source/storage-cast strict-effects?)
+            materialize-locals (if strict-effects?
+                                 (partial effect-source/typed-locals generated-cast)
+                                 materialize-region)
+            _ (when-not (and (= (count results) (count physical-results)
+                                (count result-dtypes) (count casts))
+                             (every? some? effects)
+                             (every? (fn [[cast dtype]] (or cast (storage-only-dtype? dtype)))
+                                     (map vector casts result-dtypes))
+                             (= #{:effect} (set (map :host-return storage))))
+                (throw (ex-info "the production effect-map route requires typed effect storage"
+                                {:reason :typed-soac-production-subset
+                                 :equation equation-id :results results
+                                 :storage storage :effects effects :dtypes result-dtypes})))
+            loop-statement
+            (fn [{:keys [index lower extent locals carries] :as loop} emit-body]
+              (if (seq carries)
+                (effect-source/counted-loop generated-cast loop emit-body)
+                ;; Preserve the existing source loop's induction policy when no carry is present.
+                (list 'loop* [index lower]
+                      (list 'if (list 'clojure.core/< index extent)
+                            (materialize-locals
+                             locals (emit-body (list 'recur (list 'clojure.core/inc index))))
+                            nil))))
+            statement
+            (fn [{:keys [destination conflict destination-index predicate value]}]
+              (let [cast (get cast-by-destination destination)
+                    result-dtype (get dtype-by-destination destination)
+                    destination (with-meta destination
+                                  {:raster.type/tag
+                                   (dtype/array-tag-for-dtype result-dtype)
+                                   :tag (dtype/array-tag-for-dtype result-dtype)})
+                    typed-value (if cast (list (generated-cast cast) value) value)
+                    store (if (dialect/reducing-scatter-conflict? conflict)
+                            (list 'raster.par/atomic-add!
+                                  destination destination-index typed-value)
+                            (list 'clojure.core/aset destination destination-index
+                                  typed-value))]
+                (if (contains? #{true 1} predicate) store (list 'if predicate store))))
+            continuation (effect-source/ordered-effects
+                          effects nil {:emit-store statement :emit-loop loop-statement
+                                       :emit-region materialize-locals})
+            iteration-statement (materialize-locals region-locals continuation)
+            effect-source
+            (with-meta
+              (list 'raster.par/map-void! region-index (:extent attributes)
+                    iteration-statement)
+              {:raster.type/elem-type (first result-dtypes)})]
+        {:kind :effect-map :index region-index :extent (:extent attributes)
+         :iteration-order (:iteration-order attributes)
+         :locals region-locals :statement iteration-statement :source effect-source
+         :physical-destinations physical-results :result-dtypes result-dtypes
+         :storage storage
+         :host-return-contract {:call-result :effect
+                                :storage-returns (set (map :host-return storage))}})
+
+      nil)))
+
 (defn- segmented-result-extent
   [attributes]
   (let [shape (dialect/segmented-reduce-result-shape attributes)]
@@ -138,7 +339,8 @@
   (let [[_ equation-id results] equation
         {:keys [kind attributes]} (dialect/operation-parts equation)
         values (:values (dialect/facts program))
-        {region-locals :locals bodies :bodies region-index :index} (scalar-region equation)
+        {region-locals :locals bodies :bodies}
+        (when-not (contains? '#{map effect-map} kind) (scalar-region equation))
         placement-facts (get-in (dialect/facts program) [:equations equation-id])
         constituent-ids (or (some-> placement-facts :attributes :fusion/constituents keys set)
                             #{(or (get-in placement-facts [:provenance :source-binding-id])
@@ -181,83 +383,14 @@
            :source source}))
 
       map
-      (do
-        (when-not (and (seq results) (= (count results) (count bodies)))
-          (throw (ex-info "the production TypedSOAC route requires one body per map result"
-                          {:reason :typed-soac-production-subset
-                           :equation equation-id :results results})))
-        (let [result (first results)
-              result-dtypes (mapv #(:dtype (get values %)) results)
-              casts (mapv #(nth (get invocation-source/dtype->allocation %) 2 nil) result-dtypes)
-              projected-source-casts
-              (mapv (fn [body result-dtype]
-                      (when (and (seq? body) (= 2 (count body))
-                                 (descriptor/cast-op? (descriptor/semantic-op body))
-                                 (= result-dtype
-                                    (some-> (descriptor/semantic-op body)
-                                            descriptor/cast-result-tag
-                                            dtype/dtype-for-scalar-tag dtype/canon)))
-                        (descriptor/semantic-op body)))
-                    bodies result-dtypes)
-              casts (mapv #(or %1 %2) projected-source-casts casts)
-              bodies (mapv (fn [body source-cast]
-                             (if source-cast (second body) body))
-                           bodies projected-source-casts)
-              ;; A storage-only dtype (`:half` in `short[]`) has no JVM scalar cast; its map
-              ;; results are stored bit-exactly, so only dtypes with a scalar need one.
-              _ (when (some (fn [[cast dtype]] (and (nil? cast) (not (storage-only-dtype? dtype))))
-                            (map vector casts result-dtypes))
-                  (throw (ex-info "TypedSOAC materialization has no scalar cast for map output"
-                                  {:reason :typed-soac-materialization-dtype
-                                   :results results :dtypes result-dtypes})))
-              cast (first casts)
-              storage (dialect/result-storage (dialect/facts program) equation-id)
-              physical-results (dialect/physical-results (dialect/facts program) equation)
-              host-binding (or (get-in placement-facts [:attributes :host-binding]) result)
-              host-bindings (or (get-in placement-facts [:attributes :host-bindings])
-                                {result host-binding})
-              host-returns (set (map :host-return storage))
-              multiple-buffer-results? (and (= #{:buffer} host-returns)
-                                            (< 1 (count physical-results)))
-              _ (when (and storage
-                           (not (or (= #{:effect} host-returns)
-                                    (= #{:buffer} host-returns))))
-                  (throw (ex-info "stored map results require one coherent host return contract"
-                                  {:reason :typed-soac-production-subset
-                                   :equation equation-id :storage storage})))
-              secondary-stores
-              (mapv (fn [secondary secondary-cast body]
-                      (list 'clojure.core/aset secondary (:index attributes)
-                            (invocation-source/typed-store-value secondary-cast body)))
-                    (rest physical-results) (rest casts) (rest bodies))
-              body (materialize-region
-                    region-locals
-                    (if (seq secondary-stores)
-                      (list* 'do (concat secondary-stores [(first bodies)]))
-                      (first bodies)))
-              effect (gensym (str "typed_soac_map_" equation-id "__"))
-              source (with-meta
-                       (cond
-                         (or (= #{:effect} host-returns) multiple-buffer-results?)
-                         (list 'raster.par/map-void! (:index attributes) (:extent attributes)
-                               (materialize-region
-                                region-locals
-                                (list* 'do
-                                       (map (fn [destination result-cast result-body]
-                                              (list 'clojure.core/aset destination
-                                                    (:index attributes)
-                                                    (invocation-source/typed-store-value result-cast result-body)))
-                                            physical-results casts bodies))))
-
-                         (= #{:buffer} host-returns)
-                         (list 'raster.par/map! (first physical-results) (:index attributes)
-                               (:extent attributes) cast
-                               (materialize-region region-locals (first bodies)))
-
-                         :else
-                         (list 'raster.par/map! result (:index attributes) (:extent attributes)
-                               cast body))
-                       {:raster.type/elem-type (first result-dtypes)})]
+      (let [{:keys [source storage physical-destinations multiple-buffer-results?]}
+            (functional-map-host-projection program equation)
+            physical-results physical-destinations
+            result (first results)
+            host-binding (or (get-in placement-facts [:attributes :host-binding]) result)
+            host-bindings (or (get-in placement-facts [:attributes :host-bindings])
+                              {result host-binding})
+            effect (gensym (str "typed_soac_map_" equation-id "__"))]
           {:equation-id equation-id
            :placement placement
            :pairs (cond
@@ -282,7 +415,7 @@
                     (conj (mapv #(invocation-source/equation-allocation-pair values equation %) results)
                           [effect source]))
            :site [:binding (if (and storage (not multiple-buffer-results?)) host-binding effect)]
-           :source source}))
+           :source source})
 
       scatter
       (let [storage (dialect/result-storage (dialect/facts program) equation-id)
@@ -336,68 +469,14 @@
          :source effect-source})
 
       effect-map
-      (let [storage (dialect/result-storage (dialect/facts program) equation-id)
-            physical-results (dialect/physical-results (dialect/facts program) equation)
+      (let [{:keys [source]} (functional-map-host-projection program equation)
             host-binding (or (get-in placement-facts [:attributes :host-binding])
-                             (first results))
-            result-dtypes (mapv #(:dtype (get values %)) results)
-            casts (mapv #(nth (get invocation-source/dtype->allocation %) 2 nil) result-dtypes)
-            dtype-by-destination (zipmap physical-results result-dtypes)
-            cast-by-destination (zipmap physical-results casts)
-            effects (mapv dialect/scheduled-effect bodies)
-            strict-effects? (dialect/strict-effect-scalar-policy? effects)
-            generated-cast (partial effect-source/storage-cast strict-effects?)
-            materialize-locals (if strict-effects?
-                                 (partial effect-source/typed-locals generated-cast)
-                                 materialize-region)
-            _ (when-not (and (= (count results) (count physical-results)
-                                (count result-dtypes) (count casts))
-                             (every? some? effects)
-                             (every? (fn [[cast dtype]] (or cast (storage-only-dtype? dtype)))
-                                     (map vector casts result-dtypes))
-                             (= #{:effect} (set (map :host-return storage))))
-                (throw (ex-info "the production effect-map route requires typed effect storage"
-                                {:reason :typed-soac-production-subset
-                                 :equation equation-id :results results
-                                 :storage storage :effects effects :dtypes result-dtypes})))
-            loop-statement
-            (fn [{:keys [index lower extent locals carries] :as loop} emit-body]
-              (if (seq carries)
-                (effect-source/counted-loop generated-cast loop emit-body)
-                ;; Preserve the existing source loop's induction policy when no carry is present.
-                (list 'loop* [index lower]
-                      (list 'if (list 'clojure.core/< index extent)
-                            (materialize-locals
-                             locals (emit-body (list 'recur (list 'clojure.core/inc index))))
-                            nil))))
-            statement
-            (fn [{:keys [destination conflict destination-index predicate value]}]
-              (let [cast (get cast-by-destination destination)
-                    result-dtype (get dtype-by-destination destination)
-                    destination (with-meta destination
-                                  {:raster.type/tag
-                                   (dtype/array-tag-for-dtype result-dtype)
-                                   :tag (dtype/array-tag-for-dtype result-dtype)})
-                    typed-value (if cast (list (generated-cast cast) value) value)
-                    store (if (dialect/reducing-scatter-conflict? conflict)
-                            (list 'raster.par/atomic-add!
-                                  destination destination-index typed-value)
-                            (list 'clojure.core/aset destination destination-index
-                                  typed-value))]
-                (if (contains? #{true 1} predicate) store (list 'if predicate store))))
-            continuation (effect-source/ordered-effects
-                          effects nil {:emit-store statement :emit-loop loop-statement
-                                       :emit-region materialize-locals})
-            effect-source
-            (with-meta
-              (list 'raster.par/map-void! region-index (:extent attributes)
-                    (materialize-locals region-locals continuation))
-              {:raster.type/elem-type (first result-dtypes)})]
+                             (first results))]
         {:equation-id equation-id
          :placement placement
-         :pairs [[host-binding effect-source]]
+         :pairs [[host-binding source]]
          :site [:binding host-binding]
-         :source effect-source})
+         :source source})
 
       stencil
       (let [host-binding (or (get-in placement-facts [:attributes :host-binding])
@@ -425,20 +504,17 @@
             result-cast (nth (get invocation-source/dtype->allocation result-dtype) 2 nil)
             source
             (cond
-              (and resident? transform)
+              resident?
               ;; GPU scheduling applies this same checked transform in the terminal reduction
               ;; phase. Source/JVM materialization must not write the raw accumulator into the
               ;; resident result: reduce to a scalar, apply the authoritative transform (including
-              ;; its explicit singleton operand loads), then store the transformed value once.
+              ;; its explicit singleton operand loads), then store the finalized value once.
+              ;; The identity case uses the same executable source grammar; reduce-into is an
+              ;; internal numerical IR marker, not a runtime function in a source witness.
               (list 'clojure.core/aset resident-target 0
                     (invocation-source/typed-store-value
                      result-cast
                      (materialize-functional-result-transform scalar-reduction-source transform)))
-
-              resident?
-              (list 'raster.par/reduce-into resident-target accumulator
-                    (first (:identities attributes)) (:index attributes)
-                    (:extent attributes) body)
 
               :else
               (materialize-functional-result-transform scalar-reduction-source transform))]
@@ -1089,7 +1165,10 @@
         (if (= required required') required (recur required'))))))
 
 (defn- retain-analyzed-binding-expressions
-  "Transport analyzed expressions only at their exact original ordered binding identities."
+  "Transport analyzed expressions at their exact original ordered binding identities.
+   A separately projected numerical expression must not overwrite its preserved
+   source initializer. That correspondence is supplied by the constructing
+   frontend and checked against this exact current source position."
   [form descriptions invariant]
   (let [[head bindings & body] form
         pairs (mapv vec (partition 2 bindings))
@@ -1097,16 +1176,22 @@
     (when-not (= (count ids) (count (distinct ids)))
       (throw (ex-info "analyzed source descriptors repeat a binding site"
                       {:reason :raster/bug :invariant invariant :source-binding-ids ids})))
-    (doseq [{:keys [id sym expr]} descriptions]
+    (doseq [{:keys [id sym expr source-expression]} descriptions]
       (when-not (and (integer? id) (<= 0 id) (< id (count pairs))
-                     (= sym (first (nth pairs id))) (some? expr))
+                     (= sym (first (nth pairs id))) (some? (or source-expression expr))
+                     (or (nil? source-expression)
+                         (identical? source-expression (second (nth pairs id)))))
         (throw (ex-info "analyzed source descriptor lost its binding site"
                         {:reason :raster/bug :invariant invariant
                          :binding sym :source-binding-id id}))))
-    (let [pairs (reduce (fn [pairs {:keys [id expr]}]
-                          (assoc pairs id [(first (nth pairs id)) expr])) pairs descriptions)]
-      (with-meta (list* head (with-meta (vec (mapcat identity pairs)) (meta bindings)) body)
-        (meta form)))))
+    (if (every? (fn [{:keys [id expr source-expression]}]
+                  (identical? (or source-expression expr) (second (nth pairs id)))) descriptions)
+      form
+      (let [pairs (reduce (fn [pairs {:keys [id expr source-expression]}]
+                            (assoc pairs id [(first (nth pairs id)) (or source-expression expr)]))
+                          pairs descriptions)]
+        (with-meta (list* head (with-meta (vec (mapcat identity pairs)) (meta bindings)) body)
+          (meta form))))))
 
 (defn- public-resident-source-substitutions
   "Map direct public resident roots and exact top-level symbol aliases to scalar zero-loads.
@@ -1170,9 +1255,71 @@
               (dialect/equations program))]
     (set/union reduction-outputs scalar-outputs)))
 
+(defn- contextual-source-bindings
+  [pairs]
+  (reduce
+   (fn [contexts [position [binder expression]]]
+     (let [{:keys [contract operand]} (completion/canonical-parts expression)]
+       (if-not (and (= :jvm-bytecode-result-context (:source-context contract))
+                    (= :ref (:result-carrier contract)) (par/par-reduce-form? operand))
+         contexts
+         (do
+           (when (contains? (:bindings contexts) binder)
+             (throw (ex-info "contextual source bindings must be unique"
+                             {:reason :typed-soac-contextual-source :binding binder})))
+           (-> contexts
+               (assoc-in [:bindings binder] {:position position :expression expression :contract contract})
+               (assoc-in [:positions position] binder))))))
+   {:bindings {} :positions {}} (map-indexed vector pairs)))
+
+(defn- preserve-contextual-reduction-source
+  "Keep a source-observable result context around NEW scalar reduction source.
+   The algorithm may have fused; its old operand/occurrence is never reused.
+   Resident/compound reconstruction needs its distinct scalar-to-view relation."
+  [program equation {:keys [bindings positions]} realized]
+  (let [results (nth equation 2)
+        attached (keep bindings results)
+        at-placement (get positions (:placement realized))]
+    (if-not (or (seq attached) at-placement)
+      realized
+      (let [result (first results)
+            context (get bindings result)
+            {:keys [kind attributes]} (dialect/operation-parts equation)
+            value (get-in (dialect/facts program) [:values result])
+            pairs (:pairs realized)
+            matches (filterv #(= result (first %)) pairs)
+            source (:source realized)]
+        (when-not (and (= 1 (count results)) (= 1 (count attached)) context
+                       (= (:position context) (:placement realized))
+                       (= [:binding result] (:site realized))
+                       (= 'reduce kind) (nil? (:result-transform attributes))
+                       (= :tensor (:kind value)) (= [] (:shape value))
+                       (= {:kind :plain} (:representation value))
+                       (not (resident/resident-scalar-value? value))
+                       (empty? (get-in (dialect/facts program)
+                                       [:equations (second equation) :attributes :result-storage]))
+                       (= 1 (count pairs) (count matches))
+                       (identical? source (second (first matches)))
+                       (par/par-reduce-form? source))
+          (throw (ex-info "source reduction context has no matching plain scalar realization"
+                          {:reason :typed-soac-contextual-source
+                           :equation (second equation) :result result
+                           :placement (:placement realized)})))
+        (let [wrapped (with-meta (completion/complete-value (:contract context) source)
+                        (meta (:expression context)))]
+          (assoc realized :source wrapped
+                 :pairs (mapv (fn [[id expression :as pair]]
+                                (if (= result id) [id wrapped] pair)) pairs)))))))
+
 (defn- realize-source
   [form program]
-  (let [form (retain-analyzed-binding-expressions
+  ;; Root and dependency scans run outside the original walker. Retain its
+  ;; actual lexical names: a local called `alias` or `count` is not a core Var.
+  (binding [util/*shadowing-locals*
+            (into util/*shadowing-locals*
+                  (concat (map first (partition 2 (second form)))
+                          (:inputs (dialect/facts program))))]
+   (let [form (retain-analyzed-binding-expressions
               form (mapv (fn [{:keys [source-binding-id destination source-expression]}]
                            {:id source-binding-id :sym destination :expr source-expression})
                          (filter #(or (contains? % :source-expression)
@@ -1195,7 +1342,16 @@
         original-pairs (vec (partition 2 bindings))
         host-binding-ids (set (get-in (dialect/facts program)
                                       [:attributes :host-binding-ids]))
-        realized (mapv #(realize-equation program %) (dialect/equations program))
+        contexts (contextual-source-bindings original-pairs)
+        realized (mapv #(preserve-contextual-reduction-source
+                         program % contexts (realize-equation program %))
+                       (dialect/equations program))
+        missing-contexts (set/difference (set (keys (:bindings contexts)))
+                                         (into #{} (map (comp second :site)) realized))
+        _contexts (when (seq missing-contexts)
+                    (throw (ex-info "source-observable reduction context was lost during realization"
+                                    {:reason :typed-soac-contextual-source
+                                     :bindings missing-contexts})))
         by-placement (group-by :placement realized)
         ;; Fusion constituents are exact source bindings now owned by a realized typed equation.
         ;; They must not re-enter the ordinary host dependency closure after staging/fusion has
@@ -1255,6 +1411,17 @@
                          (map :destination
                               (get-in equation-facts [:attributes :result-storage])))))
               (:equations (dialect/facts program)))
+        ;; An analyzed allocation is also an ordered source computation, even if
+        ;; no surviving equation consumes its contents. Its original argument
+        ;; evaluation and constructor failure cannot disappear with a dead fill.
+        ;; These claims were restored/validated against exact source sites above;
+        ;; generated storage without a source claim is not a new host root.
+        source-allocation-destinations
+        (into #{}
+              (comp (filter #(or (contains? % :source-expression)
+                                 (contains? % :source-binding-id)))
+                    (map :destination))
+              (get-in (dialect/facts program) [:attributes :allocations]))
         ;; Bindings the typed program leaves under host control (an opaque effect loop, a
         ;; host call) are retained as written, so everything they read is a root of the host
         ;; dependency closure too: a size scalar only that loop reads must stay bound.
@@ -1276,6 +1443,7 @@
                            pair))
                        original-pairs)
          (set/union physical-destinations
+                    source-allocation-destinations
                     host-controlled-reads
                     (into #{} (mapcat util/free-syms) body)))
         unprojected-constituent-symbols
@@ -1319,7 +1487,7 @@
                (mapcat :pairs (get by-placement id)))))
           (range (count original-pairs))))
         source (with-meta (list* let-head (vec (mapcat identity pairs)) body) (meta form))]
-    {:source source :realized (into {} (map (juxt :equation-id identity)) realized)}))
+    {:source source :realized (into {} (map (juxt :equation-id identity)) realized)})))
 
 (defn- equation-operation?
   [operation]
@@ -1365,6 +1533,40 @@
                          (= (:operands equation) (:inputs (dialect/facts algorithm)))
                          (= (:results equation) (dialect/outputs algorithm))))})))
 
+(defn ^:no-doc analyzed-program-envelope
+  "Realize one analyzed/fused source program through the production constructor.
+   An enclosing construction may rename read-only incoming SSA values while retaining original
+   source names. This mechanically derives the renamed algorithm, not an equivalence witness
+   for an arbitrary second program. It grants no host read or source-completion authority."
+  ([source typed-program] (analyzed-program-envelope source typed-program {}))
+  ([source typed-program incoming-renames]
+   (let [typed-program (dialect/validate! typed-program)
+         facts (dialect/facts typed-program)
+         _ (when-not (and (map? incoming-renames)
+                          (every? dialect/value-id? (concat (keys incoming-renames) (vals incoming-renames)))
+                          (set/subset? (set (keys incoming-renames)) (set (:inputs facts))))
+             (throw (ex-info "incoming value renaming requires declared input IDs"
+                             {:reason :typed-soac-incoming-renaming})))
+         renames (into {} (remove (fn [[source target]] (= source target))) incoming-renames)
+         definitions (set (mapcat #(nth % 2) (dialect/equations typed-program)))
+         writes (into #{}
+                      (mapcat (fn [equation]
+                                (let [{:keys [destinations]} (dialect/operation-parts equation)
+                                      attrs (get-in facts [:equations (second equation) :attributes])]
+                                  (concat destinations
+                                          (keep identity [(:destination attrs)])
+                                          (map :destination (:result-storage attrs))))))
+                      (dialect/equations typed-program))
+         _ (when-not (and (= (count renames) (count (set (vals renames))))
+                          (empty? (set/intersection (set (keys renames))
+                                                    (set/union definitions writes)))
+                          (not-any? #(contains? (:values facts) %) (vals renames)))
+             (throw (ex-info "source transport permits only fresh read-only incoming SSA renaming"
+                             {:reason :typed-soac-incoming-renaming :mapping renames})))
+         {:keys [source realized]} (realize-source source typed-program)
+         renamed (if (seq renames) (dialect/remap-values typed-program renames) typed-program)]
+     (envelope renamed source realized))))
+
 (defn- equation-references
   [equation]
   (vec (distinct
@@ -1374,25 +1576,44 @@
 (declare sequential-continuation-decline)
 
 (defn- entry-operands
-  [equations-by-id {:keys [kind equation-id description]}]
+  [equations-by-id {:keys [kind equation-id description source-reads]}]
   (case kind
     :typed-soac (equation-references (get equations-by-id equation-id))
+    :source-action source-reads
     :segmented-weighted-reduction
     (vec (distinct
           (concat (swr/ordered-input-ids (:plan description))
                   (filter symbol? (swr/runtime-parameter-values (:plan description))))))))
 
 (defn- component-runs
-  "Partition the one analyzed source spine into maximal ordinary SOAC runs and singleton plans."
+  "Partition numerical components at every retained source action.
+
+   Leading actions belong to the following numerical component's causal prefix.
+   Once a typed run starts, an action ends that run and is accumulated into the
+   next component's prefix. Trailing actions remain in the whole retained source;
+   they never manufacture an empty numerical component. SWR keeps its existing
+   independent component boundary. This partitions source order only and grants
+   no execution authority to an action."
   [entries]
+  (doseq [entry entries]
+    (when-not (contains? #{:typed-soac :source-action :segmented-weighted-reduction}
+                         (:kind entry))
+      (throw (ex-info "analyzed source entry has no component projection"
+                      {:reason :typed-soac-source-entry :kind (:kind entry)}))))
   (loop [remaining (seq entries) prefix [] components []]
     (if-not (seq remaining)
       components
-      (if (= :typed-soac (:kind (first remaining)))
+      (case (:kind (first remaining))
+        :source-action
+        (recur (next remaining) (conj prefix (first remaining)) components)
+
+        :typed-soac
         (let [[run suffix] (split-with #(= :typed-soac (:kind %)) remaining)]
           (recur suffix (into prefix run)
                  (conj components {:kind :typed-soac :entries (vec run)
                                    :prefix prefix :suffix (vec suffix)})))
+
+        :segmented-weighted-reduction
         (recur (next remaining) (conj prefix (first remaining))
                (conj components {:kind :segmented-weighted-reduction
                                  :entry (first remaining)
@@ -1402,6 +1623,9 @@
 (defn- entry-storage-values
   [facts equations-by-id {:keys [kind equation-id description]}]
   (case kind
+    ;; Lexical reference dependencies do not establish a content access or
+    ;; discharge first-use initialization. The source/allocation cursor owns it.
+    :source-action #{}
     :typed-soac
     (let [equation (get equations-by-id equation-id)
           storage (get-in facts [:equations equation-id :attributes :result-storage])]
@@ -1415,12 +1639,14 @@
 (defn- public-scalar-checkpoint
   "Transport one globally unused source-public scalar across component splitting.
    This selects a candidate; the complete residency and production boundary proofs remain required."
-  [{:keys [typed-program outputs entries]}]
+  [{:keys [typed-program outputs entries source-result] :as projection}]
   (let [facts (dialect/facts typed-program)
         equations (dialect/equations typed-program)
         by-id (into {} (map (juxt second identity)) equations)
         scalar-outputs (resident/public-scalar-results typed-program outputs)
-        result (when (= 1 (count scalar-outputs)) (first scalar-outputs))
+        result (if (contains? projection :source-result)
+                 (when (some #{source-result} scalar-outputs) source-result)
+                 (when (= 1 (count scalar-outputs)) (first scalar-outputs)))
         producer (when result (some #(when (= [result] (nth % 2)) %) equations))]
     (if (and producer (= 'scalar (dialect/operation-kind producer))
              (resident/public-scalar-unused-in-program? facts equations result)
@@ -1431,7 +1657,9 @@
   [{:keys [typed-program outputs]} component]
   (let [source-facts (dialect/facts typed-program)
         equations-by-id (into {} (map (juxt second identity)) (dialect/equations typed-program))
-        equations (mapv #(get equations-by-id (:equation-id %)) (:entries component))
+        equations (into [] (comp (filter #(= :typed-soac (:kind %)))
+                                (map #(get equations-by-id (:equation-id %))))
+                        (:entries component))
         equation-ids (set (map second equations))
         definitions (set (mapcat #(nth % 2) equations))
         references (vec (distinct (mapcat equation-references equations)))
@@ -1456,6 +1684,7 @@
               (mapcat (fn [{:keys [kind equation-id description]}]
                         (case kind
                           :typed-soac (nth (get equations-by-id equation-id) 2)
+                          :source-action [(:sym description)]
                           :segmented-weighted-reduction [(:sym description)])))
               (:prefix component))
         ;; An allocator extent can be computed in an earlier component and absent from every
@@ -1473,29 +1702,109 @@
                   (assoc-in [:attributes :allocations] allocations))]
     (dialect/make facts equations chunk-outputs)))
 
-(defn- optimize-typed-component
-  [typed-input {:keys [resident-reductions? resident-initialization?
-                       resident-uniform-input-loads? abstract-machine]}]
-  (let [[typed-result typed-stats] (fusion/fusion-fixpoint typed-input abstract-machine)
-        [typed-result uniform-stats]
+(defn- merge-component-stats
+  [& reports]
+  (apply merge-with (fn [left right]
+                      (if (and (number? left) (number? right)) (+ left right) right))
+         reports))
+
+(defn- prepare-typed-component
+  [typed-input {:keys [resident-reductions? resident-uniform-input-loads?]} public-outputs]
+  (when (and (seq public-outputs) (not resident-reductions?))
+    (throw (ex-info "explicit public-output representation requires resident realization"
+                    {:reason :typed-soac-resident-output-policy :requested public-outputs})))
+  (let [[typed-result uniform-stats]
         (if resident-uniform-input-loads?
-          (resident/inline-uniform-input-loads typed-result)
-          [typed-result {:resident-uniform-input-loads 0}])
+          (resident/inline-uniform-input-loads typed-input)
+          [typed-input {:resident-uniform-input-loads 0}])
         [typed-result resident-stats]
         (if resident-reductions?
-          (resident/realize typed-result)
-          [typed-result {:resident-reductions 0 :inlined-scalars 0}])
-        [typed-result initialization-stats]
+          (resident/realize typed-result public-outputs)
+          [typed-result {:resident-reductions 0 :inlined-scalars 0}])]
+    {:program typed-result
+     :stats (merge-component-stats uniform-stats resident-stats)}))
+
+(defn- finish-typed-component
+  [{:keys [program stats]} {:keys [resident-initialization?]} component-context]
+  (let [[typed-result initialization-stats]
         (if resident-initialization?
-          (initialization/materialize typed-result)
-          [typed-result {}])
+          (initialization/materialize program component-context)
+          [program {}])
         [typed-result ownership-stats] (ownership/prove typed-result)]
     {:program typed-result
      :declined (sequential-continuation-decline typed-result)
-     :stats (merge-with (fn [left right]
-                          (if (and (number? left) (number? right)) (+ left right) right))
-                        typed-stats uniform-stats resident-stats initialization-stats
-                        ownership-stats)}))
+     :stats (merge-component-stats stats initialization-stats ownership-stats)}))
+
+(defn ^:no-doc realize-typed-component
+  "Shared post-fusion component pipeline, including structured-control continuations.
+   An internal public-output demand must come from a checked whole-source return projection,
+   never from a component's conservative live-outs or caller-supplied representation hints."
+  ([typed-input options] (realize-typed-component typed-input options []))
+  ([typed-input options public-outputs]
+   (finish-typed-component
+    (prepare-typed-component typed-input options public-outputs)
+    options nil)))
+
+(defn- fuse-typed-component
+  [typed-input {:keys [abstract-machine]}]
+  (let [[fused stats] (fusion/fusion-fixpoint typed-input abstract-machine)]
+    {:program fused :stats stats}))
+
+(defn- realize-fused-component
+  [{:keys [program stats]} options public-outputs]
+  (update (realize-typed-component program options public-outputs) :stats
+          #(merge-component-stats stats %)))
+
+(defn- prepare-fused-component
+  [{:keys [program stats]} options public-outputs]
+  (update (prepare-typed-component program options public-outputs) :stats
+          #(merge-component-stats stats %)))
+
+(defn- public-source-return?
+  [options]
+  (and (:resident-reductions? options)
+       (seq (or (:public-parameters options) (:active-params options)))))
+
+(defn- source-return-demand
+  [typed-program provisional options]
+  (if (and typed-program (:source provisional) (public-source-return? options))
+    (let [projected (source-result/validate-source-result! provisional options)]
+      (resident/source-return-reduction-demand typed-program (:outputs projected)))
+    []))
+
+(defn- optimize-typed-component
+  [source typed-input options]
+  (let [{:keys [program] :as fused} (fuse-typed-component typed-input options)
+        provisional (when (public-source-return? options)
+                      (analyzed-program-envelope source program))
+        demand (source-return-demand program provisional options)]
+    (realize-fused-component fused options demand)))
+
+(defn- foreign-source-read-values
+  "Keep non-SOAC dependencies visible to the whole-program reduction-use audit.
+   These are conservative read exclusions, not additional execution or residency authority."
+  [projection]
+  (let [values (:values projection)
+        by-id (into {} (map (juxt second identity))
+                    (dialect/equations (:typed-program projection)))
+        aliases (into {} (keep (fn [[binding expression]]
+                                (when (symbol? expression) [binding expression])))
+                      (partition 2 (second (:source projection))))
+        resolve-alias (fn [value]
+                        (loop [value value seen #{}]
+                          (if (and (contains? aliases value) (not (contains? seen value)))
+                            (recur (get aliases value) (conj seen value))
+                            value)))]
+    (binding [util/*shadowing-locals* (into util/*shadowing-locals* (keys values))]
+      (into #{}
+            (comp (remove #(= :typed-soac (:kind %)))
+                  (mapcat (fn [entry]
+                            (concat (entry-operands by-id entry)
+                                    (when (= :segmented-weighted-reduction (:kind entry))
+                                      (util/free-syms (get-in entry [:description :expr]))))))
+                  (mapcat #(vector % (resolve-alias %)))
+                  (filter #(contains? values %)))
+            (:entries projection)))))
 
 (defn- realization-program
   [projection typed-components]
@@ -1509,8 +1818,11 @@
           outputs (vec (distinct (mapcat #(nth % 2) equations)))
           values (apply merge (:values projection) (map #(get-in (dialect/facts %) [:values]) programs))
           effects (reduce set/union #{} (map :effects (vals equation-facts)))
-          facts (assoc (:facts projection) :values values :inputs inputs
-                       :equations equation-facts :effects effects)]
+          facts (-> (:facts projection)
+                    (assoc :values values :inputs inputs
+                           :equations equation-facts :effects effects)
+                    (update-in [:attributes :host-read-values]
+                               #(vec (distinct (concat % (foreign-source-read-values projection))))))]
       (dialect/make facts equations outputs))))
 
 (defn- swr-equation
@@ -1540,16 +1852,30 @@
    form (mapv :description (filter #(= :segmented-weighted-reduction (:kind %)) entries))
    :protected-source-binding-mismatch))
 
-(defn- mixed-envelope
-  [form projection options]
-  (let [components (component-runs (:entries projection))
-        typed-components
-        (into []
-              (comp (filter #(= :typed-soac (:kind %)))
-                    (map #(optimize-typed-component
-                           (typed-component-program projection %) options)))
-              components)]
-    (if-let [decline (some :declined typed-components)]
+(defn- certified-parallel-operation?
+  [operation]
+  (contains? #{:map :scatter :effect-map :stencil :reduce
+               :segmented-reduce :contract :product-reduce
+               :segmented-fold-map :scan}
+             (:kind (fusion/equation-info operation))))
+
+(defn- typed-component-equation?
+  "Recognize an actually realized TypedSOAC equation with a certified parallel operation.
+   Component construction itself is not scheduling authority, and scalar-only algorithms do
+   not become parallel merely by entering the common component envelope."
+  [equation]
+  (and (= :typed-soac (get-in equation [:attributes :algorithm-dialect]))
+       (some certified-parallel-operation?
+             (some-> equation :algorithm dialect/equations))))
+
+(defn- swr-component-equation?
+  [equation]
+  (= :segmented-weighted-reduction
+     (get-in equation [:attributes :algorithm-dialect])))
+
+(defn- assemble-component-envelope
+  [form projection components typed-components]
+  (if-let [decline (some :declined typed-components)]
       {:declined decline}
       (let [form (retain-protected-source form (:entries projection))
             realization (realization-program projection typed-components)
@@ -1570,6 +1896,8 @@
             values (apply merge (:values projection) (map :values typed-envelopes))
             inputs (parallel-program/infer-inputs equations)
             effects (reduce set/union #{} (map :effects equations))
+            swr-count (count (filter swr-component-equation? equations))
+            swr? (pos? swr-count)
             stats (apply merge-with
                          (fn [left right]
                            (if (and (number? left) (number? right)) (+ left right) right))
@@ -1578,7 +1906,7 @@
          ;; The structured-control route owns validation of this existing typed algorithm union.
          ;; The pipeline validates immediately after this attempt, avoiding a dependency cycle.
          (parallel-program/make
-          {:dialect :typed-parallel
+          {:dialect (if swr? :typed-parallel :typed-soac)
            :source source
            :values values
            :inputs inputs
@@ -1587,16 +1915,51 @@
            :effects effects
            :diagnostics (get-in projection [:facts :diagnostics])
            :provenance {:front-end :analyzed-source
-                        :pass :segmented-weighted-reduction-protection}
-           :attributes (assoc (:attributes (:facts projection))
-                              :host-control :typed-soac-materialization
-                              :mixed-algorithms true)})
-         :stats (merge stats
-                       {:route :typed-parallel
-                        :front-end :analyzed-source
-                        :segmented-weighted-reductions
-                        (count (filter #(= :segmented-weighted-reduction (:kind %))
-                                       components))})}))))
+                        :pass (if swr?
+                                :segmented-weighted-reduction-protection
+                                :typed-soac-fusion)}
+           :attributes (cond-> (assoc (:attributes (:facts projection))
+                                      :host-control :typed-soac-materialization)
+                         swr? (assoc :mixed-algorithms true))})
+         :stats (cond-> (merge stats
+                               {:route (if swr? :typed-parallel :typed-soac)
+                                :front-end :analyzed-source})
+                  swr? (assoc :segmented-weighted-reductions swr-count)
+                  (not swr?) (assoc :typed-validated true))})))
+
+(defn- component-envelope
+  [form projection options]
+  (let [components (component-runs (:entries projection))
+        fused-components
+        (into []
+              (comp (filter #(= :typed-soac (:kind %)))
+                    (map #(fuse-typed-component
+                           (typed-component-program projection %) options)))
+              components)
+        return-provisional (when (public-source-return? options)
+                             (:program (assemble-component-envelope
+                                        form projection components fused-components)))
+        demand (set (source-return-demand
+                     (when return-provisional
+                       (realization-program projection fused-components))
+                     return-provisional options))
+        prepared-components
+        (mapv (fn [{:keys [program] :as fused}]
+                (prepare-fused-component
+                 fused options (filterv demand (dialect/outputs program))))
+              fused-components)
+        initialization-provisional
+        (when (:resident-initialization? options)
+          (:program (assemble-component-envelope
+                     form projection components prepared-components)))
+        typed-components
+        (mapv (fn [{:keys [program] :as prepared}]
+                (finish-typed-component
+                 prepared options
+                 (when initialization-provisional
+                   {:parallel-program initialization-provisional :component program})))
+              prepared-components)]
+    (assemble-component-envelope form projection components typed-components)))
 
 (defn program-envelope
   "Wrap an already constructed TypedSOAC program in the same ParallelProgram boundary used by
@@ -1648,10 +2011,17 @@
   [form {:keys [segmented-plans?] :as frontend-options}]
   (let [projection (when segmented-plans?
                      (frontend/form->program-components form frontend-options))
+        preserved (into [] (comp (map :description) (filter :source-expression))
+                        (:entries projection))
+        form (if (seq preserved)
+               (retain-analyzed-binding-expressions form preserved :numerical-source-binding-mismatch)
+               form)
+        projection (cond-> projection
+                     (and projection (seq preserved)) (assoc :source form))
         typed-input (or (:typed-program projection)
                         (when-not projection
                           (frontend/form->program form frontend-options)))]
-    {:projection projection
+    {:form form :projection projection
      :typed-input typed-input
      :admitted? (boolean (or typed-input (:segmented-plans? projection)))}))
 
@@ -1664,7 +2034,8 @@
    the filtered form.  If filtering removes the last admitted operation, retain the validated input;
    liveness is an optional optimization and cannot turn an admitted program into fallback."
   [form frontend-options]
-  (let [initial (source-projection form frontend-options)]
+  (let [initial (source-projection form frontend-options)
+        form (:form initial)]
     (if-not (:admitted? initial)
       (assoc initial :form form :bindings-removed 0)
       (let [{filtered :form {:keys [bindings-removed]} :stats}
@@ -1687,7 +2058,7 @@
               (assoc rebuilt :form filtered :bindings-removed bindings-removed)
               (assoc initial :form form :bindings-removed 0))))))))
 
-(defn- validated-terminal-scalar-projection
+(defn- validated-terminal-scalar-projection*
   "Reproject one frontend-certified named terminal scalar without weakening source admission.
 
    The original complete source has already passed projection. A speculative candidate which is
@@ -1695,13 +2066,18 @@
   [{:keys [form projection typed-input] :as admitted} frontend-options]
   (if (or (:segmented-plans? projection) (nil? typed-input))
     (assoc admitted :terminal-scalars-materialized 0)
-    (if-let [{candidate-form :form result :result}
+    (if-let [{candidate-form :form result :result description :description}
              (frontend/materialize-terminal-scalar-result form frontend-options)]
       (let [rebuilt (try
                       (source-projection candidate-form frontend-options)
                       (catch clojure.lang.ExceptionInfo exception
                         (if (frontend/source-decline? exception) nil (throw exception))))
             program (when (:admitted? rebuilt) (:typed-input rebuilt))
+            selection (when program
+                        (public-scalar-checkpoint
+                         (assoc (:projection rebuilt)
+                                :typed-program program :outputs (dialect/outputs program)
+                                :source-result result)))
             result-equation (when program
                               (some #(when (= [result] (nth % 2)) %)
                                     (dialect/equations program)))]
@@ -1710,17 +2086,55 @@
           (do
             (when-not (and (not (:segmented-plans? (:projection rebuilt)))
                            (= 'scalar (some-> result-equation dialect/operation-kind))
-                           (= [result] (dialect/outputs program))
+                           (= 3 (count form) (count candidate-form))
+                           (identical? result (nth candidate-form 2 nil))
+                           (= :scalar (:kind description)) (= result (:sym description))
+                           (= (+ 2 (count (second form))) (count (second candidate-form)))
+                           (identical? result (nth (second candidate-form) (count (second form))))
+                           (every? true? (map identical? (second form) (second candidate-form)))
+                           (identical? (nth form 2) (last (second candidate-form)))
+                           (some #{result} (dialect/outputs program))
                            (= [] (get-in (dialect/facts program) [:values result :shape])))
               (throw (ex-info "terminal scalar reprojection lost its certified result boundary"
                               {:reason :raster/bug
                                :invariant :terminal-scalar-result-projection
                                :result result :outputs (dialect/outputs program)})))
-            (if (resident/terminal-device-scalar-projection program)
-              (assoc rebuilt :form candidate-form :terminal-scalars-materialized 1
-                     :bindings-removed (:bindings-removed admitted))
-              (assoc admitted :terminal-scalars-materialized 0)))))
+            (let [facts (assoc-in (dialect/facts program)
+                                  [:attributes :public-scalar-checkpoint] selection)
+                  selected (dialect/make facts (dialect/equations program) (dialect/outputs program))]
+              ;; Internal host-action liveouts remain outputs of this component.
+              ;; Selection does not prove residency: audit its entire equation
+              ;; spine, including the writer/allocation and every other output.
+              (if (and (= [result] selection)
+                       (resident/terminal-device-scalar-projection selected))
+                (cond-> (assoc rebuilt :form candidate-form :typed-input selected
+                               :terminal-scalars-materialized 1
+                               :bindings-removed (:bindings-removed admitted))
+                  (:projection rebuilt)
+                  (assoc :projection (assoc (:projection rebuilt)
+                                            :typed-program selected :facts facts)))
+                (assoc admitted :terminal-scalars-materialized 0))))))
       (assoc admitted :terminal-scalars-materialized 0))))
+
+(defn- validated-terminal-scalar-projection
+  "Use the ordinary terminal audit for an owned Float publication candidate.
+   A failed optional candidate rolls back as a whole, never retaining just its
+   writer, changed output selection or partially reconstructed component."
+  [admitted frontend-options]
+  (or
+   (when (:admitted? admitted)
+     (me/call-with-optional-definition-inputs
+      (fn []
+        (when-let [candidate (frontend/construct-terminal-float-publication (:form admitted))]
+          (let [rebuilt (try (source-projection (:form candidate) frontend-options)
+                             (catch clojure.lang.ExceptionInfo error
+                               (if (frontend/source-decline? error) nil (throw error))))]
+            (when (:admitted? rebuilt)
+              (let [selected (validated-terminal-scalar-projection*
+                              (assoc rebuilt :bindings-removed (:bindings-removed admitted))
+                              frontend-options)]
+                (when (= 1 (:terminal-scalars-materialized selected)) selected))))))))
+   (validated-terminal-scalar-projection* admitted frontend-options)))
 
 (defn attempt
   "Return a typed production ParallelProgram result, an explicit `:declined` result, or nil when
@@ -1731,62 +2145,82 @@
    (attempt form dtype {}))
   ([form dtype array-types]
    (attempt form dtype array-types {}))
-  ([form dtype array-types {:keys [resident-reductions? resident-initialization?
-                                   resident-uniform-input-loads?
-                                   scalar-types values abstract-machine segmented-plans?
+  ([form dtype array-types {:keys [scalar-types values lexical-inputs source-ns source-var source-binding-context
+                                   segmented-plans?
                                    preserve-declared-array-storage? host-scalars?]
-                            :or {resident-reductions? false}}]
+                            :as options}]
    (when (and (seq? form) (contains? #{'let 'let*} (first form)))
-     (let [form (frontend/normalize-source form {:array-types array-types
-                                                 :scalar-types scalar-types})]
        (try
-         (let [frontend-options {:dtype dtype :array-types array-types
-                                 :scalar-types scalar-types :values values
-                                 :host-scalars? host-scalars?
-                                 :segmented-plans? segmented-plans?
-                                 :preserve-declared-array-storage? preserve-declared-array-storage?}
+         (let [form (frontend/normalize-source
+                     form (cond-> {:array-types array-types :scalar-types scalar-types
+                                   :values values :dtype dtype :source-ns source-ns :source-var source-var
+                                   :source-binding-context source-binding-context}
+                            (contains? options :lexical-inputs)
+                            (assoc :lexical-inputs lexical-inputs)))
+               frontend-options (cond-> {:dtype dtype :array-types array-types
+                                        :scalar-types scalar-types :values values
+                                        :host-scalars? host-scalars?
+                                        :segmented-plans? segmented-plans?
+                                        :preserve-declared-array-storage? preserve-declared-array-storage?}
+                                  (contains? options :lexical-inputs) (assoc :lexical-inputs lexical-inputs))
                live-projection (validated-live-source-projection form frontend-options)
                {live-form :form :keys [projection typed-input admitted? bindings-removed
                                        terminal-scalars-materialized]}
                (validated-terminal-scalar-projection live-projection frontend-options)
-               form live-form]
+               form live-form
+               ;; Source completion belongs to the original public invocation context,
+               ;; not to the frontend's deliberately restricted operation options.
+               optimization-options (assoc options :array-types array-types)]
            (if-not admitted?
              (when-let [decline (frontend/coverage-decline form frontend-options)]
                {:declined decline})
-             (if (:segmented-plans? projection)
-               (update (mixed-envelope form projection
-                                       {:resident-reductions? resident-reductions?
-                                        :resident-initialization? resident-initialization?
-                                        :resident-uniform-input-loads? resident-uniform-input-loads?
-                                        :abstract-machine abstract-machine})
-                       :stats assoc :canonical-source-bindings-removed bindings-removed)
-               (let [optimization-options
-                     {:resident-reductions? resident-reductions?
-                      :resident-initialization? resident-initialization?
-                      :resident-uniform-input-loads? resident-uniform-input-loads?
-                      :abstract-machine abstract-machine}
-                     optimized (optimize-typed-component typed-input optimization-options)
+             (if projection
+               (let [optimized (component-envelope form projection optimization-options)
+                     lost-terminal? (and (= 1 terminal-scalars-materialized)
+                                         (not= 1 (get-in optimized
+                                                        [:stats :resident-terminal-scalars])))
+                     optimized (if lost-terminal?
+                                 (component-envelope (:form live-projection)
+                                                     (:projection live-projection)
+                                                     optimization-options)
+                                 optimized)
+                     terminal-scalars-materialized (if lost-terminal?
+                                                     0 terminal-scalars-materialized)
+                     {program :program stats :stats decline :declined} optimized
+                     swr? (boolean (some swr-component-equation? (:equations program)))]
+                 (cond
+                   decline {:declined decline}
+
+                   (and (not host-scalars?) (not swr?)
+                        (not-any? typed-component-equation? (:equations program)))
+                   {:declined {:reason :no-certified-parallel-equation
+                               :stats stats}}
+
+                   :else
+                   {:program program
+                    :stats (assoc stats
+                                  :terminal-scalars-materialized terminal-scalars-materialized
+                                  :canonical-source-bindings-removed bindings-removed)}))
+               (let [optimized (optimize-typed-component form typed-input optimization-options)
                      lost-terminal? (and (= 1 terminal-scalars-materialized)
                                          (not= 1 (get-in optimized [:stats :resident-terminal-scalars])))
                      optimized (if lost-terminal?
-                                 (optimize-typed-component (:typed-input live-projection)
+                                 (optimize-typed-component (:form live-projection)
+                                                           (:typed-input live-projection)
                                                            optimization-options)
                                  optimized)
                      form (if lost-terminal? (:form live-projection) form)
                      terminal-scalars-materialized (if lost-terminal? 0 terminal-scalars-materialized)
                      {typed-result :program typed-stats :stats decline :declined} optimized]
                  (if (and (not host-scalars?)
-                          (not-any? #(contains? #{:map :scatter :effect-map :stencil :reduce
-                                             :segmented-reduce :contract :product-reduce
-                                             :segmented-fold-map :scan}
-                                           (:kind (fusion/equation-info %)))
+                          (not-any? certified-parallel-operation?
                                (dialect/equations typed-result)))
                    {:declined {:reason :no-certified-parallel-equation
                                :stats typed-stats}}
                    (if decline
                      {:declined decline}
-                     (let [{:keys [source realized]} (realize-source form typed-result)]
-                       {:program (envelope typed-result source realized)
+                     (let [program (analyzed-program-envelope form typed-result)]
+                       {:program program
                         :stats (merge typed-stats
                                       {:route :typed-soac :typed-validated true
                                        :front-end :analyzed-source
@@ -1798,4 +2232,4 @@
              {:declined {:reason (:reason (ex-data exception))
                          :message (.getMessage exception)
                          :details (ex-data exception)}}
-             (throw exception))))))))
+             (throw exception)))))))

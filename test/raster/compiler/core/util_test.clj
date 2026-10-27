@@ -1,13 +1,118 @@
 (ns raster.compiler.core.util-test
   "Tests for free variable analysis — correctness of scoping across all binding forms."
-  (:require [clojure.test :refer [deftest testing is]]
+  (:require [clojure.set :as set]
+            [clojure.test :refer [deftest testing is]]
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-launch :as launch]
+            [raster.compiler.ir.form :as form]
             [raster.compiler.core.util :as util]))
 
 ;; ================================================================
 ;; free-syms: scoped free variable collection
 ;; ================================================================
+
+(defn- reference-free-leaf?
+  "The pre-accumulator free-syms leaf policy, retained only as a differential
+   test oracle."
+  [expression bound]
+  (and (symbol? expression)
+       (not (namespace expression))
+       (not (contains? bound expression))
+       (not (.startsWith (name expression) "."))
+       (or (contains? util/*shadowing-locals* expression)
+           (not (when-let [v (try (ns-resolve 'clojure.core expression)
+                                  (catch Exception _ nil))]
+                  (var? v))))))
+
+(defn- reference-free-syms
+  "The former recursive set/union implementation, used only to prove that the
+   accumulator traversal preserves its lexical result."
+  ([expression] (reference-free-syms expression #{}))
+  ([expression bound]
+   (cond
+     (symbol? expression)
+     (if (reference-free-leaf? expression bound) #{expression} #{})
+
+     (and (seq? expression)
+          (contains? #{'quote 'clojure.core/quote} (first expression)))
+     #{}
+
+     (seq? expression)
+     (if-let [{:keys [scopes outer sequential? rec?]} (form/scope-info expression)]
+       (let [outer-free (apply set/union #{} (map #(reference-free-syms % bound) outer))
+             scope-free
+             (apply set/union #{}
+                    (for [{:keys [binders inits body]} scopes]
+                      (let [bset (set (filter symbol? binders))]
+                        (if sequential?
+                          (let [[bound' init-free]
+                                (reduce (fn [[current-bound free] [sym init]]
+                                          [(conj current-bound sym)
+                                           (set/union free
+                                                      (reference-free-syms init current-bound))])
+                                        [bound #{}] (map vector binders inits))
+                                body-free (apply set/union #{}
+                                                 (map #(reference-free-syms % bound') body))]
+                            (set/union init-free body-free))
+                          (let [init-bound (if rec? (into bound bset) bound)
+                                init-free (apply set/union #{}
+                                                 (map #(reference-free-syms % init-bound) inits))
+                                body-bound (into bound bset)
+                                body-free (apply set/union #{}
+                                                 (map #(reference-free-syms % body-bound) body))]
+                            (set/union init-free body-free))))))]
+         (set/union outer-free scope-free))
+       (if (= :call (:kind (form/form-info expression)))
+         (apply set/union #{} (map #(reference-free-syms % bound) expression))
+         (apply set/union #{} (map #(reference-free-syms % bound) (rest expression)))))
+
+     (vector? expression)
+     (apply set/union #{} (map #(reference-free-syms % bound) expression))
+
+     (map? expression)
+     (apply set/union #{}
+            (map #(reference-free-syms % bound) (apply concat expression)))
+
+     (set? expression)
+     (apply set/union #{} (map #(reference-free-syms % bound) expression))
+
+     :else #{})))
+
+(deftest free-syms-accumulator-matches-recursive-set-oracle
+  (doseq [[expression bound shadowing]
+          [['x #{} #{}]
+           ['(+ x y) #{} #{}]
+           ['(my-fn x) #{'x} #{}]
+           ['(.add x y) #{} #{}]
+           ['(quote (+ hidden data)) #{} #{}]
+           ['(let* [a seed b (+ a prior)]
+               (fn* [prior] (my-fn a b prior outside))) #{} #{}]
+           ['(loop* [i start total initial]
+               (if (< i limit) (recur (+ i step) (+ total value)) total)) #{} #{}]
+           ['(letfn* [f (fn* [x] (g x captured))
+                      g (fn* [y] (f y))]
+               (f query)) #{} #{}]
+           [(list 'try '(danger input)
+                  (list 'catch 'Exception 'failure '(recover failure fallback))) #{} #{}]
+           ['(reify* [IFoo] (bar [this x] (+ x external))) #{} #{}]
+           ['(raster.par/map! out i n double
+               (+ (aget input i) offset)) #{} #{}]
+           ['(fold {:accumulator acc :index i :identity 0.0 :dtype :float
+                    :extent n :association :ordered}
+               (lambda [acc i]
+                 (region [(let-value value :float (aget input i))]
+                   [(+ acc value)]))) #{} #{}]
+           ['(caller {key [x (quote hidden)] :fixed #{y z}}) #{'z} #{}]
+           [(sorted-map 'first-key 'first-value
+                        'second-key '(nested-call nested-value)) #{} #{}]
+           [(launch/->RuntimeValue 'record-value) #{} #{}]
+           ['(+ seq first count ordinary) #{} #{'seq 'first}]
+           ['(let* [seq external first seq]
+               (+ seq first global)) #{'global} #{'seq 'first}]]]
+    (binding [util/*shadowing-locals* shadowing]
+      (is (= (reference-free-syms expression bound)
+             (util/free-syms expression bound))
+          (pr-str {:expression expression :bound bound :shadowing shadowing})))))
 
 (deftest no-op-reconstruction-preserves-occurrences-not-just-equality
   (doseq [original [(with-meta '(callee value) {:line 7 :tag 'double})
@@ -24,6 +129,21 @@
       (is (= (count longer) (count (util/remake-if-changed original longer))))))
   (doseq [empty-form ['() []]]
     (is (identical? empty-form (util/remake-if-changed empty-form [])))))
+
+(deftest map-reconstruction-preserves-only-unchanged-child-identities
+  (let [original (with-meta (array-map :class Double/TYPE :value 'x) {:line 7})]
+    (doseq [result [(util/map-preserving-identity identity original)
+                    (util/subst-syms {} original)
+                    (util/alpha-convert original)
+                    (util/postwalk-preserving-meta identity original)]]
+      (is (identical? original result)))
+    (let [changed (with-meta (symbol "x") {:tag 'double})
+          result (util/map-preserving-identity #(if (= 'x %) changed %) original)]
+      (is (= original result) "equality ignores a changed child's metadata")
+      (is (not (identical? original result)))
+      (is (identical? changed (:value result)))
+      (is (identical? (meta original) (meta result)))
+      (is (= (class original) (class result))))))
 
 (deftest result-effect-branches-bind-only-their-continuation
   (let [source '(effect-region []

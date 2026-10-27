@@ -5,6 +5,7 @@
    Duplicate expressions become aliases; DCE cleans dead bindings."
   (:require [raster.compiler.passes.scalar.effects :as effects]
             [raster.compiler.core.util :as util]
+            [raster.compiler.core.source-declaration :as source-declaration]
             [raster.compiler.ir.form :as form]))
 
 (defn- normalize-expr
@@ -102,11 +103,20 @@
                                   (assoc vec-bindings sym expr)
                                   vec-bindings)
                    ;; If folded to a symbol, register as substitution
-                   sym-subst (if (and folded (symbol? folded))
+                   sym-subst (if (and folded (symbol? folded)
+                                      (not (source-declaration/reference-declared? sym)))
                                (assoc sym-subst sym folded)
                                sym-subst)
                    ;; CSE
-                   norm (when (effects/cse-safe-expr? expr) (normalize-expr expr))
+                   ;; Substituting a declared local could erase its source reference context.
+                   ;; No initializer Class/normal-return proof is available in this pass.
+                   properties (effects/cse-properties expr)
+                   ;; Pure reads are repeatable only until an intervening effect.
+                   ;; Do not reuse an old observation after a write through an
+                   ;; alias or an opaque call whose memory footprint is unknown.
+                   cache (if (:invalidates-observations? properties) {} cache)
+                   norm (when (and (not (source-declaration/reference-declared? sym))
+                                   (:shareable? properties)) (normalize-expr expr))
                    cached (when norm (get cache norm))]
                (assoc
                 (if cached

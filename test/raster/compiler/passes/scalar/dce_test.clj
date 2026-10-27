@@ -7,6 +7,86 @@
 ;; Dead binding removal
 ;; ================================================================
 
+(deftest identity-alias-writes-retain-caller-and-live-local-storage
+  (doseq [source ['(let* [first-alias counter second-alias first-alias
+                         unused (clojure.core/aset second-alias 0
+                                  (inc (clojure.core/aget second-alias 0)))] 7)
+                  '(let* [storage (clojure.core/long-array 1)
+                          first-alias storage second-alias first-alias
+                          unused (clojure.core/aset second-alias 0 9)]
+                     (clojure.core/aget storage 0))]]
+    (let [lowered (:form (dce/eliminate-dead-bindings source))
+          run (fn [body]
+                (let [counter (long-array [0])]
+                  [((eval (list 'fn '[counter] body)) counter) (vec counter)]))]
+      (is (= (run source) (run lowered)))
+      (is (some #(and (seq? %) (= 'clojure.core/aset (first %)))
+                (tree-seq coll? seq lowered))))))
+
+(deftest caller-projection-through-an-identity-alias-retains-leaf-writes
+  (let [source '(let* [container-alias container
+                      leaf (clojure.core/aget container-alias 0)
+                      leaf-alias leaf
+                      unused (clojure.core/aset leaf-alias 0 11)] 7)
+        lowered (:form (dce/eliminate-dead-bindings source))
+        run (fn [body]
+              (let [leaf (long-array [0]) container (object-array [leaf])]
+                [((eval (list 'fn '[container] body)) container) (vec leaf)]))]
+    (is (= [7 [11]] (run source) (run lowered)))))
+
+(deftest later-shadowing-does-not-hide-an-earlier-caller-alias
+  (let [source '(let* [alias counter counter nil
+                      unused (clojure.core/aset alias 0 9)] 7)
+        lowered (:form (dce/eliminate-dead-bindings source))
+        run (fn [body]
+              (let [counter (long-array [0])]
+                [((eval (list 'fn '[counter] body)) counter) (vec counter)]))]
+    (is (= [7 [9]] (run source) (run lowered)))))
+
+(deftest returned-local-containers-retain-projected-leaf-writes
+  (let [source '(let* [leaf (clojure.core/long-array 1)
+                      box (clojure.core/object-array 1)
+                      fill (clojure.core/aset box 0 leaf)
+                      projected (clojure.core/aget box 0)
+                      write (clojure.core/aset projected 0 9)] box)
+        lowered (:form (dce/eliminate-dead-bindings source))
+        run (fn [body] (mapv vec (eval body)))]
+    (is (= [[9]] (run source) (run lowered)))))
+
+(deftest unobserved-private-alias-writes-remain-removable
+  (let [source '(let* [storage (clojure.core/long-array 1)
+                      alias storage unused (clojure.core/aset alias 0 9)] 7)
+        lowered (:form (dce/eliminate-dead-bindings source))]
+    (is (not-any? #(and (seq? %) (= 'clojure.core/aset (first %)))
+                  (tree-seq coll? seq lowered)))
+    (is (= 7 (eval lowered)))))
+
+(deftest dead-constructor-retains-source-failure-and-effect-order
+  (let [source '(let* [before (clojure.core/aset output 0 7.0)
+                      unused (clojure.core/double-array n)
+                      after (clojure.core/aset output 1 9.0)]
+                 output)
+        lowered (:form (dce/eliminate-dead-bindings source))
+        run (fn [body n]
+              (let [output (double-array 2)
+                    failure (try
+                              ((eval (list 'fn '[output n] body)) output n)
+                              nil
+                              (catch Exception e (class e)))]
+                [failure (vec output)]))]
+    (is (= source lowered))
+    (doseq [n [-1 0 3]]
+      (is (= (run source n) (run lowered n))))
+    (is (= [NegativeArraySizeException [7.0 0.0]] (run lowered -1)))
+    (is (= [nil [7.0 9.0]] (run lowered 3)))))
+
+(deftest required-reference-evaluation-still-roots-possibly-aliased-writes
+  ;; Do not split mandatory evaluation from result liveness without a genuine
+  ;; freshness/non-escape proof: this unknown helper can return caller memory.
+  (let [source '(let* [leaf (opaque-helper input)
+                      write (clojure.core/aset leaf 0 9.0)] 0)]
+    (is (= source (:form (dce/eliminate-dead-bindings source))))))
+
 (deftest per-binding-syntactic-free-symbols-are-derived-once
   (let [store '(clojure.core/aset buf 0 1.0)
         compute '(+ x 2)
@@ -49,7 +129,27 @@
                  #(dce/eliminate-dead-bindings form))]
     (is (= form (:form result)))
     (is (= {:bindings-removed 0} (:stats result)))
-    (is (= [false true true] @queries))))
+    (is (= [true true] @queries)
+        "no obsolete target inventory is queried before descriptor initialization")))
+
+(deftest late-mutation-through-a-projected-leaf-uses-current-effect-facts
+  (let [store '(late-effect leaf)
+        form (list 'let* ['leaf '(clojure.core/aget container 0) 'effect store] 7)
+        descriptor-var #'effects/descriptor mutation-var #'dce/extract-mutation-targets
+        original-descriptor @descriptor-var original-mutation @mutation-var
+        initialized? (atom false)
+        result (with-redefs-fn
+                 {descriptor-var (fn [expr]
+                                   (if (identical? expr store)
+                                     (do (reset! initialized? true) {:effect :local :flags #{}})
+                                     (original-descriptor expr)))
+                  mutation-var (fn [expr]
+                                 (if (identical? expr store)
+                                   (if @initialized? '#{leaf} #{})
+                                   (original-mutation expr)))}
+                 #(dce/eliminate-dead-bindings form))]
+    (is (= form (:form result)))
+    (is (= 0 (get-in result [:stats :bindings-removed])))))
 
 (deftest mutation-targets-traverse-maps-test
   ;; Regression: extract-mutation-targets must descend into map literals. A `case*`

@@ -54,3 +54,65 @@
   (is (= :ad-product-unknown-tangent
          (try (ports/literal-plan 'p ['a] {'a {:alias 'b} 'b {:alias 'a}} {'a true}) nil
               (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))
+
+(deftest explicit-absence-joins-only-declared-scalar-tangents
+  (let [x (with-meta 'x {:raster.type/tag 'double})
+        fact #(select-keys % [:schema :active-paths])
+        absent (fact (ports/literal-plan 'absent [nil [nil]] {} {}))
+        scalar (fact (ports/literal-plan 'scalar [x [x]] {} {'x true}))]
+    (doseq [[a b] [[absent scalar] [scalar absent]]]
+      (let [joined (ports/join-facts a b)]
+        (is (= scalar joined))
+        (is (= scalar (ports/join-facts joined absent)))
+        (is (not-any? #(and (map? %) (contains? % :presence))
+                      (tree-seq coll? seq joined)))))
+    (let [unknown (fact (ports/literal-plan 'unknown ['untyped ['untyped]] {} {}))]
+      (is (= :ad-product-choice-schema
+             (try (ports/join-facts unknown scalar) nil
+                  (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))))
+
+(deftest inactive-opaque-joins-forget-absence-without-inventing-a-tangent
+  (let [absent {:kind :leaf :tag nil :presence :absent}
+        unknown {:kind :leaf :tag nil}
+        fact (fn [leaf] {:schema {:kind :product
+                                 :fields [{:kind :product :fields [leaf]}]}
+                         :active-paths #{}})
+        a (fact absent) u (fact unknown)]
+    (doseq [[left right] [[a u] [u a]]]
+      (let [joined (ports/join-facts left right)]
+        (is (= u joined))
+        (is (= u (ports/join-facts joined a)))
+        (is (= u (ports/join-facts a joined)))))
+    (doseq [[left right] [[(assoc u :active-paths #{[0 0]}) a]
+                         [a (assoc u :active-paths #{[0 0]})]]]
+      (is (= :ad-product-choice-schema
+             (try (ports/join-facts left right) nil
+                  (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))))
+
+(deftest absence-does-not-follow-activity-or-unproved-facts
+  (is (= {:kind :leaf :tag 'double}
+         (get-in (ports/literal-plan 'p [1.0] {1.0 {:presence :absent}} {}) [:schema :fields 0])))
+  (let [fact #(select-keys (ports/literal-plan 'p ['field] {'field %} {'field true})
+                           [:schema :active-paths])
+        declared (with-meta 'field {:raster.type/tag 'double})]
+    (is (= #{} (:active-paths (fact {:value declared :presence :absent}))))
+    (is (= #{[0]} (:active-paths (fact {:value declared :presence :unknown}))))
+    (is (= #{[0]} (:active-paths (fact {:value declared :presence :no-return}))))))
+
+(deftest absence-join-refuses-unsupported-or-malformed-schema-relaxation
+  (let [product #(hash-map :schema {:kind :product :fields [%]} :active-paths #{})
+        absent {:kind :leaf :tag nil :presence :absent}]
+    (is (= :ad-product-choice-schema
+           (try (ports/join-facts (assoc (product absent) :active-paths #{[0]})
+                                  (product {:kind :leaf :tag 'double})) nil
+                (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
+    (doseq [[a b] [[{:kind :leaf :tag nil} {:kind :leaf :tag 'double}]
+                   [absent {:kind :leaf :tag 'doubles}]
+                   [{:kind :leaf :tag 'float} {:kind :leaf :tag 'double}]
+                   [(assoc absent :tag 'float) {:kind :leaf :tag 'double}]
+                   [(assoc absent :unexpected true) {:kind :leaf :tag 'double}]
+                   [absent {:kind :leaf :tag 'double :presence :present}]
+                   [absent {:kind :product :fields []}]]]
+      (is (= :ad-product-choice-schema
+             (try (ports/join-facts (product a) (product b)) nil
+                  (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))))

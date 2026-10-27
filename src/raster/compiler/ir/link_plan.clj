@@ -23,6 +23,7 @@
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.ir.segmented-weighted-reduction :as swr]
             [raster.compiler.ir.write-coverage :as coverage]
+            [raster.compiler.ir.structured-control :as control]
             [raster.compiler.ir.structured-loop-call :as loop-call]))
 
 (def node-roles #{:input :constant :state :output :internal :scratch})
@@ -1231,16 +1232,34 @@
         (emitted-equation/validate-with-result-contracts
          (equation-dispatch/boundary-equation operation *caller-options*) *caller-options*)))))
 
+(defn- soac-complete-writes
+  "Exact retained SOAC coverage, shared by straight-line and structured iteration graphs.
+   Buffers and outputs are actual bindings; graph-owned temporaries grant no outer coverage."
+  [nodes values instance algorithm buffers outputs scalars]
+  (let [resolve-dimension #(kgcall/resolve-integer scalars %)
+        covers? (fn [result node]
+                  (let [capacity (reduce *' 1 (get-in node [:view :shape]))]
+                    (or (coverage/dense-result-covers? algorithm result capacity resolve-dimension)
+                        (coverage/rectangular-effect-covers? algorithm result capacity scalars))))]
+    (into #{}
+          (mapcat (fn [equation]
+                    (mapcat (fn [[result physical]]
+                              (let [base (when (contains? buffers physical)
+                                           (program-value-node! nodes values instance physical
+                                                                (get buffers physical)))
+                                    child (when (contains? outputs result)
+                                            (program-value-node! nodes values instance result
+                                                                 (get outputs result)))]
+                                (keep #(when (and % (covers? result %)) (:id %)) [base child])))
+                            (map vector (nth equation 2) (soac/physical-results algorithm equation)))))
+          (soac/equations algorithm))))
+
 (defn- program-complete-writes [nodes values instance step call-scalars projection]
   (let [operation (:boundary projection)
         algorithm (:algorithm operation)
         scalars (merge (program-extent-values nodes values instance (:buffers step))
                        call-scalars (:scalar-values step))
-        resolve-dimension #(kgcall/resolve-integer scalars %)
-        covers? (fn [result node]
-                  (let [capacity (reduce *' 1 (get-in node [:view :shape]))]
-                    (or (coverage/dense-result-covers? algorithm result capacity resolve-dimension)
-                        (coverage/rectangular-effect-covers? algorithm result capacity scalars))))]
+        resolve-dimension #(kgcall/resolve-integer scalars %)]
     (into (into #{}
                 (keep (fn [[physical extent]]
                         (let [node (program-value-node! nodes values instance physical
@@ -1251,19 +1270,11 @@
                 ;; Retain the prior protected-plan admission. Ordinary SOAC coverage remains
                 ;; semantic below; sharing a report must not promote a new coverage family.
                 (when (swr/plan? algorithm) (:complete-write-domains projection)))
-          (mapcat (fn [equation]
-                    (mapcat (fn [[result physical]]
-                              (let [base (when (contains? (:buffers step) physical)
-                                           (program-value-node! nodes values instance physical
-                                                                (get (:buffers step) physical)))
-                                    child (when (contains? (:outputs step) result)
-                                            (program-value-node! nodes values instance result
-                                                                 (get (:outputs step) result)))]
-                                (keep #(when (and % (covers? result %)) (:id %)) [base child])))
-                            (map vector (nth equation 2) (soac/physical-results algorithm equation)))))
           ;; Ordinary SOAC coverage remains semantic; protected plans require exact schedule
           ;; rederivation above, never a mere graph/ABI write permission.
-          (when (soac/program-form? algorithm) (soac/equations algorithm)))))
+          (when (soac/program-form? algorithm)
+            (soac-complete-writes nodes values instance algorithm
+                                 (:buffers step) (:outputs step) scalars)))))
 
 (defn- validate-program-instance-bindings!
   [nodes values instance]
@@ -1332,10 +1343,16 @@
                         (if (nil? *caller-options*)
                           (loop-call/iteration-binding step iteration)
                           (loop-call/iteration-binding step iteration *caller-options*))]
-                    (program-graph-fact nodes values id [step-index iteration]
-                                        :structured-loop-iteration
-                                        (:graph step) buffers
-                                        (:scalar-values call) scalar-values)))
+                    (let [scalars (merge (program-extent-values nodes values id buffers)
+                                         (:scalar-values call) scalar-values)]
+                      (assoc (program-graph-fact nodes values id [step-index iteration]
+                                                :structured-loop-iteration
+                                                (:graph step) buffers
+                                                (:scalar-values call) scalar-values)
+                             :complete-writes
+                             (soac-complete-writes nodes values id
+                                                  (control/body (get-in step [:schedule :algorithm]))
+                                                  buffers {} scalars)))))
                 (range (min 3 (:trip-count step))))))
       (map-indexed vector (:steps call))))))
 

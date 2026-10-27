@@ -14,7 +14,8 @@
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.extent-proof :as extent-proof]
-            [raster.compiler.ir.kernel-launch :as launch]))
+            [raster.compiler.ir.kernel-launch :as launch]
+            [raster.compiler.ir.semantic-fingerprint :as semantic]))
 
 (defrecord ScalarRegion [parameters body result-dtype])
 (defrecord Reduction [operator identity map-region])
@@ -474,6 +475,69 @@
                   :runtime-parameters (vec runtime-values)
                   :source-operation {:form source-form :output output :intermediates []})
            (assoc-in [:provenance :operation-id] output))))))
+
+(def protected-marker-op 'raster.compiler/segmented-weighted-reduction!)
+
+(def protected-marker-plan-key
+  ;; Preserve the existing retained-source representation when sharing its validator with
+  ;; invocation projection. This is a template, not a separately trusted host-return certificate.
+  :raster.compiler.passes.parallel.segmented-weighted-reduction-fuse/plan)
+
+(defn protected-marker?
+  [form]
+  (and (seq? form) (= protected-marker-op (first form))))
+
+(defn protected-marker-plan
+  "Recover the checked schedule-neutral plan from its existing retained source representation."
+  [marker emitted-dtype]
+  (when-not (and (protected-marker? marker) (= 4 (count marker))
+                 (vector? (nth marker 2)) (vector? (nth marker 3)))
+    (throw (ex-info "segmented weighted-reduction marker has the wrong shape"
+                    {:reason :segmented-reduction-invalid-marker :marker marker})))
+  (let [[_ output inputs runtime-values] marker
+        template (get (meta marker) protected-marker-plan-key)]
+    (when-not (plan? template)
+      (throw (ex-info "segmented weighted-reduction marker lost its proof"
+                      {:reason :segmented-reduction-marker-missing-plan :marker marker})))
+    (when-not (= emitted-dtype (:accumulator-dtype template))
+      (throw (ex-info "segmented weighted-reduction marker dtype differs from its proof"
+                      {:reason :segmented-reduction-marker-dtype-mismatch
+                       :expected (:accumulator-dtype template) :actual emitted-dtype})))
+    (rebind template output inputs runtime-values marker)))
+
+(defn source-buffer-return
+  "Project a protected operation's actual source buffer return, never an outer attribute alone.
+
+   The unique retained binding/site and producing equation must agree with the complete rebound
+   marker plan and its validated physical storage. Source-binding ordinals are not compared with
+   current vector positions: intervening realization can insert bindings. This relation supplies
+   an alias to causal capacity analysis; it is not acquisition or execution-completion evidence."
+  [parallel-program equation]
+  (try
+    (let [algorithm (:algorithm equation)
+          source (:source parallel-program)
+          bindings (when (and (seq? source) (contains? #{'let 'let*} (first source))
+                              (vector? (second source)) (even? (count (second source))))
+                     (partition 2 (second source)))
+          binding (when (= 1 (count (:results equation))) (first (:results equation)))
+          matches (filterv #(= binding (first %)) bindings)
+          owners (filterv #(some #{binding} (:results %)) (:equations parallel-program))
+          expression (when (= 1 (count matches)) (second (first matches)))]
+      (when (and (symbol? binding) (= [:binding binding] (:site equation))
+                 (= [equation] owners)
+                 (or (not (contains? (:attributes equation) :host-binding))
+                     (= binding (get-in equation [:attributes :host-binding])))
+                 (protected-marker? expression)
+                 (equation-boundary? (:values parallel-program) equation algorithm parallel-program)
+                 (semantic/retained-source-equivalent? expression (:source equation))
+                 (semantic/retained-source-equivalent?
+                  expression (get-in algorithm [:source-operation :form]))
+                 (semantic/retained-source-equivalent?
+                  algorithm (protected-marker-plan expression (:accumulator-dtype algorithm))))
+        {:entries (mapv vector (:results equation)
+                        (get-in equation [:attributes :result-storage]))
+         :host-binding binding}))
+    (catch Exception _ nil)))
 
 (defn algebra-key
   "Buffer- and storage-independent computation identity. Physical page routing and cache layout

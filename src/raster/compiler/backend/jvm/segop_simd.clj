@@ -359,7 +359,11 @@
     (not (floating-node-precision-compatible? expr *simd-element-type*))
     false
     (number? expr) true
-    (symbol? expr) true
+    ;; The ordinal varies between SIMD lanes. Treating it as an ordinary
+    ;; scalar would broadcast one value (or reference an unbound source ID).
+    ;; Address uses are admitted by aget-form? below; value uses need a lane
+    ;; ramp representation before this vector schedule can accept them.
+    (symbol? expr) (not= expr idx-sym)
     (some? (aget-form? expr idx-sym)) true
     (soac-dialect/scalar-convert-form? expr)
     (let [{:keys [attributes operand]} (soac-dialect/scalar-convert-parts expr)]
@@ -1000,25 +1004,39 @@
   explicit scalar Fold terms keep the outer map scalar and SIMD-schedule each inner fold. Stable
   indirect reads select hardware vgather from this scheduled scalar region rather than from a raw
   raster.par source form."
-  [segmap out-sym cast & {:keys [store-offset]}]
+  [segmap out-sym cast & {:keys [store-offset array-types]}]
   (if (seq (scalar-folds (:lambda segmap)))
     (compile-fold-map-scalar-loop segmap out-sym cast store-offset)
     (or (when-not store-offset
-          (compile-indexed-gather-segmap segmap out-sym cast))
+          (compile-indexed-gather-segmap segmap out-sym cast array-types))
         (compile-vector-segmap segmap out-sym cast :store-offset store-offset))))
 
 ;; ================================================================
 ;; par/gather → SIMD hardware vgather
 ;; ================================================================
 
+(defn- hardware-gather-storage?
+  "VectorAPI indexed fromArray consumes int[] indices, never long[] or a
+   logical index dtype. All three backing-storage dtypes must be supplied by
+   the enclosing validated program/entry; unknown storage simply abstains."
+  [array-types out src index elem-type]
+  (let [storage-type #(let [type (get array-types %)]
+                       (when (dtype/known? type) (dtype/canon type)))]
+    (and (contains? #{:double :float} elem-type)
+         (= :int (storage-type index))
+         (= elem-type (storage-type src) (storage-type out)))))
+
 (defn compile-par-gather
   "Compile (raster.par/gather out src index n) to a SIMD vgather loop:
      out[j..j+L) = src[index[j..j+L)]
    via DoubleVector.fromArray(species, src, 0, index, j) (hardware vgather),
    stored contiguously into out, with a scalar tail. Flat (non-strided) form
-   only; returns SIMD S-expr or nil. elem-type ∈ {:double :float}."
-  [out src index n elem-type]
-  (let [{:keys [species-expr from-array]} (get simd-type-info elem-type)
+   only; returns SIMD S-expr or nil. elem-type ∈ {:double :float}.
+   The five-argument compatibility entry has no storage authority and declines."
+  ([out src index n elem-type] (compile-par-gather out src index n elem-type nil))
+  ([out src index n elem-type array-types]
+  (when (hardware-gather-storage? array-types out src index elem-type)
+   (let [{:keys [species-expr from-array]} (get simd-type-info elem-type)
         vec-tag     (case elem-type :double 'jdk.incubator.vector.DoubleVector
                           :float 'jdk.incubator.vector.FloatVector)
         species-sym (vary-meta (gensym "sp__") assoc :tag 'jdk.incubator.vector.VectorSpecies)
@@ -1044,7 +1062,7 @@
                                                 (list 'clojure.core/aget src
                                                       (list 'clojure.core/aget index j-sym)))
                                           (list 'recur (list 'inc j-sym)))
-                                    out))))))))
+                                    out))))))))))
 
 (defn- exact-indexed-gather
   "Return [source index-map] for the canonical typed scalar region
@@ -1063,19 +1081,34 @@
                      (= index (descriptor/unwrap-int-cast map-index)))
             [source index-map]))))))
 
+(defn- gather-result-expression [expression elem-type]
+  (loop [expression expression]
+    (let [{:keys [attributes operand]} (soac-dialect/scalar-convert-parts expression)]
+      (if (and attributes (soac-dialect/scalar-convert-attributes? attributes)
+               (= elem-type (:source-dtype attributes) (:target-dtype attributes))
+               (= [:exact :exact] ((juxt :rounding :overflow) attributes)))
+        ;; Only the verified identity at this SAME storage width disappears.
+        ;; In particular Double->Float->Double must keep its inner rounding.
+        (recur operand)
+        expression))))
+
 (defn compile-indexed-gather-segmap
   "Select the JVM hardware-vgather schedule from a typed SegMap's exact scalar region.
 
   This is a schedule recognizer over verified compiler IR, not a second source-language route.
   Repeated source indices are legal because every destination coordinate is written exactly once."
-  [segmap out-sym cast]
-  (let [body (-> (:lambda segmap) clean-dead-bindings bc/desugar-invk)
+  ([segmap out-sym cast] (compile-indexed-gather-segmap segmap out-sym cast nil))
+  ([segmap out-sym cast array-types]
+  (let [elem-type (or (:dtype segmap)
+                      (when (= cast 'float) :float)
+                      (when (= cast 'double) :double))
+        body (-> (:lambda segmap) clean-dead-bindings bc/desugar-invk
+                 (gather-result-expression elem-type))
         index (seg-idx segmap)]
     (when-let [[source index-map] (exact-indexed-gather body index)]
       (compile-par-gather out-sym source index-map (seg-bound segmap)
-                          (or (:dtype segmap)
-                              (when (= cast 'float) :float)
-                              :double)))))
+                          elem-type
+                          array-types)))))
 
 (defn compile-effect-segmap
   "Lower a scheduled explicit-store SegMap to its exact ordered JVM loop.
@@ -1129,7 +1162,8 @@
                                   :emit-region materialize-locals})))
           body (clojure.walk/postwalk
                 (fn [form] (if (= form index) j-sym form))
-                (bc/desugar-invk (or typed-region-body (:lambda segmap))))]
+                (bc/desugar-invk
+                 (soac-dialect/scalar-converts->source (or typed-region-body (:lambda segmap)))))]
       (list 'let* [n-sym (list 'int bound)]
             (list 'loop* [j-sym '(int 0)]
                   (list 'if (ix< j-sym n-sym)
@@ -1160,7 +1194,10 @@
                        " acc=" acc " init=" init
                        " inputs=" (vec (:inputs segred)))))
         {:keys [species-expr from-array broadcast] cf :cast-fn} (get simd-type-info elem-type)]
-    (when (and acc init idx bound lambda)
+    ;; A retained integral reduction is valid IR, but this emitter currently
+    ;; owns only Float/Double species. Decline before constructing vector forms;
+    ;; the caller retains the scalar reduction rather than changing its dtype.
+    (when (and (contains? simd-type-info elem-type) acc init idx bound lambda)
       ;; Unwrap let* in lambda
       (let [[let-bindings inner-body]
             (if (and (seq? lambda) (contains? #{'let* 'let} (first lambda)))

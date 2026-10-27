@@ -259,6 +259,11 @@
         fused (peek (get-in compilation [:emitted :equations]))
         emitted-equation (first (:operations fused))
         artifact (first (:kernels compilation))
+        numerical-ids (mapv :id (remove #(true? (get-in % [:attributes :host-only]))
+                                       (get-in compilation [:semantic :equations])))
+        extent-id (peek (get-in emitted-equation [:graph :arguments]))
+        extent-producer (some #(when (= [extent-id] (:results %)) %)
+                              (get-in compilation [:semantic :equations]))
         in 256
         out 1
         nrows 1
@@ -280,11 +285,16 @@
                              (tree-seq coll? seq
                                        (get-in artifact
                                                [:attributes :kernel-body :operations]))))))
-    (is (= [3 5] (get-in fused [:attributes :emitted-source-equations])))
-    (is (= '[wd wq wsc xd xq y in nrows out nb rstr_extent_3]
+    (is (= 2 (count numerical-ids)))
+    (is (= numerical-ids (get-in fused [:attributes :emitted-source-equations])))
+    (is (true? (get-in extent-producer [:attributes :host-only])))
+    (is (some #(= '(clojure.core/* nrows out) %)
+              (tree-seq coll? seq (:source extent-producer)))
+        "the row extent is the earlier completed source product, not an invented scalar")
+    (is (= (conj '[wd wq wsc xd xq y in nrows out nb] extent-id)
            (get-in emitted-equation [:graph :arguments]))
         "the public graph keeps source scalar order")
-    (is (= '[wd wq wsc xd xq y in nb nrows out rstr_extent_3]
+    (is (= (conj '[wd wq wsc xd xq y in nb nrows out] extent-id)
            (:arguments artifact))
         "the target body may independently order its scalar parameters")
     (is (link-plan/link-plan? plan))

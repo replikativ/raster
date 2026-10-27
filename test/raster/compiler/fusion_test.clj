@@ -1,39 +1,141 @@
 (ns raster.compiler.fusion-test
   (:require [clojure.test :refer [deftest is testing]]
+            [raster.core :as core :refer [deftm]]
+            [raster.compiler.core.method-entry :as entry]
             [raster.compiler.core.op-descriptor :as descriptor]
+            [raster.compiler.pipeline :as pipeline]
             [raster.compiler.passes.scalar.buffer-fuse :as buffer-fuse]
             [raster.compiler.passes.scalar.inline :as inline]
             [raster.compiler.passes.scalar.hoist :as hoist]
             [raster.compiler.ir.soac :as soac]
+            [raster.numeric :as n]
             [raster.analysis.memory :as ma]))
 
 ;; ================================================================
-;; Mock deftm vars for inlining tests
+;; Owned deftm fixtures for inlining tests
 ;; ================================================================
 
-;; Leaf deftm: simple let* body
-(def mock-leaf-fn nil)
-(alter-meta! #'mock-leaf-fn assoc
-             :raster.core/deftm-params '[a b]
-             :raster.core/deftm-walked-body
-             ['(let* [t1 (some-op a b)
-                      t2 (other-op t1)]
-                     t2)])
+(deftm owned-inline-leaf [a :- Double b :- Double] :- Double
+  ;; These typed numerical calls retain selected `.invk` operations in the
+  ;; source body.  They are inside the ordinary whole-call proof domain; raw
+  ;; clojure.core arithmetic deliberately is not.
+  (let [t1 (n/+ a b)
+        t2 (n/* t1 2.0)]
+    t2))
 
-;; Mid-level deftm: calls mock-leaf-fn
-(def mock-mid-fn nil)
-(alter-meta! #'mock-mid-fn assoc
-             :raster.core/deftm-params '[x]
-             :raster.core/deftm-walked-body
-             ['(let* [r (raster.compiler.fusion-test/mock-leaf-fn x 42)]
-                     r)])
+(deftm owned-core-arithmetic-leaf [a :- Double b :- Double] :- Double
+  (let [t1 (clojure.core/+ a b)
+        t2 (clojure.core/* t1 2.0)]
+    t2))
 
-;; Bare expression body (plain call, not let*/loop*/dotimes/do): should NOT be inlined
-(def mock-bare-fn nil)
-(alter-meta! #'mock-bare-fn assoc
-             :raster.core/deftm-params '[x]
-             :raster.core/deftm-walked-body
-             ['(Math/sqrt x)])
+;; A bare host call remains a call: this fixture has a genuine source owner and
+;; selected Method, but its body is outside the ordinary decomposable domain.
+(deftm owned-inline-bare [x :- Double] :- Double
+  (Math/sqrt x))
+
+(deftm owned-inline-direct-owner [p :- Double q :- Double] :- Double
+  (let [x (owned-inline-leaf p q)] x))
+
+(deftm owned-inline-nested-owner [input :- Double] :- Double
+  ;; Keep the admitted call at an original nested lexical source site.  Calls
+  ;; introduced by importing another helper are not occurrence plans owned by
+  ;; this caller and therefore are not a transitive inlining authority.
+  (let [offset 42.0
+        r (owned-inline-leaf input offset)]
+    r))
+
+(deftm owned-inline-chain-mid [x :- Double] :- Double
+  (let [r (owned-inline-leaf x 42.0)] r))
+
+(deftm owned-inline-chain-owner [input :- Double] :- Double
+  (let [r (owned-inline-chain-mid input)] r))
+
+(deftm owned-core-arithmetic-owner [p :- Double q :- Double] :- Double
+  (let [x (owned-core-arithmetic-leaf p q)] x))
+
+(deftm owned-inline-mixed-owner [p :- Double q :- Double] :- Double
+  (let [a (owned-inline-leaf p q)
+        b (owned-inline-bare a)]
+    b))
+
+(defn- owned-inline-expansion [owner helpers]
+  ;; Source readiness is an explicit prerequisite. The expansion itself then
+  ;; consumes one real caller source context and independently retained helper
+  ;; frontends; no Method/body facts are manufactured in test metadata.
+  (doseq [helper helpers]
+    (core/prepare-emission-source-walk! (core/resolve-deftm-var helper)))
+  (let [source-var (core/resolve-deftm-var owner)
+        facts (pipeline/deftm-frontend-facts source-var :double)
+        forms (pipeline/get-walked-body source-var :double)
+        source (if (= 1 (count forms)) (first forms) (list* 'do forms))
+        parameters (:parameters facts)
+        options {:source-var source-var :source-ns (:source-ns facts)
+                 :active-params parameters :public-parameters parameters}]
+    (entry/call-with-definition-inputs
+     #(entry/call-with-independent-definition-inputs
+       (fn []
+         (inline/call-with-source-input-completions
+          source options (fn [] (inline/inline-deftm-calls source))))))))
+
+(defn- executable-nodes [form]
+  (tree-seq #(and (coll? %)
+                  (not (and (seq? %) (contains? '#{quote clojure.core/quote} (first %)))))
+            seq form))
+
+(defn- generic-operation [generic]
+  (let [metadata (meta generic)]
+    (symbol (str (ns-name (:ns metadata))) (str (:name metadata)))))
+
+(defn- contains-owned-call? [form generic]
+  (let [operation (generic-operation generic)]
+    (boolean
+     (some #(= operation (descriptor/semantic-op %))
+           (executable-nodes form)))))
+
+(defn- operation-named [form operation-name]
+  (some (fn [node]
+          (let [operation (descriptor/semantic-op node)]
+            (when (and (symbol? operation) (= operation-name (name operation))) operation)))
+        (executable-nodes form)))
+
+(defn- symbol-used? [form id]
+  (boolean (some #(= id %) (executable-nodes form))))
+
+(defn- retained-leaf-arithmetic-chain [form]
+  ;; Derive operation identities from the genuine walked helper, then find its
+  ;; alpha-renamed lexical dependency anywhere inside the complete imported
+  ;; expression. Placement in one outer result binding is intentionally free.
+  (let [leaf (first (pipeline/get-walked-body
+                     (core/resolve-deftm-var #'owned-inline-leaf) :double))
+        leaf-pairs (partition 2 (second leaf))
+        original-binders (set (map first leaf-pairs))
+        plus (operation-named leaf "+")
+        multiply (operation-named leaf "*")]
+    (when (and plus multiply)
+      (some (fn [scope]
+              (when (and (seq? scope) (contains? '#{let let*} (first scope))
+                         (vector? (second scope)))
+                (let [pairs (vec (partition 2 (second scope)))]
+                  (some (fn [[producer-index [producer producer-init]]]
+                          (some (fn [[consumer-index [consumer consumer-init]]]
+                                  (when (and (< producer-index consumer-index)
+                                             (= plus (operation-named producer-init "+"))
+                                             (= multiply (operation-named consumer-init "*"))
+                                             (symbol-used? consumer-init producer)
+                                             (symbol-used? (drop 2 scope) consumer)
+                                             (not= producer consumer)
+                                             (not (contains? original-binders producer))
+                                             (not (contains? original-binders consumer)))
+                                    {:producer producer :consumer consumer}))
+                                (map-indexed vector pairs)))
+                        (map-indexed vector pairs)))))
+            (executable-nodes form)))))
+
+(defn- assert-compiled-results [owner arguments expected]
+  (doseq [inline? [false true]]
+    (let [compiled (pipeline/compile-aot owner :simd? false :inline? inline?)]
+      (is (= expected (apply compiled arguments))
+          (str "inline?=" inline?)))))
 
 ;; ================================================================
 ;; Register test ops for structural testing
@@ -291,84 +393,41 @@
 ;; ================================================================
 
 (deftest test-inline-deftm-calls
-  (testing "Inlines a deftm call, splicing inner bindings"
-    (let [form '(let* [x (raster.compiler.fusion-test/mock-leaf-fn p q)]
-                      (use-result x))
-          result (inline/inline-deftm-calls form)]
-      ;; Should have 3 bindings: t1_gensym, t2_gensym, x
-      (let [[_ bindings & _body] result
-            pairs (partition 2 bindings)]
-        (is (= 3 (count pairs))
-            "Should have 2 inlined + 1 outer binding")
-        ;; First binding init should substitute params: (some-op p q)
-        (let [[_sym1 init1] (first pairs)]
-          (is (= 'some-op (first init1)))
-          (is (= 'p (second init1)))
-          (is (= 'q (nth init1 2))))
-        ;; Second binding init should reference first binding's renamed sym
-        (let [[sym1 _] (first pairs)
-              [_sym2 init2] (second pairs)]
-          (is (= 'other-op (first init2)))
-          (is (= sym1 (second init2))))
-        ;; Third binding (x) should equal second binding's renamed sym
-        (let [[sym2 _] (second pairs)
-              [sym3 init3] (nth pairs 2)]
-          (is (= 'x sym3))
-          (is (= sym2 init3)))))))
+  (testing "Inlines a real owned deftm call and preserves its result"
+    (let [result (owned-inline-expansion #'owned-inline-direct-owner
+                                         [#'owned-inline-leaf])]
+      (is (not (contains-owned-call? result #'owned-inline-leaf)))
+      (is (some? (retained-leaf-arithmetic-chain result))
+          "the complete imported expression retains its hygienic + to * dependency"))
+    (assert-compiled-results #'owned-inline-direct-owner [3.0 4.0] 14.0))
+  (testing "Core arithmetic outside the whole-call closure retains exact behavior"
+    (assert-compiled-results #'owned-core-arithmetic-owner [3.0 4.0] 14.0)))
 
 (deftest test-inline-nested
-  (testing "Nested deftm chain A→B gets fully inlined"
-    (let [form '(let* [r (raster.compiler.fusion-test/mock-mid-fn input)]
-                      r)
-          result (inline/inline-deftm-calls form)]
-      ;; mock-mid-fn calls mock-leaf-fn, so after 2 passes:
-      ;; t1_gensym, t2_gensym, r_gensym (from leaf), r (outer)
-      ;; Plus the mid-level's inner binding for r
-      (let [[_ bindings & _] result
-            pairs (vec (partition 2 bindings))]
-        ;; Should have at least 4 bindings after full inlining:
-        ;; leaf's t1, leaf's t2, mid's r-inner, outer's r
-        (is (>= (count pairs) 4)
-            "Should have inlined both levels")
-        ;; The deepest init should be (some-op input 42)
-        (let [[_sym init] (first pairs)]
-          (is (= 'some-op (first init))
-              "Deepest binding should be leaf's some-op")
-          (is (= 'input (second init))
-              "First arg should be substituted to 'input")
-          (is (= 42 (nth init 2))
-              "Second arg should be literal 42"))))))
+  (testing "A real owned call at a nested lexical source site is fully inlined"
+    (let [result (owned-inline-expansion #'owned-inline-nested-owner
+                                         [#'owned-inline-leaf])]
+      (is (not (contains-owned-call? result #'owned-inline-leaf)))
+      (is (some? (retained-leaf-arithmetic-chain result))
+          "the nested imported expression retains its hygienic lexical arithmetic"))
+    (assert-compiled-results #'owned-inline-nested-owner [3.0] 90.0))
+  (testing "A real A→B→leaf call chain retains exact behavior"
+    ;; Transitive structural elimination needs an authenticated inherited
+    ;; occurrence plan for calls introduced by an imported helper.  The
+    ;; current whole-call projection does not claim that capability.
+    (assert-compiled-results #'owned-inline-chain-owner [3.0] 90.0)))
 
-(deftest test-inline-no-recursion
-  (testing "Non-let* walked body is NOT inlined"
-    (let [form '(let* [x (raster.compiler.fusion-test/mock-bare-fn input)]
-                      x)
-          result (inline/inline-deftm-calls form)]
-      ;; Should be unchanged — mock-bare-fn has plain call body (Math/sqrt)
-      (let [[_ bindings & _] result
-            pairs (partition 2 bindings)]
-        (is (= 1 (count pairs))
-            "Should still have exactly 1 binding (not inlined)")
-        (let [[sym init] (first pairs)]
-          (is (= 'x sym))
-          (is (= 'raster.compiler.fusion-test/mock-bare-fn (first init))
-              "Call should be preserved unchanged"))))))
+(deftest test-inline-bare-helper-behavior
+  (testing "An owned bare helper remains exact whether retained or legally expanded"
+    (assert-compiled-results #'owned-inline-bare [9.0] 3.0)))
 
 (deftest test-inline-mixed
-  (testing "Mix of inlineable and non-inlineable calls"
-    (let [form '(let* [a (raster.compiler.fusion-test/mock-leaf-fn p q)
-                       b (raster.compiler.fusion-test/mock-bare-fn a)]
-                      b)
-          result (inline/inline-deftm-calls form)]
-      (let [[_ bindings & _] result
-            pairs (vec (partition 2 bindings))]
-        ;; mock-leaf-fn inlined (2 inner + 1 outer = 3), mock-bare-fn kept (1)
-        (is (= 4 (count pairs))
-            "Should have 3 from leaf inlining + 1 bare")
-        ;; Last binding should be the bare call
-        (let [[sym init] (last pairs)]
-          (is (= 'b sym))
-          (is (= 'raster.compiler.fusion-test/mock-bare-fn (first init))))))))
+  (testing "Inlineable and retained real calls coexist"
+    (let [result (owned-inline-expansion #'owned-inline-mixed-owner
+                                         [#'owned-inline-leaf #'owned-inline-bare])]
+      (is (not (contains-owned-call? result #'owned-inline-leaf)))
+      (is (some? (retained-leaf-arithmetic-chain result))))
+    (assert-compiled-results #'owned-inline-mixed-owner [1.0 7.0] 4.0)))
 
 ;; ================================================================
 ;; SOAC modelling of imperative par/map-void! bodies

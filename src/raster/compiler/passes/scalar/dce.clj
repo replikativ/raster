@@ -198,42 +198,39 @@
                       ;; afterward rather than reuse the earlier mutation inventory.
                       (empty? (extract-mutation-targets expr))))))))
 
-(defn- escaping-array-alias-init?
-  "True if `init` binds a local to an ALIAS of escaping/caller-owned array memory:
-   an array-element read `(aget src k)` or a value-class field read `(.-field src)`
-   where `src` is a FREE symbol (a parameter or outer binding, not bound by this
-   let). The bound local then shares identity with memory reachable from the
-   caller, so an in-place mutation of it is externally observable and must survive
-   DCE — exactly the reason function parameters are seeded live. (When `src` is
-   bound locally, the alias doesn't escape and normal in-let liveness applies.)
-   Used to keep a `leaf = (aget params-container k)` + its in-place optimizer
-   update from being silently eliminated.
-
-   `.invk` — raster's DEVIRTUALIZED DISPATCH head — is NOT interop and must be
-   looked THROUGH, not matched on its leading dot. It is the head of essentially
-   every typed call in the IR, and `(second init)` is then the impl SYMBOL (never
-   a let-bound sym), so the old `(.startsWith (name head) \".\")` arm classified
-   EVERY `.invk` binding as an escaping alias and seeded it live. That silently
-   defeated DCE for any in-place-written buffer allocated through a devirtualized
-   call — notably the frozen-weight `dW = (.invk zeros-like-impl …)` of a LoRA /
-   partially-consumed value+grad, whose dead `dgemm-tn!` then survived because its
-   output looked live. Unwrap the `.invk` and classify the REAL op instead: an
-   `aget` through it (the devirtualized `leaf = (aget params-container k)`) is
-   still an escaping alias; an allocation is not."
-  [init bound-syms]
+(defn- array-projection-source
+  "Possible memory reachability from an array/field read's source to its result.
+   This is conservative liveness information, not type or ownership authority.
+   Unwrap .invk before classifying it: ordinary calls/allocations are not field
+   reads merely because their dispatch transport starts with a dot."
+  [init]
   (when (and (seq? init) (symbol? (first init)) (>= (count init) 2))
     (let [head  (first init)
           invk? (= '.invk head)
           op    (if invk? (second init) head)
           src   (if invk? (nth init 2 nil) (second init))]
-      (boolean
+      (when
        (and (symbol? op) (symbol? src)
-            (not (contains? bound-syms src))
             (or ;; .field / .-field / (. obj field) — value-class field access
              (and (not invk?) (.startsWith (name head) "."))
              (descriptor/aget-op? op)
              (when-let [base (descriptor/extract-base-op op)]
-               (descriptor/aget-op? base))))))))
+               (descriptor/aget-op? base))))
+        src))))
+
+(defn- alias-closure
+  "Close identity aliases in this flat lexical region. This is a liveness
+   relation, not a type, freshness or no-alias proof."
+  ([neighbors roots] (alias-closure neighbors #{} roots))
+  ([neighbors closed additional]
+   ;; Backward liveness extends an already closed set. Visit only newly live
+   ;; nodes, rather than rescanning the complete region for every binding.
+   (let [new (clojure.set/difference (set additional) closed)]
+     (loop [pending (seq new) seen (into closed new)]
+       (if-let [id (first pending)]
+         (let [new (clojure.set/difference (get neighbors id #{}) seen)]
+           (recur (concat (next pending) new) (into seen new)))
+         seen)))))
 
 (defn eliminate-dead-bindings
   "Remove dead bindings from a flat let* form.
@@ -256,29 +253,35 @@
         ;; Syntactic free symbols belong to this immutable let only. Mutation/effect queries
         ;; below remain fresh: effect analysis can initialize operation descriptors.
         binding-free-sets (mapv #(free-syms (second %)) pairs)
-        binding-free (apply clojure.set/union #{}
-                            binding-free-sets)
-        let-free (clojure.set/difference
-                  (clojure.set/union body-free binding-free)
-                  bound-syms)
-        live (atom (clojure.set/union body-free let-free))
-        ;; All symbols mutated anywhere in this let (handles aset, par mutations,
-        ;; and inlined optimizer .invk/dotimes bodies via extract-mutation-targets).
-        all-mut-targets (apply clojure.set/union #{}
-                               (map #(extract-mutation-targets (second %)) pairs))
+        ;; A later binding must not mask an outer value used by an earlier
+        ;; initializer (including legal let* shadowing).
+        let-free (second
+                  (reduce (fn [[bound free] [[id _] dependencies]]
+                            [(conj bound id)
+                             (into free (clojure.set/difference dependencies bound))])
+                          [#{} (clojure.set/difference body-free bound-syms)]
+                          (map vector pairs binding-free-sets)))
+        aliases (reduce (fn [neighbors [id expression]]
+                          (if (and (symbol? id) (symbol? expression))
+                            (-> neighbors
+                                (update id (fnil conj #{}) expression)
+                                (update expression (fnil conj #{}) id))
+                            neighbors)) {} pairs)
+        ;; A mutation target can be reachable through a live container. Trace
+        ;; its ancestors only when querying FRESH mutation facts below, rather
+        ;; than caching a target inventory before effect analysis initializes it.
+        ;; Projection ancestry is directed and is not array identity.
+        ancestors (reduce (fn [neighbors [id expression]]
+                            (if-let [source (array-projection-source expression)]
+                              (update neighbors id (fnil conj #{}) source)
+                              neighbors)) aliases pairs)
+        live (atom (alias-closure aliases (clojure.set/union body-free let-free)))
         _ (doseq [[sym expr] pairs]
             (when (or (root-pred sym)
-                      ;; A local that ALIASES escaping array memory (a leaf read
-                      ;; out of a caller-owned params container) and is MUTATED
-                      ;; in-place: its write is externally observable, so seed it
-                      ;; live like a parameter — otherwise the alias binding and
-                      ;; its optimizer update are both silently DCE'd.
-                      (and (contains? all-mut-targets sym)
-                           (escaping-array-alias-init? expr bound-syms))
                       ;; A local mutation set is not an exhaustive effect summary: I/O,
                       ;; global mutation and checked conversions remain observable too.
                       (keep-unconditionally? expr))
-              (swap! live conj sym)))
+              (swap! live #(alias-closure aliases % #{sym}))))
         live-indices (atom #{})]
     (doseq [i (range (dec n) -1 -1)]
       (let [[sym expr] (nth pairs i)
@@ -292,13 +295,14 @@
             ;; For opaque effects (IO, unknown mutations): keep if any free var
             ;; is live (conservative fallback).
             mutates-live? (and has-mutation-targets?
-                               (some @live mutation-targets))
+                               (or (some @live mutation-targets)
+                                   (some @live (alias-closure ancestors mutation-targets))))
             opaque-effect-refs-live? (and effect-binding?
                                           (not has-mutation-targets?)
                                           (some @live (nth binding-free-sets i)))]
         (when (or referenced? opaque-effect-refs-live? mutates-live?)
           (swap! live-indices conj i)
-          (swap! live into (nth binding-free-sets i)))))
+          (swap! live #(alias-closure aliases % (nth binding-free-sets i))))))
     (let [live-pairs (keep-indexed (fn [i pair]
                                      (when (contains? @live-indices i) pair))
                                    pairs)

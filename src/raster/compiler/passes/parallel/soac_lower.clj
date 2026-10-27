@@ -105,29 +105,18 @@
     (let [equation (first (soac-dialect/equations program))
           [_ equation-id results operation] equation
           [_ attributes arrays captures lambda] operation
-          {:keys [locals body-results]} (soac-dialect/lambda-parts lambda)
-          {:keys [elements capture-parameters]} (soac-dialect/parameter-layout equation)
+          facts (soac-dialect/facts program)
+          values (:values facts)
+          physical-results (soac-dialect/physical-results facts equation)
+          {:keys [index region]} (typed-projection/instantiate-map-region equation physical-results)
+          {:keys [locals body-results]} (soac-dialect/lambda-parts (list 'lambda [] region))
           _ (when-not (and (seq results)
                            (= (count results) (count body-results)))
               (throw (ex-info "typed SegMap requires one scalar body result per logical output"
                               {:reason :typed-soac-map-subset
                                :equation equation-id :results results})))
-          index (:index attributes)
-          substitutions
-          (into (zipmap capture-parameters captures)
-                (map (fn [parameter array]
-                       [parameter (list 'clojure.core/aget array index)])
-                     elements arrays))
-          locals (mapv #(update % :init
-                                (fn [init]
-                                  (util/subst-syms substitutions init)))
-                       locals)
-          bodies (mapv #(util/subst-syms substitutions %)
-                       body-results)
+          bodies body-results
           result (first results)
-          facts (soac-dialect/facts program)
-          values (:values facts)
-          physical-results (soac-dialect/physical-results facts equation)
           secondary-stores
           (mapv (fn [_logical-result secondary-result secondary-body]
                   ;; The logical result and its physical storage already own the destination
@@ -362,7 +351,7 @@
               (throw (ex-info "typed effect-map destination storage changed after validation"
                               {:reason :raster/bug :equation equation-id
                                :destinations destinations :physical physical-results})))
-          projected (typed-projection/instantiate-effect-region equation)
+          projected (typed-projection/instantiate-map-region equation physical-results)
           attributes (assoc attributes :index (:index projected))
           {:keys [locals body-results]}
           (soac-dialect/lambda-parts (list 'lambda [] (:region projected)))

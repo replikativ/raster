@@ -9,16 +9,612 @@
             [raster.compiler.ir.axis-map :as axis-map]
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.ir.reduction :as reduction]
+            [raster.compiler.ir.semantic-fingerprint :as semantic]
             [raster.compiler.ir.numerical-contract :as numerics]
             [raster.compiler.ir.contraction-facts :as contraction-facts]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.types :as types]
             [raster.compiler.core.util :as util]
+            [raster.compiler.core.value-completion :as completion]
+            [raster.compiler.core.binding-completion :as binding-completion]
+            [raster.compiler.core.method-entry :as entry]
+            [raster.compiler.core.source-entry-lineage-test :as lineage]
+            [raster.compiler.backend.jvm.bytecode :as bytecode]
+            [raster.compiler.passes.scalar.host-abstract-value :as host-av]
             [raster.compiler.passes.parallel.patterns :as patterns]
             [raster.compiler.passes.parallel.soac-lower :as soac-lower]
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
             [raster.compiler.passes.parallel.typed-soac-projection :as projection]
             [raster.compiler.passes.parallel.typed-soac-route :as route]))
+
+(deftest incoming-extent-aliases-do-not-redefine-scalar-carriers-or-local-producers
+  (let [integral #(av/tensor {:dtype % :shape []})
+        values {'count (integral :int) 'length (integral :long)
+                'later (integral :int) 'floating (integral :double)}
+        descriptions [{:kind :scalar :sym 'alias :expr 'count}
+                      {:kind :map :sym 'result :extent 'count}
+                      {:kind :scalar :sym 'measured :expr '(clojure.core/alength result)
+                       :scalar-dtype :int}]
+        normalize #(#'frontend/normalize-extents %1 %2 values)
+        normalized (normalize descriptions {'count 'length})]
+    (is (= 'length (:extent (second normalized))))
+    (is (= 'count (:expr (first normalized)))
+        "a numerical extent equality is not a scalar carrier conversion")
+    (is (= 'count (:expr (nth normalized 2)))
+        "a later alength also keeps its original Int-producing representative")
+    (doseq [equalities [{'count 'later}
+                        {'count 'later 'later 'length}
+                        {'count 'floating}]]
+      (let [descriptions (conj descriptions {:kind :scalar :sym 'later :expr 9})]
+        (is (= 'count (:extent (second (normalize descriptions equalities))))
+            "no path through a local or nonintegral producer justifies an incoming extent")))
+    (is (= 'count (:extent (second (normalize descriptions {'count 'unknown})))))
+    (let [shadowed (into [{:kind :scalar :sym 'count :expr 3}] descriptions)]
+      (is (= 3 (:extent (nth (normalize shadowed {'count 'length}) 2)))
+          "the actual preceding source binding, not its shadowed entry fact, owns the extent"))))
+
+(deftest extent-normalization-retains-a-causal-resumable-prefix
+  (let [descriptions [{:kind :scalar :sym 'alias :expr 'count}
+                      {:kind :map :sym 'mapped :extent 'alias}
+                      {:kind :scalar :sym 'later :expr 9}
+                      {:kind :scalar :sym 'measured :expr '(clojure.core/alength mapped)}
+                      {:kind :map :sym 'result :extent 'measured}]
+        values (zipmap '[count later] (repeat (av/tensor {:dtype :long :shape []})))
+        equalities {'count 'later}
+        context (#'frontend/extent-normalization-context (set (map :sym descriptions))
+                                                         equalities values)
+        initial {:descriptions [] :extents {} :scalar-representatives {}}
+        advance (partial #'frontend/advance-extent-normalization context)
+        prefix (reduce advance initial (take 2 descriptions))
+        complete (reduce advance prefix (drop 2 descriptions))
+        calls (atom 0)
+        transfer @#'frontend/advance-extent-normalization
+        ordinary (with-redefs-fn
+                   {#'frontend/advance-extent-normalization
+                    (fn [& arguments] (swap! calls inc) (apply transfer arguments))}
+                   #(#'frontend/normalize-extents descriptions equalities values))]
+    (is (= 'count (get-in prefix [:descriptions 1 :extent]))
+        "a future local cannot become the representative of an earlier traversal")
+    (is (not (contains? (:scalar-representatives prefix) 'later)))
+    (is (not (contains? (:scalar-representatives prefix) 'measured)))
+    (is (= 'count (get-in complete [:descriptions 3 :expr])))
+    (is (= 'count (get-in complete [:descriptions 4 :extent])))
+    (is (= ordinary (:descriptions complete)))
+    (is (= (count descriptions) @calls)
+        "the ordinary path normalizes each binding once, not every growing prefix")))
+
+(deftest ordered-source-fold-preserves-the-original-two-phase-analysis
+  (let [original-schedule
+        (fn [pairs dtype arrays scalars segmented? equalities values]
+          (#'frontend/normalize-extents
+           (:descriptions
+            (reduce (partial #'frontend/advance-source-description dtype segmented?)
+                    (#'frontend/initial-source-description-state arrays scalars)
+                    (map-indexed vector pairs)))
+           equalities values))]
+    (doseq [[source options]
+            [['(let* [scratch (clojure.core/float-array n)
+                      alias scratch
+                      size (clojure.core/long (clojure.core/alength alias))
+                      fill (raster.par/map! alias i size float (clojure.core/aget x i))
+                      result (raster.par/pmap j size float (clojure.core/aget alias j))]
+                 result)
+              {:dtype :float :array-types {'x :float} :scalar-types {'n :long}}]
+             ['(let* [alias count
+                      result (raster.par/pmap i alias float (clojure.core/aget x i))] result)
+              {:dtype :float :array-types {'x :float}
+               :scalar-types {'count :int 'length :long}
+               :values {'count (av/tensor {:dtype :int :shape []})
+                        'length (av/tensor {:dtype :long :shape []})}
+               :shape-equalities {'count 'length}}]
+             ['(let* [out (clojure.core/float-array n)
+                      fill (raster.par/map! out i n float (clojure.core/aget wide i))] out)
+              {:dtype :double :array-types {'wide :double} :scalar-types {'n :long}
+               :preserve-declared-array-storage? true}]
+             ['(let* [y (raster.par/pmap i n float (clojure.core/aget x i))
+                      observe (clojure.core/println y)
+                      z (raster.par/pmap j n float (+ (clojure.core/aget y j) 1.0))] z)
+              {:dtype :float :array-types {'x :float} :scalar-types {'n :long}}]]]
+      (let [actual (frontend/form->program source options)
+            analyze @#'frontend/analyze-source-descriptions
+            expected (with-redefs-fn
+                       {#'frontend/analyze-source-descriptions
+                        (fn [& arguments]
+                          ;; Replace the description schedule, not the independent
+                          ;; causal fact transfer now consumed by production.
+                          (assoc (apply analyze arguments) :descriptions
+                                 (apply original-schedule (take 7 arguments))))}
+                       #(frontend/form->program source options))]
+        (is (some? actual) (pr-str source))
+        (is (semantic/equivalent? actual expected)
+            "interleaving must preserve types, extents, effects, storage and source metadata")))))
+
+(deftest causal-equations-are-reused-unless-storage-selection-changes
+  (doseq [[capacity expected-constructions] [[2 1] [8 2]]]
+    (let [source '(let* [a (raster.par/pmap i 2 float (aget input i))
+                        final (raster.par/pmap j 1 float 0.0)] a)
+          calls (atom {})
+          project @#'frontend/operation-equation
+          projection (with-redefs-fn
+                       {#'frontend/operation-equation
+                        (fn [description]
+                          (swap! calls update (:id description) (fnil inc 0))
+                          (project description))}
+                       #(frontend/form->program-components
+                         source {:dtype :float :array-types {'input :float}
+                                 :values {'input (av/tensor {:dtype :float :shape [capacity]})}
+                                 :lexical-inputs '[input] :segmented-plans? true}))]
+      (is (some? (:typed-program projection)))
+      (is (= {0 expected-constructions 1 1} @calls)
+          "one early projection is reused; changed indexed storage needs exactly one rebuild")
+      (is (= [2] (get-in projection [:preceding-values 1 'a :shape])))
+      (is (= [capacity] (get-in projection [:preceding-values 1 'input :shape]))))))
+
+(defn- discarded-causal-observation [x] x)
+
+(deftest unavailable-early-projection-does-not-reject-final-storage-admission
+  (let [source '(let* [a (raster.par/pmap i 2 float (aget input i))
+                      final (raster.par/pmap j 1 float 0.0)] a)
+        options {:dtype :float :array-types {'input :float}
+                 :values {'input (av/tensor {:dtype :float :shape [8]})}
+                 :lexical-inputs '[input] :segmented-plans? true}
+        ordinary (frontend/form->program-components source options)
+        calls (atom 0)
+        owner (atom {:static [] :values []})
+        unused #'discarded-causal-observation
+        project @#'frontend/operation-equation
+        delayed (binding [entry/*emission-inputs* owner]
+                  (with-redefs-fn
+                  {#'frontend/operation-equation
+                   (fn [description]
+                     (if (and (= 0 (:id description)) (= 1 (swap! calls inc)))
+                       (do
+                         (entry/observe-definition-input! unused (.ns ^clojure.lang.Var unused)
+                                                          'discarded-causal-observation)
+                         (throw (ex-info "requires later storage classification"
+                                         {:reason :typed-soac-stable-read-alias})))
+                       (project description)))}
+                  #(frontend/form->program-components source options)))]
+    (is (some? (:typed-program delayed)))
+    (is (semantic/equivalent? (:typed-program ordinary) (:typed-program delayed)))
+    (is (not (contains? (:definition-proofs @owner) unused))
+        "discarded early projection observations are not final executable dependencies")
+    (is (not (contains? (get-in delayed [:preceding-values 1]) 'a))
+        "failed optional construction supplies no causal fact")))
+
+(deftest source-projection-validation-does-not-multiply-inherited-history
+  (let [visits (fn [size]
+                 (let [checks (atom 0)
+                       inherited (reify entry/RetainedProducerInput
+                                   (assert-producer-current! [this] (swap! checks inc) this))
+                       owner (atom {:static [] :values [] :producer-inputs [inherited]})
+                       ids (mapv #(symbol (str "a" %)) (range size))
+                       source (list 'let* (vec (mapcat (fn [id]
+                                                        [id '(raster.par/pmap i 1 double 0.0)]) ids))
+                                    (peek ids))]
+                   (binding [entry/*emission-inputs* owner]
+                     (is (some? (:typed-program
+                                 (frontend/form->program-components
+                                  source {:dtype :double :segmented-plans? true})))))
+                   @checks))
+        small (visits 2) large (visits 16)]
+    (is (pos? small) "the complete projection still validates inherited dependencies")
+    (is (= small large) "more numerical bindings do not revalidate the entire inherited history")))
+
+(deftest early-projection-ownership-failures-and-owner-drift-refuse
+  (let [source '(let* [a (raster.par/pmap i 1 double 0.0)] a)
+        options {:dtype :double :segmented-plans? true}
+        project @#'frontend/operation-equation
+        reason (fn [f] (try (f) nil (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))]
+    (is (= :stale-definition-proof-input
+           (with-redefs-fn {#'frontend/operation-equation
+                           (fn [_] (throw (ex-info "stale projection" {:reason :stale-definition-proof-input})))}
+             #(reason (fn [] (frontend/form->program-components source options))))))
+    (let [owner (atom {:static [] :values []})]
+      (binding [entry/*emission-inputs* owner]
+        (is (= :unstable-definition-proof-input
+               (with-redefs-fn {#'frontend/operation-equation
+                               (fn [description]
+                                 (swap! owner assoc :competing-owner-update true)
+                                 (project description))}
+                 #(reason (fn [] (frontend/form->program-components source options))))))))))
+
+(deftest whole-source-decline-discards-successful-nested-observations
+  (let [owner (atom {:static [] :values []})
+        observed? (atom false)
+        unused #'discarded-causal-observation
+        project @#'frontend/operation-equation
+        nested '(let* [inner (raster.par/pmap j 1 double 1.0)] inner)
+        source '(let* [a (raster.par/pmap i 1 double 0.0)
+                       unsupported (if flag (raster.par/pmap k 1 double 2.0) nil)] a)
+        options {:dtype :double :segmented-plans? true}
+        result (binding [entry/*emission-inputs* owner]
+                 (with-redefs-fn
+                   {#'frontend/operation-equation
+                    (fn [description]
+                      (cond
+                        (= [0.0] (:bodies description))
+                        (do
+                          (is (some? (:typed-program (frontend/form->program-components nested options))))
+                          (reset! observed? (contains? (:definition-proofs @entry/*emission-inputs*) unused)))
+                        (= [1.0] (:bodies description))
+                        (entry/observe-definition-input! unused (.ns ^clojure.lang.Var unused)
+                                                         'discarded-causal-observation))
+                      (project description))}
+                   #(frontend/form->program-components source options)))]
+    (is @observed? "the successful nested batch actually adopted its dependency locally")
+    (is (nil? result) "the enclosing hidden parallel region is still unsupported")
+    (is (not (contains? (:definition-proofs @owner) unused))
+        "whole-query decline publishes none of the successful nested observations")))
+
+(deftest successful-causal-observations-must-still-be-current-at-publication
+  (let [owner (atom {:static [] :values []})
+        unused #'discarded-causal-observation original-root @unused
+        observed? (atom false)
+        project @#'frontend/operation-equation
+        source '(let* [a (raster.par/pmap i 1 double 0.0)
+                       b (raster.par/pmap j 1 double 2.0)] b)
+        reason (try
+                 (binding [entry/*emission-inputs* owner]
+                   (with-redefs-fn
+                     {#'frontend/operation-equation
+                      (fn [description]
+                        (if (= 0 (:id description))
+                          (do
+                            (entry/observe-definition-input! unused (.ns ^clojure.lang.Var unused)
+                                                             'discarded-causal-observation)
+                            (reset! observed? true))
+                          (alter-var-root unused (constantly (fn [_] :changed))))
+                        (project description))}
+                     #(frontend/form->program-components source {:dtype :double :segmented-plans? true})))
+                 nil
+                 (catch clojure.lang.ExceptionInfo exception (:reason (ex-data exception)))
+                 (finally (alter-var-root unused (constantly original-root))))]
+    (is @observed?)
+    (is (= :stale-definition-proof-input reason))
+    (is (not (contains? (:definition-proofs @owner) unused))
+        "the stale batch never replaces the public owner's earlier history")))
+
+(deftest description-only-analysis-does-not-construct-numerical-equations
+  (let [source '(let* [a (raster.par/pmap i 2 float (aget input i))] a)]
+    (with-redefs-fn {#'frontend/operation-equation
+                    (fn [& _] (throw (AssertionError. "description-only equation construction")))}
+      (fn []
+        (let [analysis (frontend/source-fragment-analysis
+                        source {:dtype :float :array-types {'input :float}})]
+          (is (= :map (-> analysis :descriptions first :kind)))
+          (is (nil? (frontend/coverage-decline
+                     source {:dtype :float :array-types {'input :float}}))))))))
+
+(deftest cached-equations-cannot-ignore-description-metadata-changes
+  (let [source '(let* [a (raster.par/pmap i 2 float (aget input i))] a)
+        original (first (:descriptions (frontend/source-fragment-analysis
+                                       source {:dtype :float :array-types {'input :float}})))
+        changed (update-in original [:bodies 0] vary-meta assoc :raster.type/tag 'Object)
+        cached (#'frontend/operation-equation original)
+        calls (atom 0)
+        project @#'frontend/operation-equation]
+    (is (= original changed) "ordinary Clojure equality ignores the changed metadata")
+    (with-redefs-fn {#'frontend/operation-equation
+                    (fn [description] (swap! calls inc) (project description))}
+      #(do
+         (is (identical? cached (#'frontend/projected-operation-equation
+                                {0 {:description original :equation cached}} original)))
+         (#'frontend/projected-operation-equation
+          {0 {:description original :equation cached}} changed)))
+    (is (= 1 @calls) "only the identical immutable description may reuse its equation")))
+
+(deftest normalized-fragment-locals-avoid-nontextual-incoming-identities
+  (let [incoming '#{rstr_extent_0 rstr_copy_effect_0_0 rstr_copy_index_0_0}
+        options {:dtype :double :array-types {'input :double}
+                 :scalar-types {'count :long}
+                 :values (merge {'input (av/tensor {:dtype :double :shape ['rstr_extent_0]})}
+                                (zipmap (disj incoming 'rstr_extent_0)
+                                        (repeat (av/tensor {:dtype :long :shape []}))))}
+        sources ['(let* [result (raster.par/pmap index (+ count 1) double
+                                               (clojure.core/aget input index))] result)
+                 '(let* [copy (clojure.core/aclone input)] copy)]]
+    (doseq [source sources
+            :let [normalized (frontend/normalize-source source options)
+                  binders (set (take-nth 2 (second normalized)))]]
+      (is (not= source normalized))
+      (is (not-any? binders incoming)
+          "a fragment cannot shadow an enclosing value used only by retained shape facts"))
+    (let [normalized (frontend/normalize-source (second sources) options)
+          copy-map (some (fn [[_ expression]]
+                           (when (and (seq? expression)
+                                      (= 'raster.par/map! (first expression))) expression))
+                         (partition 2 (second normalized)))]
+      (is (some? copy-map))
+      (is (not (contains? incoming (nth copy-map 2)))))))
+
+(deftest abstract-shape-names-do-not-replace-source-length-computations
+  (let [descriptions [{:kind :scalar :sym 'measured
+                      :expr '(clojure.core/alength input) :scalar-dtype :int}]
+        normalize (fn [values descriptions]
+                    (#'frontend/normalize-extents descriptions {} values))]
+    (is (= '(clojure.core/alength input)
+           (:expr (first (normalize {'input (av/tensor {:dtype :double :shape '[unknown]})}
+                                    descriptions)))))
+    (is (= '(clojure.core/alength input)
+           (:expr (first (normalize {'input (av/tensor {:dtype :double :shape '[later]})
+                                     'later (av/tensor {:dtype :int :shape []})}
+                                    (conj descriptions {:kind :scalar :sym 'later :expr 3}))))))
+    (is (= 3 (:expr (first (normalize {'input (av/tensor {:dtype :double :shape [3]})}
+                                     descriptions)))))))
+
+(deftest reference-entry-projection-requires-the-actual-unshadowed-formal
+ (doseq [contract-kind [:boxed-entry :method-input]]
+  (let [{:keys [source]} (#'lineage/fresh-entry)
+        parameters '[values count scale reference]
+        scope (:ns (meta source))
+        array-class (.arrayType Double/TYPE)
+        checked (fn [carrier operand]
+                  (completion/complete-value
+                   (case contract-kind
+                     :boxed-entry (completion/bytecode-boxed-parameter-contract carrier)
+                     :method-input (completion/bytecode-reference-input-contract
+                                    carrier (completion/bytecode-operand-context {:object-result? true})))
+                   operand))
+        baseline-options {:dtype :double :source-ns scope :lexical-inputs parameters
+                          :array-types {'values :double} :scalar-types {'count :long 'scale :double}}
+        normalize (fn [body changes]
+                    (entry/call-with-definition-inputs
+                     #(frontend/normalize-source
+                       body (merge baseline-options
+                                   {:source-var source
+                                    :source-binding-context
+                                    (binding-completion/capture-resolution-context
+                                     #'bytecode/binding-completion-plan)} changes))))
+        binder (with-meta 'array-input {:tag 'doubles :raster.type/tag 'doubles})
+        body (list 'let* [binder (checked array-class 'values)] 'array-input)
+        projected (normalize body {})]
+    (is (= 'values (get (into {} (map vec) (partition 2 (second projected))) 'array-input)))
+    (is (= 'array-input (last projected)) "the existing alias/return path owns the public projection")
+    (let [expression (vary-meta (checked array-class 'values)
+                                assoc :raster.effect/preserve-evaluation true)
+          retained (normalize (list 'let* [binder expression] 'values) {})
+          [id identity] (take 2 (second retained))]
+      (is (= 'java.lang.Object (:tag (meta id))))
+      (is (= 'doubles (:raster.type/tag (meta id))))
+      (is (= 'values (:operand (completion/object-input-parts identity))))
+      (is (true? (:raster.effect/preserve-evaluation (meta identity))))
+      (is (= (case contract-kind
+               :boxed-entry :jvm-bytecode-boxed-parameter-input
+               :method-input :jvm-bytecode-reference-input)
+             (:source-context (:contract (completion/reference-input-parts expression))))
+          "the original checked source remains unchanged"))
+    (let [snapshot (with-meta 'snapshot {:tag 'Object :raster.type/tag 'doubles})
+          object-input #(completion/complete-value completion/object-input-contract %)
+          chained (list 'let* [snapshot (object-input 'values)
+                              binder (checked array-class 'snapshot)] 'array-input)
+          result (normalize chained {})]
+      (is (not-any? completion/reference-input-parts (take-nth 2 (rest (second result))))
+          "the actual entry Class survives an exact, independently checked Object alias")
+      (doseq [blocked [(list 'let* [(with-meta 'snapshot {:tag 'String :raster.type/tag 'doubles})
+                                    (object-input 'values)
+                                    binder (checked array-class 'snapshot)] 'array-input)
+                       (list 'let* [snapshot (vary-meta (object-input 'values)
+                                                       assoc :raster.effect/preserve-evaluation true)
+                                    binder (checked array-class 'snapshot)] 'array-input)
+                       (list 'let* [binder (checked array-class 'snapshot)
+                                    snapshot (object-input 'values)] 'array-input)]]
+        (is (some completion/reference-input-parts
+                  (take-nth 2 (rest (second (normalize blocked {})))))
+            "a checked/effectful/future intermediate cannot establish formal provenance")))
+    (doseq [[candidate changes]
+            [[body {:lexical-inputs '[reference count scale values]}]
+             [body {:array-types {'values :float}}]
+             [body {:source-var nil}]
+             [(list 'let* [binder (checked array-class 'reference)] 'array-input)
+              {:array-types {'values :double 'reference :double}}]
+             [(list 'let* [binder (checked (.arrayType Float/TYPE) 'values)] 'array-input) {}]
+             [(list 'let* [(with-meta 'array-input {:tag 'String})
+                          (checked array-class 'values)] 'array-input) {}]
+             [(list 'let* ['values '(clojure.core/float-array 1)
+                          binder (checked array-class 'values)] 'array-input) {}]
+             [(list 'let* [binder (vary-meta (checked array-class 'values)
+                                            assoc :raster.effect/source-reference-cast true)]
+                    'array-input) {}]
+             [(list 'let* [binder (completion/complete-value
+                                  (completion/bytecode-reference-input-contract
+                                   array-class (completion/bytecode-operand-context {:void-context true}))
+                                  'values)] 'array-input) {}]]]
+      (let [unchanged (frontend/normalize-source candidate (merge baseline-options changes))
+            result (normalize candidate changes)]
+        (is (= unchanged result)
+            "declarations, incompatible storage, Object formals, shadowing and independent checks cannot grant the projection")))
+    (is (nil? (entry/source-var-body-entry-carriers source))
+        "carrier evidence remains an owned compiler query, not a process-wide hint"))))
+
+(deftest dead-object-snapshots-respect-lexical-binding-completion
+  (let [scope (the-ns 'raster.compiler.passes.parallel.typed-soac-frontend-test)
+        object-input #(completion/complete-value completion/object-input-contract %)
+        snapshot (with-meta 'snapshot {:tag 'Object})
+        normalize (fn [source]
+                    (entry/call-with-definition-inputs
+                     #(frontend/normalize-source
+                       source {:source-ns scope :lexical-inputs '[x calls]
+                               :source-binding-context
+                               (binding-completion/capture-resolution-context
+                                #'bytecode/binding-completion-plan)})))
+        source (list 'let*
+                     ['producer '(do (clojure.core/swap! calls clojure.core/conj :producer) x)
+                      snapshot (object-input 'producer)
+                      'after '(clojure.core/swap! calls clojure.core/conj :after)]
+                     'producer)
+        normalized (normalize source)
+        original-pairs (mapv vec (partition 2 (second source)))
+        compile-source (fn [source]
+                         (binding [*ns* scope]
+                           (eval (list 'fn* '[x calls]
+                                       (completion/project-to-jvm-source source)))))
+        original (compile-source source)
+        optimized (compile-source normalized)]
+    (is (= [(first original-pairs) (last original-pairs)]
+           (mapv vec (partition 2 (second normalized))))
+        "only the dead snapshot disappears; its eager producer and later effects remain verbatim")
+    (doseq [value [nil (Object.) (Double/valueOf -0.0) Double/NaN]]
+      (let [left (atom []) right (atom [])]
+        (is (identical? value (original value left)))
+        (is (identical? value (optimized value right)))
+        (is (= [:producer :after] @left @right))))
+    (let [source (list 'let*
+                       ['producer '(do (clojure.core/swap! calls clojure.core/conj :producer)
+                                       (clojure.core/double x))
+                        snapshot (object-input 'producer)] 0.0)
+          normalized (normalize source)]
+      (doseq [program [source normalized]]
+        (let [events (atom [])]
+          (is (thrown? NullPointerException ((compile-source program) nil events)))
+          (is (= [:producer] @events))))
+      (is (= (first (partition 2 (second source)))
+             (first (partition 2 (second normalized))))
+          "the snapshot is not permission to eliminate an eager checked producer"))
+    (doseq [binder [(with-meta 'snapshot {:tag 'String})
+                    (with-meta 'snapshot {:tag 'doubles})
+                    (with-meta 'snapshot {:tag 'not-a-class})
+                    (with-meta 'snapshot {:tag 'IFn__double})
+                    (with-meta 'snapshot {:tag 'Object :raster.effect/preserve-evaluation true})]]
+      (let [source (list 'let* ['producer 'x binder (object-input 'producer)] 'producer)]
+        (is (= source (normalize source)) "a dead result does not waive the binder's own obligations")))
+    (doseq [[binder operand body]
+            [[snapshot 'future 'x]
+             [snapshot 'unbound-global 'x]
+             [snapshot '(clojure.core/double x) 'x]
+             [snapshot 'x 'snapshot]
+             [(with-meta 'count {:tag 'Object}) 'x 'count]
+             [(with-meta '.snapshot {:tag 'Object}) 'x '.snapshot]]]
+      (let [source (list 'clojure.core/let [binder (object-input operand)] body)]
+        (is (= source (normalize source))
+            "liveness includes core-spelled locals; unsupported symbol spellings abstain")))
+    (let [source (list 'let* ['producer 'x snapshot (object-input 'producer)
+                             'still-reads 'snapshot] 'producer)]
+      (is (= source (normalize source))
+          "deadness uses the original suffix, not transitive producer DCE"))))
+
+(deftest object-buffer-storage-identity-does-not-erase-evaluation-obligations
+  (let [object-input #(completion/complete-value completion/object-input-contract %)
+        flagged (vary-meta (object-input 'x) assoc :raster.effect/preserve-evaluation true)
+        source (list 'let* ['blocked flagged 'chained (object-input 'blocked)
+                           'allowed (object-input 'x)] '[chained allowed])
+        normalized (frontend/normalize-source
+                    source {:dtype :double :array-types {'x :double} :lexical-inputs '[x]})
+        pairs (into {} (map vec) (partition 2 (second normalized)))]
+    (is (completion/object-input-parts (get pairs 'blocked)))
+    (is (true? (:raster.effect/preserve-evaluation (meta (get pairs 'blocked)))))
+    (is (= 'blocked (:operand (completion/object-input-parts (get pairs 'chained))))
+        "the blocked completion cannot establish an eliminable downstream alias")
+    (is (= 'x (get pairs 'allowed)))
+    (is (= '[chained x] (last normalized))
+        "an independent admitted alias cannot launder the blocked alias at return")))
+
+(deftest object-buffer-aliases-use-the-actual-destination-before-later-uses
+  (let [object-input #(completion/complete-value completion/object-input-contract %)
+        source (list 'let*
+                     ['written '(raster.par/map! out i n double (clojure.core/aget x i))
+                      'aliased (object-input 'written) 'chained 'aliased
+                      'second '(raster.par/map! out2 i n double (clojure.core/aget chained i))]
+                     'chained)
+        options {:dtype :double :array-types {'x :double 'out :double 'out2 :double}
+                 :scalar-types {'n :long} :lexical-inputs '[x out out2 n]
+                 :values (zipmap '[x out out2] (repeat (av/tensor {:dtype :double :shape ['capacity]})))}
+        observed (atom []) query host-av/binding-buffer-alias-source
+        normalized (with-redefs [host-av/binding-buffer-alias-source
+                                 (fn [context id expression]
+                                   (when-let [parts (completion/object-input-parts expression)]
+                                     (swap! observed conj [(:operand parts)
+                                                           (get-in context [:analysis :values (:operand parts) :shape])]))
+                                   (query context id expression))]
+                     (frontend/normalize-source source options))
+        bindings (into {} (map vec) (partition 2 (second normalized)))]
+    (is (= 'out (get bindings 'aliased) (get bindings 'chained)))
+    (is (= #{'out} (ir-par/collect-aget-arrays (get bindings 'second))))
+    (is (= 'out (last normalized)))
+    (is (= [['out ['capacity]]] @observed)
+        "the prefix write's logical n-elements never replace the destination's full capacity")
+    (is (completion/object-input-parts
+         (get (into {} (map vec) (partition 2 (second source))) 'aliased))
+        "normalization never mutates the retained original source")))
+
+(deftest object-buffer-alias-normalization-covers-tail-uses-without-capturing-locals
+  (let [object-input #(completion/complete-value completion/object-input-contract %)
+        bindings ['written '(raster.par/map! out i n double (clojure.core/aget x i))
+                  'aliased (object-input 'written)]
+        options {:dtype :double :array-types {'x :double 'out :double 'out2 :double}
+                 :scalar-types {'n :long} :lexical-inputs '[x out out2 n]}
+        tail '(raster.par/map! out2 i n double (clojure.core/aget aliased i))
+        normalized (frontend/normalize-source (list 'let* bindings tail) options)
+        scoped (frontend/normalize-source
+                (list 'let* bindings '(vector aliased (fn* [aliased] aliased))) options)
+        scoped-body (last scoped)]
+    (is (= #{'out} (ir-par/collect-aget-arrays (last normalized))))
+    (is (= 'out (second scoped-body)))
+    (is (empty? (util/free-syms (nth scoped-body 2))))
+    (is (not (some #{'out} (tree-seq coll? seq (nth scoped-body 2)))))
+    (is (= 'out (get (into {} (map vec) (partition 2 (second scoped))) 'aliased))))
+  (let [scope (create-ns (gensym "raster.test.alias-scope-"))
+        original (double-array [1.0])
+        replacement (double-array [2.0])
+        global (intern scope 'future-buffer original)]
+    (try
+      (binding [*ns* scope]
+        (clojure.core/refer 'clojure.core)
+        (let [source (list 'let*
+                           ['saved 'future-buffer
+                            (with-meta 'future-buffer {:tag 'doubles}) '(clojure.core/double-array 1)
+                            'changed '(replace-global!)
+                            'aliased (completion/complete-value completion/object-input-contract 'x)]
+                           'saved)
+              normalized (frontend/normalize-source
+                          source {:dtype :double :array-types {'x :double}
+                                  :lexical-inputs '[x replace-global!]})
+              bindings (into {} (map vec) (partition 2 (second normalized)))
+              execute (eval (list 'fn* '[x replace-global!] normalized))]
+          (is (= 'x (get bindings 'aliased)))
+          (is (= 'saved (last normalized)))
+          (is (identical? original
+                          (execute (double-array [3.0])
+                                   #(alter-var-root global (constantly replacement))))
+              "accepting an unrelated buffer alias must not reread a captured global at return")
+          (is (identical? replacement @global))))
+      (finally (remove-ns (ns-name scope))))))
+
+(deftest object-buffer-aliases-inherit-only-certified-buffer-return-kinds
+  (let [object-input #(completion/complete-value completion/object-input-contract %)
+        options {:dtype :double :array-types {'x :double 'out :double}
+                 :scalar-types {'n :long} :lexical-inputs '[x out n]}
+        functional (frontend/normalize-source
+                    (list 'let* ['result '(raster.par/pmap i n double (clojure.core/aget x i))
+                                 'aliased (object-input 'result)] 'aliased) options)
+        effect (frontend/normalize-source
+                (list 'let* ['result '(raster.par/map-void! i n (clojure.core/aset out i 1.0))
+                             'aliased (object-input 'result) 'chained 'aliased] 'chained)
+                (assoc options :values (zipmap '[result aliased chained]
+                                                (repeat (av/tensor {:dtype :double :shape ['n]})))))
+        allocated (frontend/normalize-source
+                   (list 'let* ['result '(raster.arrays/zeros-like x n)
+                                'aliased (object-input 'result)] 'aliased) options)
+        functional-bindings (into {} (map vec) (partition 2 (second functional)))
+        allocation-bindings (into {} (map vec) (partition 2 (second allocated)))
+        effect-bindings (into {} (map vec) (partition 2 (second effect)))]
+    (is (= 'result (get functional-bindings 'aliased)))
+    (is (= 'result (get allocation-bindings 'aliased))
+        "source-shaped allocators use the existing allocation contract, not a primitive-constructor tag")
+    (doseq [[expression accepted?]
+            [[(with-meta '(.invk raster.arrays/zeros-like_m_doubles_long-impl x n)
+                         {:raster.op/original 'raster.arrays/zeros-like}) true]
+             ['(raster.arrays/zeros-like x) true]
+             ['(raster.arrays/zeros-like x out) false]
+             ['(raster.arrays/zeros-like x n 0) false]]]
+      (let [normalized (frontend/normalize-source
+                        (list 'let* ['result expression 'aliased (object-input 'result)] 'aliased)
+                        options)
+            rhs (get (into {} (map vec) (partition 2 (second normalized))) 'aliased)]
+        (is (= accepted? (= 'result rhs))
+            "devirtualized calls share the allocation grammar; array lengths and wrong arities do not")))
+    (is (completion/object-input-parts (get effect-bindings 'aliased)))
+    (is (not= 'out (get effect-bindings 'chained)))))
 
 (deftest shared-scalar-projector-retains-result-type-and-ordered-captures
   (let [expression (with-meta '(clojure.core/+ z a) {:raster.type/tag 'float})
@@ -230,6 +826,26 @@
     (is (not-any? #(and (seq? %) (= 'clojure.core/alength (first %)))
                   (tree-seq coll? seq normalized)))))
 
+(deftest retained-allocation-count-query-reuses-declared-source-kinds
+  (let [count-expression (list 'clojure.core/* 'n 'width)
+        source (list 'let* ['out (list 'clojure.core/float-array count-expression)] 'out)
+        options {:scalar-types {'n :long 'width :long}}
+        retained (frontend/retained-allocation-count-expressions source options)
+        copied (with-meta (apply list count-expression) (meta count-expression))]
+    (is (.containsKey ^java.util.IdentityHashMap retained count-expression))
+    (is (not (.containsKey ^java.util.IdentityHashMap retained copied))
+        "denial follows the actual source occurrence, not structural equality")
+    (doseq [[expression candidate-options]
+            [[(list '.invk 'raster.numeric/_star__m_long_long-impl 'n 'width)
+              options]
+             ['unknown options]
+             ['array-count {:array-types {'array-count :float}}]]]
+      (let [candidate (list 'let* ['out (list 'clojure.core/float-array expression)] 'out)]
+        (is (zero? (.size ^java.util.IdentityHashMap
+                          (frontend/retained-allocation-count-expressions
+                           candidate candidate-options)))
+            "unsupported calls, unknown symbols and arrays acquire no scalar denial")))))
+
 (deftest cast-local-allocation-length-retains-the-conversion
   (doseq [cast ['clojure.core/long 'clojure.core/int]]
     (let [source (list 'let* ['buffer '(raster.arrays/zeros-like input n)
@@ -269,20 +885,28 @@
 
 (deftest numerical-equations-are-projected-once-before-dependency-selection
   (let [calls (atom [])
+        transfers (atom [])
         project #'frontend/operation-equation
         original @project
+        normalize #'frontend/advance-extent-normalization
+        original-normalize @normalize
         source '(let* [y (raster.par/pmap i n float (* (aget x i) 2.0))
                        z (raster.par/pmap j n float (+ (aget y j) 1.0))]
                   z)
         program (with-redefs-fn
                   {project (fn [description]
                              (swap! calls conj (:id description))
-                             (original description))}
+                             (original description))
+                   normalize (fn [context state description]
+                               (swap! transfers conj (:id description))
+                               (original-normalize context state description))}
                   #(frontend/form->program source
                                            {:dtype :float :array-types {'x :float}
                                             :scalar-types {'n :long}}))]
     (is (some? program))
     (is (= [0 1] @calls))
+    (is (= [0 1] @transfers)
+        "production analysis normalizes each binding once in the same source fold")
     (is (= [0 1] (mapv second (dialect/equations program))))
     (is (= '[z] (dialect/outputs program)))))
 
@@ -595,6 +1219,95 @@
                       first-result)]
     (is (nil? (frontend/form->program source options))
         "host-only staging cannot move a later throw before an independent device write")))
+
+(defn- preserved-long-scalar [expression]
+  (with-meta expression {:tag 'long :raster.type/tag 'long
+                         :raster.effect/preserve-evaluation true}))
+
+(deftest source-preserved-scalars-remain-at-their-original-numerical-boundaries
+  (let [saved (with-meta 'saved {:tag 'long :raster.type/tag 'long})
+        product (preserved-long-scalar '(clojure.core/* n n))
+        write '(raster.par/map! out i n double 1.0)
+        options {:dtype :double :array-types {'out :double} :scalar-types {'n :long}}]
+    (doseq [[bindings result expected]
+            [[[saved product 'written write] 'written '[scalar map]]
+             [['written write saved product] 'written '[map scalar]]
+             [['first-write write saved product 'second-write write]
+              'second-write '[map scalar map]]]]
+      (let [source (list 'let* bindings result)
+            program (frontend/form->program source options)
+            equations (dialect/equations program)
+            equation (first (filter #(= [saved] (nth % 2)) equations))
+            body (some-> equation dialect/operation-parts :lambda dialect/lambda-parts
+                         :body-results first)]
+        (is (= expected (mapv dialect/operation-kind equations)))
+        (is (= [:long] (-> equation dialect/operation-parts :attributes :dtypes)))
+        (is (= 'clojure.core/* (descriptor/semantic-op body)))
+        (is (true? (:raster.effect/preserve-evaluation (meta body))))))))
+
+(deftest preserved-scalar-evaluation-is-not-a-checked-cast-reuse-permission
+  (let [first-id (with-meta 'first-check {:tag 'long :raster.type/tag 'long})
+        second-id (with-meta 'second-check {:tag 'long :raster.type/tag 'long})
+        expression (preserved-long-scalar '(clojure.core/* n n))
+        source (list 'let* [first-id expression
+                            'first-write '(raster.par/map! out i n double 1.0)
+                            second-id expression
+                            'second-write '(raster.par/map! out i n double 2.0)] 'second-write)
+        options {:dtype :double :array-types {'out :double} :scalar-types {'n :long}}
+        normalized (frontend/normalize-source source options)
+        equations (some-> normalized (frontend/form->program options) dialect/equations)]
+    (is (= expression (get (into {} (map vec) (partition 2 (second normalized))) first-id)))
+    (is (= expression (get (into {} (map vec) (partition 2 (second normalized))) second-id)))
+    (is (= '[scalar map scalar map] (mapv dialect/operation-kind equations)))
+    (is (= [[first-id] [second-id]]
+           (mapv #(nth % 2) (filter #(= 'scalar (dialect/operation-kind %)) equations))))))
+
+(deftest source-preservation-roots-only-its-existing-scalar-dependency-closure
+  (let [dependency (with-meta 'dependency {:tag 'long :raster.type/tag 'long})
+        saved (with-meta 'saved {:tag 'long :raster.type/tag 'long})
+        expression (preserved-long-scalar '(clojure.core/* dependency n))
+        source (list 'let* [dependency (with-meta '(clojure.core/+ n 1) {:tag 'long :raster.type/tag 'long})
+                            saved expression
+                            'written '(raster.par/map! out i n double 1.0)] 'written)
+        options {:dtype :double :array-types {'out :double} :scalar-types {'n :long}}]
+    (is (= '[scalar scalar map]
+           (mapv dialect/operation-kind (dialect/equations (frontend/form->program source options)))))
+    (let [unflagged (vary-meta expression dissoc :raster.effect/preserve-evaluation)
+          ordinary (list 'let* [dependency (with-meta '(clojure.core/+ n 1) {:tag 'long :raster.type/tag 'long})
+                                saved unflagged
+                                'written '(raster.par/map! out i n double 1.0)] 'written)]
+      (is (= '[map] (mapv dialect/operation-kind
+                         (dialect/equations (frontend/form->program ordinary options))))))))
+
+(deftest source-preservation-does-not-admit-effects-data-reads-or-completions
+  (let [binder (with-meta 'saved {:tag 'long :raster.type/tag 'long})
+        eligible? (fn [expression scalar-types array-types]
+                    (#'frontend/required-source-scalar? binder expression :long scalar-types array-types))]
+    (is (eligible? (preserved-long-scalar '(clojure.core/* n n)) {'n :long} {}))
+    (doseq [expression ['(unknown.library/value n) '(println n)
+                        '(clojure.core/* unavailable n) '(clojure.core/aget input 0)]]
+      (is (not (eligible? (preserved-long-scalar expression) {'n :long} {'input :long}))))
+    (binding [util/*shadowing-locals* #{'future}]
+      (is (not (eligible? (preserved-long-scalar '(clojure.core/* future n)) {'n :long} {})))
+      (is (eligible? (preserved-long-scalar '(clojure.core/* future n)) {'n :long 'future :long} {})
+          "a core-named local uses the caller's lexical scope and preceding type facts"))
+    (is (not (eligible? (preserved-long-scalar '(clojure.core/aget input 0))
+                        {'input :long} {}))
+        "data reads do not become eligible through a forged scalar dependency table")
+    (is (not (eligible? (preserved-long-scalar '(clojure.core/* n n))
+                        {'n :long} {'n :long})))
+    (is (not (#'frontend/required-source-scalar?
+              (with-meta 'saved {:tag 'Object :raster.type/tag 'long})
+              (preserved-long-scalar '(clojure.core/* n n)) :long {'n :long} {})))
+    (is (not (eligible? (vary-meta (completion/complete-value completion/object-input-contract 'n)
+                                   assoc :raster.effect/preserve-evaluation true)
+                        {'n :long} {})))
+    (is (not (eligible? (preserved-long-scalar
+                         (list 'clojure.core/long
+                               (completion/complete-value completion/object-input-contract 'n)))
+                        {'n :long} {})))
+    (is (not (#'frontend/required-source-scalar? binder
+              (preserved-long-scalar '(clojure.core/* n n)) nil {'n :long} {})))))
 
 (deftest certified-checked-scalars-after-host-allocation-bound-a-following-typed-island
   (let [source '(let* [out (double-array (long n))
@@ -2578,6 +3291,23 @@
     (binding [util/*shadowing-locals* #{'float-array}]
       (is (empty? (:allocations (analyze '(float-array n) {} {})))))))
 
+(deftest causal-allocation-typing-does-not-waive-a-declared-binder
+  (let [expression '(clojure.core/double-array n)
+        analyze (fn [binder]
+                  (#'frontend/source-storage-analysis
+                   [[binder expression]] :float {} {'n :long} false {} {} '[n]))]
+    (is (= :double (get-in (analyze 'out) [:allocations 0 :dtype]))
+        "the existing allocation transfer supplies element type, not ambient precision")
+    (is (= '[n] (get-in (analyze 'out) [:values 'out :shape])))
+    (doseq [tag ['String 'not-a-class 'long]
+            :let [binder (with-meta 'out {:tag tag})
+                  result (analyze binder)]]
+      (is (nil? (get-in result [:allocations 0 :dtype]))
+          "source capacity evidence cannot complete or erase a declared binder check")
+      (is (nil? (get-in result [:values 'out])))
+      (is (= expression (get-in result [:descriptions 0 :expr])))
+      (is (= tag (-> result :descriptions first :sym meta :tag))))))
+
 (deftest equivalent-shapes-preserve-producers-but-still-refine-unknowns
   (let [producer (av/tensor {:dtype :float :shape '[n]})
         consumer (av/tensor {:dtype :float :shape '[later-length]})
@@ -2710,6 +3440,192 @@
                   {:shape ['n] :representation {:kind :packed}}]]
       (is (empty? (:storage-inputs (first (preserve [description] {'x value}))))
           "unproved flat indexing cannot reinterpret a logical layout or packed storage"))))
+
+(deftest storage-selection-freezes-context-once-and-transfers-each-real-binding-once
+  (let [source '(let* [a (raster.par/pmap i n float (aget x i))
+                       b (raster.par/pmap j m float (aget x j))] [a b])
+        context @#'frontend/storage-selection-context
+        advance @#'frontend/advance-storage-selection
+        contexts (atom 0)
+        transfers (atom [])
+        program (with-redefs-fn
+                  {#'frontend/storage-selection-context
+                   (fn [& arguments] (swap! contexts inc) (apply context arguments))
+                   #'frontend/advance-storage-selection
+                   (fn [context state description]
+                     (swap! transfers conj (:id description))
+                     (advance context state description))}
+                  #(frontend/form->program source {:dtype :float :array-types {'x :float}
+                                                   :scalar-types {'n :long 'm :long}}))
+        operations (mapv dialect/operation-parts (dialect/equations program))]
+    (is (some? program))
+    (is (= 1 @contexts))
+    (is (= [0 1] @transfers))
+    (is (= ['x] (:arrays (first operations))))
+    (is (= [] (:arrays (second operations))))
+    (is (= ['x] (get-in operations [1 :attributes :attributes :pointwise-storage-inputs])))
+    (is (= '[n] (get-in (dialect/facts program) [:values 'x :shape])))))
+
+(deftest later-contraction-requirements-only-inform-indexed-capture-classification
+  (let [source '(let* [a (raster.par/pmap p 2 float (aget A p))
+                       c (raster.par/contract C [[i 2] [j 5]] [[blk 2] [k 2]]
+                           (* (aget A (+ (* i 4) (* blk 2) k))
+                              (aget B (+ (* j 4) (* blk 2) k)))
+                           :stages [{:axis blk :extent 2 :dtype :float :init 0.0
+                                     :lift (raster.numeric/* inner (aget da _) (aget db _))
+                                     :operands [{:sym da :map {:groups [[[i 2]] [[blk 2]]]} :dtype :float}
+                                                {:sym db :map {:groups [[[j 5]] [[blk 2]]]} :dtype :float}]}
+                                    {:axis k :extent 2 :dtype :int :init 0}])]
+                 [a c])
+        options {:dtype :byte :array-types {'A :byte 'B :byte 'C :float 'da :float 'db :float}}
+        analysis (frontend/source-fragment-analysis source options)
+        ;; Re-run only the classification on actual source-derived descriptions,
+        ;; not a fabricated contraction closure or a second source analyzer.
+        descriptions (mapv #(dissoc % :storage-inputs) (:descriptions analysis))
+        context (#'frontend/storage-selection-context descriptions {})
+        initial (#'frontend/initial-storage-selection-state {})
+        advance (partial #'frontend/advance-storage-selection context)
+        prefix (advance initial (first descriptions))
+        complete (reduce advance prefix (rest descriptions))
+        without-later (#'frontend/preserve-map-storage-inputs [(first descriptions)] {})
+        projection (frontend/form->program-components
+                    source (assoc options :segmented-plans? true
+                                          :lexical-inputs '[A B C da db]))
+        before-contract (get-in projection [:preceding-values 1])]
+    (is (= [:map :contract] (mapv :kind descriptions)))
+    (is (= 8 (get-in context [:capacities 'A])))
+    (is (= #{} (:storage-inputs (first without-later))))
+    (is (= #{'A} (get-in prefix [:descriptions 0 :storage-inputs])))
+    (is (= [2] (get-in prefix [:shapes 'a])))
+    (is (not (contains? (:shapes prefix) 'A))
+        "a later storage requirement does not establish even an inferred pointwise shape")
+    (is (= #{:descriptions :shapes} (set (keys prefix)))
+        "classification state publishes neither AVs nor causal availability")
+    (is (= #{:ineligible-storage :capacities} (set (keys context))))
+    (is (= (#'frontend/preserve-map-storage-inputs descriptions {}) (:descriptions complete)))
+    (is (= 2 (:extent (first (:descriptions complete)))))
+    (is (= 'c (:sym (last (:descriptions complete)))))
+    (is (nil? (:values context)))
+    (is (nil? (:available complete)))
+    (is (some? (:typed-program projection)))
+    (is (= [8] (get-in projection [:values 'A :shape]))
+        "global storage validation still retains the later contraction's access requirement")
+    (is (not= [8] (get-in before-contract ['A :shape]))
+        "a later access requirement is not an earlier input-capacity producer")
+    (is (= :float (get-in before-contract ['a :dtype])))
+    (is (= [2] (get-in before-contract ['a :shape])))
+    (is (not (contains? before-contract 'c)))
+    (is (not (contains? (get-in projection [:preceding-values 0]) 'a)))))
+
+(deftest shadowing-an-extent-invalidates-dependent-prefix-facts
+  (let [source '(let* [a (raster.par/pmap i n float (aget x i))
+                       n (clojure.core/println n)
+                       final (raster.par/pmap j 1 float 0.0)]
+                 final)
+        projection (frontend/form->program-components
+                    source {:dtype :float :array-types {'x :float}
+                            :scalar-types {'n :long} :lexical-inputs '[x n]
+                            :values {'x (av/tensor {:dtype :float :shape ['n]})
+                                     'n (av/tensor {:dtype :long :shape []})}
+                            :segmented-plans? true})
+        before (get-in projection [:preceding-values 1])
+        after (get-in projection [:preceding-values 2])]
+    (is (some? (:typed-program projection)))
+    (is (= '[n] (get-in before ['a :shape])))
+    (is (not (contains? after 'n)))
+    (is (not (contains? after 'a))
+        "the old dimension must not be interpreted through the newly bound n")
+    (is (not (contains? after 'x))
+        "input facts mentioning that old dimension also need independent re-establishment")))
+
+(deftest a-future-dimension-cannot-enter-a-prefix-through-an-input-contract
+  (let [source '(let* [a (raster.par/pmap i (clojure.core/alength input) float (aget input i))
+                       later (clojure.core/println :later)
+                       final (raster.par/pmap j 1 float 0.0)] final)
+        projection (frontend/form->program-components
+                    source {:dtype :float :array-types {'input :float}
+                            :scalar-types {'later :long} :lexical-inputs '[input]
+                            :values {'input (av/tensor {:dtype :float :shape ['later]})}
+                            :segmented-plans? true})]
+    (is (some? (:typed-program projection)))
+    (is (not (contains? (get-in projection [:preceding-values 0]) 'input))
+        "a noncausal metadata premise cannot establish an earlier shape")
+    (is (not (contains? (get-in projection [:preceding-values 1]) 'a))
+        "nor may result projection launder that future extent into a produced AV")))
+
+(deftest prefix-dependency-invalidation-is-transitive-and-forgets-replaced-edges
+  (let [plain (av/tensor {:dtype :float :shape [4]})
+        ;; Extension references are tracked conservatively, not interpreted as
+        ;; storage, layout or execution evidence by this source analysis.
+        values {'A plain 'B (assoc plain :attributes {:view-parent 'A})
+                'C (assoc plain :attributes {:view-parent 'B}) 'D plain}
+        projection (frontend/form->program-components
+                    '(let* [A (clojure.core/println A)
+                            final (raster.par/pmap i 1 float 0.0)] final)
+                    {:dtype :float :array-types (zipmap '[A B C D] (repeat :float))
+                     :values values :lexical-inputs '[A B C D] :segmented-plans? true})
+        after (get-in projection [:preceding-values 1])
+        indexed (#'frontend/retain-produced-value-facts
+                 {:values {} :references {} :dependents {}} values)
+        forgotten (#'frontend/forget-dependent-value-facts indexed 'A)
+        replacement (#'frontend/retain-produced-value-facts forgotten {'B plain})
+        repeated (#'frontend/forget-dependent-value-facts replacement 'A)]
+    (is (some? (:typed-program projection)))
+    (is (= #{'D} (set (keys after))))
+    (is (= #{'D} (set (keys (:values forgotten)))))
+    (is (= {} (:dependents forgotten)))
+    (is (= {'B plain 'D plain} (:values repeated)))
+    (is (= {} (:dependents repeated)))
+    (is (= values (get-in projection [:preceding-values 0]))
+        "earlier persistent snapshots retain their original contracts")))
+
+(deftest destination-result-types-need-preceding-storage-evidence
+  (let [source '(let* [write (raster.par/map! out i 4 float (float i))] write)
+        analysis (frontend/source-fragment-analysis
+                  source {:dtype :float :array-types {'out :float}})
+        description (first (:descriptions analysis))
+        equation (#'frontend/operation-equation description)
+        parts (dialect/operation-parts equation)
+        local (get (#'frontend/equation-result-values equation parts :float {'write :float}) 'write)
+        global (get (#'frontend/equation-result-values equation parts :double {'write :double}) 'write)
+        predecessor {'out (av/tensor {:dtype :float :shape [4]})}]
+    (is (= :map (:kind description)))
+    (is (= :float (:dtype local)))
+    (is (= :double (:dtype global)) "the inherited final typing table is not a causal dtype proof")
+    (is (= {} (#'frontend/causal-producer-results description {'write global} predecessor)))
+    (is (= {} (#'frontend/causal-producer-results description {'write local} {})))
+    (doseq [kind [:opaque :record]]
+      (is (= {} (#'frontend/causal-producer-results
+                 description {'write local}
+                 {'out (av/make {:kind kind :dtype :float :shape [4]})}))))
+    (is (= {'write local}
+           (#'frontend/causal-producer-results description {'write local} predecessor)))))
+
+(deftest source-buffer-returns-retain-capacity-not-the-written-traversal-domain
+  (let [out (av/tensor {:dtype :float :shape [8]})
+        projection (frontend/form->program-components
+                    '(let* [write (raster.par/map! out i 2 float (float i))
+                            final (raster.par/pmap j 1 float 0.0)] write)
+                    {:dtype :float :array-types {'out :float}
+                     :values {'out out} :lexical-inputs '[out] :segmented-plans? true})]
+    (is (some? (:typed-program projection)))
+    (is (= [2] (get-in projection [:values 'write :shape]))
+        "the mathematical result still describes only the traversed domain")
+    (is (= out (get-in projection [:preceding-values 1 'write]))
+        "the source return describes the whole destination, without proving initialization")
+    (is (not (contains? (get-in projection [:preceding-values 0]) 'write)))))
+
+(deftest effect-only-source-returns-do-not-publish-their-mathematical-results-as-arrays
+  (let [projection (frontend/form->program-components
+                    '(let* [effect (raster.par/map-void! i 2 (aset out i (float i)))
+                            final (raster.par/pmap j 1 float 0.0)] effect)
+                    {:dtype :float :array-types {'out :float}
+                     :values {'out (av/tensor {:dtype :float :shape [8]})}
+                     :lexical-inputs '[out] :segmented-plans? true})]
+    (is (some? (:typed-program projection)))
+    (is (not (contains? (get-in projection [:preceding-values 1]) 'effect))
+        "map-void! returns nil, not the tensor written by its numerical equation")
+    (is (= #{'out} (set (keys (get-in projection [:preceding-values 1])))))))
 
 (deftest a-recomputed-array-read-is-not-an-alias-across-a-kernel
   ;; `n1 = (aget counts 0)` recomputed after a kernel that writes `counts` is a fresh value; only
@@ -2859,13 +3775,21 @@
     (is (= :sequential (:iteration-order attributes)))))
 
 (deftest an-unprovable-claim-declines-instead-of-failing-the-compile
-  (let [routed (route/attempt '(let* [effect (raster.par/map-void!
-                                              i n
-                                              (clojure.core/aset out (raster.par/unique-index (clojure.core/* i stride))
-                                                                 (float 1.0)))]
-                                     effect)
-                              :float {'out :float} {:scalar-types {'n :long 'stride :long}})]
-    (is (= :unique-index-not-provable (get-in routed [:declined :reason])))))
+  (doseq [alias-analysis? [false true]]
+    (let [bindings '[effect (raster.par/map-void!
+                            i n
+                            (clojure.core/aset out (raster.par/unique-index (clojure.core/* i stride))
+                                               (float 1.0)))]
+          source (list 'let* (cond-> bindings
+                              alias-analysis?
+                              (into ['aliased (completion/complete-value
+                                               completion/object-input-contract 'out)]))
+                       'effect)
+          options (cond-> {:scalar-types {'n :long 'stride :long}}
+                    alias-analysis? (assoc :lexical-inputs '[out n stride]))
+          routed (route/attempt source :float {'out :float} options)]
+      (is (= :unique-index-not-provable (get-in routed [:declined :reason]))
+          "optional alias analysis retains the route's ordinary source-decline boundary"))))
 
 (deftest a-destination-reading-transform-follows-the-contraction-dtype
   ;; A double-spelled GEMM (`doubles` call tag) compiled under the float policy writes a float

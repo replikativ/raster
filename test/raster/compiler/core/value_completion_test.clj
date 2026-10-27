@@ -5,6 +5,117 @@
 (defn- completed [expression]
   (completion/complete-value completion/object-input-contract expression))
 
+(deftest source-cast-result-declaration-does-not-admit-other-contexts-or-forged-contracts
+  (doseq [[operation tag constructor]
+          [[:int 'int completion/source-integral-cast-contract]
+           [:long 'long completion/source-integral-cast-contract]
+           [:float 'float completion/source-floating-cast-contract]
+           [:unchecked-float 'float completion/source-floating-cast-contract]]]
+    (let [contract (constructor operation {:unchecked-math false})]
+      (is (= tag (completion/source-cast-result-tag contract)))
+      (is (nil? (completion/source-cast-result-tag (dissoc contract :source-policy))))
+      (is (nil? (completion/source-cast-result-tag (assoc contract :unchecked-math true))))))
+  (is (nil? (completion/source-cast-result-tag completion/object-input-contract)))
+  (is (nil? (completion/source-cast-result-tag (completion/reference-check-contract Float)))))
+
+(deftest invocation-completion-results-separate-reference-storage-from-numerical-tags
+  (is (= {:kind :opaque} (completion/invocation-result-description completion/object-input-contract)))
+  (doseq [contract [(completion/source-floating-cast-contract :float {:unchecked-math false})
+                    (completion/bytecode-boxed-parameter-contract Float/TYPE)
+                    (completion/primitive-input-contract Float/TYPE {:unchecked-math false})
+                    (completion/bytecode-input-contract Float/TYPE
+                                                        (completion/bytecode-operand-context {}))]]
+    (is (= {:kind :scalar :tag 'float} (completion/invocation-result-description contract)))
+    (is (nil? (completion/invocation-result-description (assoc contract :unowned true)))))
+  (doseq [contract [(completion/reference-check-contract Float)
+                    (completion/bytecode-boxed-parameter-contract (.arrayType Float/TYPE))
+                    (completion/bytecode-boxed-parameter-contract Boolean/TYPE)
+                    (completion/bytecode-boxed-parameter-contract Character/TYPE)
+                    (completion/bytecode-result-context-contract
+                     (completion/bytecode-operand-context {}) :ref)]]
+    (is (nil? (completion/invocation-result-description contract))))
+  (doseq [[carrier tag] [[Float/TYPE 'float] [Double/TYPE 'double]
+                         [Long/TYPE 'long] [Integer/TYPE 'int]]
+          contract [(completion/bytecode-boxed-parameter-contract carrier)
+                    (completion/bytecode-input-contract carrier
+                                                        (completion/bytecode-operand-context {}))]]
+    (is (= {:kind :scalar :tag tag} (completion/invocation-result-description contract)))
+    (is (nil? (completion/invocation-result-description (assoc contract :unowned true)))))
+  (is (= {:kind :scalar :tag 'long}
+         (completion/invocation-result-description
+          (completion/source-integral-cast-contract :long {:unchecked-math false})))))
+
+(deftest source-floating-completion-names-the-source-overload-not-an-ieee-cast
+  (doseq [operation [:float :unchecked-float]
+          mode [false true :warn-on-boxed]]
+    (let [contract (completion/source-floating-cast-contract operation {:unchecked-math mode})
+          operand (with-meta 'input {:tag 'Object :raster.type/tag 'double :line 7})
+          term (completion/complete-value contract operand)]
+      (is (completion/canonical-contract? contract))
+      (is (identical? operand (:operand (completion/canonical-parts term))))
+      (is (= 'float (:raster.type/tag (meta term))))
+      (is (nil? (:tag (meta term))) "declared output dtype is not a primitive input proof")
+      (is (= (list (case operation :float (if mode 'clojure.lang.RT/uncheckedFloatCast
+                                                 'clojure.lang.RT/floatCast)
+                                  :unchecked-float 'clojure.lang.RT/uncheckedFloatCast) operand)
+             (completion/project-to-jvm-source term)))
+      (doseq [changed [(assoc contract :operation :double)
+                       (assoc contract :target-carrier Float/TYPE)
+                       (dissoc contract :source-policy)]]
+        (is (false? (completion/canonical-contract? changed))))))
+  (is (= :unsupported-value-completion
+         (try (completion/source-floating-cast-contract :double {:unchecked-math false}) nil
+              (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))
+
+(deftest source-integral-cast-contract-is-exact-and-declares-only-its-result
+  (doseq [operation [:int :long]
+          mode [false true :warn-on-boxed]]
+    (let [policy {:unchecked-math mode}
+          contract (completion/source-integral-cast-contract operation policy)
+          operand (with-meta 'input {:line 4 :column 2 :file "source.clj"
+                                    :tag 'double :raster.type/tag 'double
+                                    :raster.op/original 'other/call :ownership :fresh})
+          term (completion/complete-value contract operand)
+          projected (completion/project-to-jvm-source term)
+          expected-method (case operation
+                            :int (if mode 'clojure.lang.RT/uncheckedIntCast 'clojure.lang.RT/intCast)
+                            :long 'clojure.lang.RT/longCast)]
+      (is (completion/canonical-contract? contract))
+      (is (= #{:source-context :operation :source-policy} (set (keys contract))))
+      (is (= {:line 4 :column 2 :file "source.clj" :raster.type/tag (symbol (name operation))}
+             (meta term)))
+      (is (identical? operand (:operand (completion/canonical-parts term))))
+      (is (= (list expected-method operand) projected))
+      (is (= (meta term) (meta projected)))
+      (is (completion/contains-completion? term))
+      (is (not (completion/bytecode-context-form? term)))
+      (doseq [invalid [(assoc contract :target-carrier Integer/TYPE)
+                       (assoc contract :operation :float)
+                       (dissoc contract :source-policy)
+                       (assoc contract :source-policy {})]]
+        (is (false? (completion/canonical-contract? invalid))))))
+  (doseq [[operation policy] [[:float {:unchecked-math false}]
+                             ['int {:unchecked-math false}]
+                             [:int nil] [:long {:unchecked-math nil}]]]
+    (is (= :unsupported-value-completion
+           (try (completion/source-integral-cast-contract operation policy) nil
+                (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))))
+
+(deftest exact-object-input-syntax-does-not-generalize-other-completions
+  (let [operand (with-meta 'input {:raster.type/tag 'doubles})
+        term (completed operand)]
+    (is (identical? operand (:operand (completion/object-input-parts term))))
+    (is (= 'doubles (completion/object-value-declaration term)))
+    (doseq [expression [operand
+                        (completion/complete-value (completion/reference-check-contract Object) operand)
+                        (list completion/completion-symbol
+                              (assoc completion/object-input-contract :ownership :borrowed) operand)]]
+      (is (nil? (completion/object-input-parts expression))))
+    (is (= :conflicting-value-completion-declaration
+           (try (completion/object-value-declaration
+                 (with-meta term {:raster.type/tag 'floats})) nil
+                (catch clojure.lang.ExceptionInfo failure (:reason (ex-data failure))))))))
+
 (deftest retained-context-barrier-is-quote-opaque-and-includes-invalid-terms
   (let [term (completed 'x)
         malformed (list completion/completion-symbol {:source-context :unknown} 'x)]

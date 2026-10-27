@@ -117,22 +117,9 @@
   Used by the walker as the pure equivalent of par/map!. The materialize pass
   converts this to alloc + par/map! before backend compilation."
   [idx-sym bound-expr cast-fn body-expr]
-  (let [n-sym (gensym "n__")
-        out-sym (gensym "out__")
-        alloc-fn (case cast-fn
-                   float  'clojure.core/float-array
-                   double 'clojure.core/double-array
-                   long   'clojure.core/long-array
-                   int    'clojure.core/int-array
-                   'clojure.core/double-array)
-        aset-expr (if cast-fn
-                    `(~cast-fn ~body-expr)
-                    `(double ~body-expr))]
-    `(let [~n-sym (int ~bound-expr)
-           ~out-sym (~alloc-fn ~n-sym)]
-       (dotimes [~idx-sym ~n-sym]
-         (clojure.core/aset ~out-sym ~idx-sym ~aset-expr))
-       ~out-sym)))
+  (:form (ir.par/pure-map-expansion
+          (gensym "pmap_result__")
+          (list 'raster.par/pmap idx-sym bound-expr cast-fn body-expr))))
 
 (defmacro map2!
   "Parallel paired map — writes to two output arrays per index.

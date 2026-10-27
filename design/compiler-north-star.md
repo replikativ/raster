@@ -828,7 +828,12 @@ same contract: composite parameters have field initializers, composite scratch h
 leaf size closures, and allocation still sees only typed byte ranges. Certified composition now
 unifies and shares whole logical values atomically while retaining both logical and physical
 certificate mappings; public composite outputs must flatten every leaf in field order. The
-remaining value-layer boundary is ranged/subview composition with explicit ownership transfer.
+remaining value-layer boundaries include ranged/subview composition with explicit ownership
+transfer and whole-value deferred composition. Concrete certified composition does not establish
+that ordered Prepared components accept resident replacement ports or compose AMR state/scratch
+without host staging. Source returns also retain their own checked storage relation: returning a
+whole destination after a partial write must not expose only the numerical traversal view, and
+the partial write cannot initialize an otherwise uninitialized tail.
 
 ### 2.5 Workload coverage is broad at the backend edge, not yet through one door
 
@@ -1320,6 +1325,19 @@ ownership. A host definition represented in both forms denotes one evaluation. T
 correspondence is not execution, hoisting, lifetime, or completion evidence; source-free programs
 retain their separate explicit execution contracts.
 
+Physical-source readiness is a compilation prerequisite, not an invocation step or numerical
+operation. After semantic promotion identifies an actual source-completion/result-import
+consumer, discovery must request closure of that exact original source frontend before target
+scheduling/emission. The actual outer definition-input owner discards the discovery attempt;
+an independent owner prepares the original receiver and its actual emitted descendants. Fresh
+semantic/target construction then validates and adopts that successful readiness history.
+Nested collectors propagate the same authenticated request; they cannot refresh an enclosing
+owner's observations. A private request-local receipt is not portable IR or a persistent cache,
+and a stale receipt cannot silently trigger renewal. This prerequisite transition does not spend
+or reset the ordinary staleness retry budget. Source-only compilation requests no physical
+preparation. Neither source readiness nor target emission executes the numerical source or
+grants buffer initialization, invocation completion, transfer, or output-publication evidence.
+
 Public activation of source-ordered resident execution remains an implementation obligation. It uses the existing
 linked root, lifetime lock, replay transaction and cleanup machinery, with entry storage distinct
 from completed public outputs. A pending invocation has no completed LinkPlan/output boundary;
@@ -1360,13 +1378,13 @@ retain the original captured weights and advance a resident counter from one to 
 source-created temporaries are zeroed again. Capture uses the existing Cleanup transaction;
 a later entry-upload failure releases the earlier acquired roots and session without publishing
 an executable. Contradictory read-only intent is rejected before native acquisition. Semantic
-port-intent normalization and concrete public-role projection are shared with the eager path,
-but this does not yet activate deferred public `Compiled`: donation, input replacement,
+port-intent normalization and concrete public-role projection are shared with the eager path.
+Public ordered `Compiled` supports declared aggregate buffer-leaf and flat host-array replacement; donation,
 composition and frontier contracts remain separate gates. Host scalar element reads of captured
 device entries remain unsupported; validated shape descriptors are not content snapshots.
 Completion certificates remain unavailable until execution.
 
-The next internal phase retains that same compiled template in the existing sealed `Prepared`
+The public ordered phase retains that same compiled template in the existing sealed `Prepared`
 and `Compiled` types: preparation carries semantic entry/output identities and explicitly no
 concrete lowering certificate. Owned instantiation captures entries, ordinary invocation validates
 all host-array replacements before retiring outputs, and completed output views resolve through
@@ -1376,11 +1394,92 @@ and leased-invocation APIs explicitly decline this deferred phase rather than fa
 Distinct parameter storage cannot silently split a mutable host alias: the shared host-identity
 checker rejects this before capture or replacement commitment, while read-only sharing remains
 legal. Native ranges and device inputs still need their own overlap/ownership contracts.
-Local OpenCL/Level Zero controls qualify this constructor-to-callable slice, not automatic
-frontend selection. Enabling ordinary lowering must separately derive ordering obligations and
-check capability coverage, including existing model, contraction and scientific workloads; an
+Ordinary lowering derives ordering obligations and checks source-action capability coverage
+before selecting this phase. Local OpenCL/Level Zero controls qualify the covered constructor,
+replay and failure-order workloads, not every model, contraction or scientific program; an
 unsupported ordering obligation cannot fall back eagerly. No new compiler cache, record family,
 backend executor or performance claim follows from this phase.
+
+For ordered artifacts, `out-tree` is immutable public selection intent until source execution
+completes, not a physical-output certificate. Explicit outputs, semantic results and taps retain
+their usual precedence. The eager and ordered paths share one final projector: resolve actual
+resident storage, keep the first entry for each physical node, then reject surviving duplicate
+keys. The ordered path runs it after source/role reconciliation and before ordinary final
+LinkPlan validation, retaining the derived tree beside that exact completed plan. It never
+rewrites semantic results to include taps. Every selected node must be acquired and initialized
+before publication. A tap retains the final contents of its physical storage; it is not a
+snapshot of an earlier SSA version that later aliases overwrite. Declared aggregate field
+selection uses the shared leaf adapter below; whole-aggregate reconstruction for outputs/taps,
+donation, deferred composition and leased compiled invocation remain separate contracts.
+
+Declared aggregate entries share the eager path's public leaf/path metadata and field-output
+selection. Logical arguments are checked and projected once at preparation. The owner retains
+three distinct things: original logical arguments, immutable physical defaults, and current
+replay slots. Instantiation/replay never reconstruct records or reread captured root fields.
+Array sources are borrowed by identity, not snapshotted: their bytes before instantiation are
+observable under the existing copy-in contract; captured resident state/constants subsequently
+persist independently of host mutation. Dynamic buffer leaves refresh on replay.
+Whole-root replacements use the same nominal/tree, root/leaf conflict, scalar specialization
+and role checks as eager invocation. Captured scalars compare by exact semantic encoding,
+including carrier distinctions, signed zeros and NaN payloads. All leaves, storage shapes and
+mutable cross-port aliases are checked before transfers or output-wrapper retirement. The
+shared physical-parameter initializer checks scalar values/domains and buffer contracts; it is
+not evidence for a root Class, numerical payload Class or completed source entry. A physical
+vector is never passed back through the logical argument projector.
+
+Source-bearing structured loops use the same analyzed-source realization and invocation
+promotion as ordinary TypedSOAC. The frontend authenticates the complete decomposition;
+the suffix is realized once, with fresh read-only incoming SSA names derived mechanically
+while the actual source retains its physical carry names. Source positions and allocation
+claims come from that realized construction, not a guessed correspondence between binding
+lists. A construction witness is not numerical completion evidence and does not enter pure IR.
+Existing primary, auxiliary and allocation source claims are checked independently before
+hoisting or fallback executor selection: another possible executor cannot conceal a stale
+claim. Unowned observable work must execute at its source position or be refused. Original
+allocation/helper recipes and their lexical dependencies survive shape normalization; size
+equivalence remains a separate causal check. This producer closure is not execution evidence:
+admitted numerical loop/copy stages use the unified ordered ProgramLinkInstance path and its
+completion checks. Unsupported source actions, Float payload completion and deferred resident
+inter-component composition retain their separate obligations.
+
+An analyzed allocation claim also roots its original source binding during realization, even
+when no surviving numerical equation reads its contents. Allocation arguments and result storage
+are distinct owners, not interchangeable buffers. After numerical initialization, promotion
+retains missing source-only buffer contracts from causal host definition analysis in the outer
+program; inner algorithms and their numerical inputs/outputs are unchanged. Claim validation
+does not disappear on re-entry once an outer value exists. Duplicate owners, contradictory
+dtype/count/initialization and missing constructor contracts refuse. This does not establish
+the safety of earlier scalar DCE's allocation-removability policy, which requires separate
+evaluation/failure-order qualification.
+
+A device write changes contents, not a bound buffer's shape. Host dependency validation admits
+only an exact, scalar-algorithm-derived rank-one length query with a current buffer binding and
+an exact integral result conversion. This classifies a metadata dependency; it neither derives
+the length from a symbolic AV nor permits early source evaluation. The existing ordered
+ShapeProjection action reads the checked materialized shape once; final call validation retains
+its cached result and checks operand correspondence. Content reads and other scalar computations
+remain subject to the ordinary device-dependency prohibition.
+Shape dimensions may use Long storage internally, but the ShapeProjection result retains its
+declared Int/Long carrier after range checking. This does not normalize caller-supplied scalars
+or weaken carrier-sensitive equality. Definition-derived allocation projection may preserve an
+exact bound Int-to-Long typed-call widening as an explicit constructor conversion, authenticated
+against the actual selected JVM interface. Live interface correspondence and historical compiler
+ownership share one signature check but remain distinct contracts; neither creates a result Class
+or permission to adapt arbitrary IFn, Object, floating or narrowing inputs.
+
+Source local declarations and inferred types are separate facts. Original source entry captures
+the presence and value of a binder's declaration before inference; rewalking transports this
+fact rather than reinterpreting an inferred `:tag` as a source declaration. Actual macro
+expansion captures its new binders while preserving exact incoming binder occurrences. Quoted
+data and owned value-completion operands remain opaque. This is scoped metadata, not a global
+name registry or evidence that a source check has executed. More precise primitive-array clone
+inference must not erase an observable reference check. JVM scalar emission retains the source
+declaration; SIMD declines an incompatible direct operand carrier, and C/Wasm/GPU admission refuses
+incompatible or unresolved array declarations rather than manufacturing a physical Class proof.
+Compatible declarations keep the vector schedule. These constraints do not establish arbitrary
+macro/kernel coverage or general reference-type compilation. Expansion capture currently visits
+input and output subtrees, so deeply nested macro compilation needs cost qualification; it is
+not assumed to have negligible allocation or linear aggregate cost.
 
 Auxiliary realization bindings are executable source actions, not scaffolding that can be
 discarded because a later kernel overwrites the result. The internal ordered root now recovers
@@ -1390,10 +1489,12 @@ reuse that exact physical token. A storage alias binds an already acquired desti
 grants no allocation, initialization or completion credit. Local OpenCL/Level Zero controls
 cover the existing four-layer dense program, changed-input replays, empty functional results,
 late constructor failures and aliases after fused writes. Distinct logical/physical result
-storage, prefix views and aliases before target acquisition remain explicit capability limits;
-this does not enable automatic frontend selection.
+storage and prefix views now use the shared certified source-return projection: a numerical
+prefix write does not widen its initialization proof to the whole returned backing buffer.
+Aliases before target acquisition still require actual readiness; these controls do not qualify
+every possible frontend realization or helper consumption of untouched suffixes.
 Preparation and native-root construction share one structural source-action coverage gate before
-capture or effects. It refuses unsupported steps/realizations, structured-loop fragments and
+capture or effects. It refuses unsupported steps/realizations, unsupported structured fragments and
 missing native-content-provider contracts without evaluating a checked source size. Runtime
 constructor counts, argument availability, alias readiness and logical-view reconciliation still
 require their own ordered checks; structural admission is not a completion or totality proof.
@@ -1402,6 +1503,25 @@ JAX pytrees are the model for separating user structure from flat leaves, but
 Raster trees should retain stable keyed paths and type/shape information. JAX
 donation and sharding contracts are also useful references; Raster's existing
 ownership checks should remain fail-loud.
+
+The analyzed source projection retains one ordered entry per binding, including
+numerical equations, protected semantic components and host-side source actions.
+Host observation sites, barrier IDs and numerical liveness derive from those
+entries under the existing admission policy. An unselected scalar, allocation or
+reference alias does not become an extra kernel boundary merely by being retained
+there; neither does it become removable or movable. Ordinary and protected
+component routes keep their existing numerical partition and fusion legality.
+Lexical reference dependencies keep producers live but establish no storage
+access, initialized contents, physical Class or completed source action. In
+particular, a reference alias cannot discharge a later component's first-use
+allocation initialization.
+
+JVM-specific helper import correspondence belongs to an owner-local source-import
+adapter, not portable TypedSOAC facts. Its analyzed component and unresolved
+argument/return/import obligations are distinct from execution permission. The
+current entry consolidation does not enable deferred imports, result readback,
+checked Float completion or deferred resident composition; those require the
+corresponding source cursor, completion and storage-owner contracts.
 
 ### 3.8 Time, composition and rate scheduling
 
@@ -1551,6 +1671,17 @@ Partial evaluation complements the SSA-based KernelBody; it does not replace it.
 source fixpoint already combines call/AD expansion, type-aware rewalking, PE and CSE. The explicit
 PE API also accepts known parameters and dimensions. General runtime-driven respecialization is
 the direction of this contract, not a claim that every runtime fact already feeds every pass.
+
+Source optimization distinguishes external effects, safe omission, repeatability and identity.
+Beichte's absence of external effects alone proves neither that an operation cannot throw nor
+that a read repeats the same value after mutation. Scalar CSE therefore uses observation epochs:
+declared writes/allocations, nonpure evaluations and unresolved source obligations invalidate
+cached expressions; already evaluated SSA values remain unchanged. Executed collection children
+participate in effect analysis and quoted data stays opaque. This conservative source boundary
+does not partition SOAC fusion. More precise memory-version/range evidence may recover sharing,
+but must not be replaced by nominal purity or final consumer shapes. Constructor totality and
+other partial-operation families must likewise retain their checks before source DCE; that
+migration remains explicit campaign work, not an assumed property of every pure operation.
 
 Use binding-time information at three boundaries: specialize static model/simulator structure
 before TypedSOAC fusion; specialize shapes, layouts and hardware choices before scheduling;

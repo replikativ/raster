@@ -30,6 +30,7 @@
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.passes.parallel.typed-soac-fusion :as fusion]
             [raster.compiler.passes.parallel.typed-soac-projection :as projection]
+            [raster.compiler.passes.parallel.scalar-expression-body :as scalar-body]
             [raster.compiler.passes.scalar.effects :as effects]
             [raster.compiler.passes.scalar.peephole :as peephole]
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
@@ -119,6 +120,15 @@
       (fail! :ad-normalized-operation {:expression expression :operation operation}))
     (assoc call :template (if unary? forward-template template)
            :template-identity (if unary? forward-owner template-identity)
+           ;; Template arguments cross out of the typed program here. Retain
+           ;; their owning value declarations, not desired gradient-port tags.
+           :arguments (mapv (fn [argument]
+                              (if-let [dt (expression-dtype values argument)]
+                                (let [retained (:raster.type/tag (meta argument))]
+                                  (when (and retained (not= retained (tag dt)))
+                                    (fail! :ad-normalized-value-declaration
+                                           {:argument argument :declared (tag dt) :retained retained}))
+                                  (tagged argument dt)) argument)) arguments)
            :canonical (if unary? :nonlinear-unary canonical) :cast-tag cast-tag)))
 
 (defn- equation-expression [equation]
@@ -427,10 +437,9 @@
      :seed seed}))
 
 (defn ^:no-doc revisions []
-  ;; Effect analysis cold-loads numerical libraries and their AD/dispatch declarations. Establish
-  ;; that shared semantic context before any construction or execution authority snapshots epochs.
-  ;; The realized delay is cheap on hot calls; later mutations must still fail the existing fences.
-  (effects/init-raster-context!)
+  ;; Observational at both construction and execution fences. Producers must
+  ;; explicitly establish the shared effect/rule context before taking this
+  ;; snapshot; a validator must not load libraries or register new rules.
   {:template-revision (templates/registry-revision)
    :compiler-revision (dispatch/compiler-definition-revision)})
 
@@ -703,7 +712,7 @@
       (binding-dtype! values id expression)))
   primal)
 
-(declare validate! validate-map-proof! validate-indexed-proof!
+(declare validate! ^:private validate-map-proof! validate-indexed-proof!
          validate-sum-programs! sum-source-map sum-source-producer
          linearize-map-sum-program build-producer-sum-programs
          segmented-description project-segmented-fold segmented-node-lifecycle
@@ -801,6 +810,7 @@
    The interface explicitly supplies :params, retained :tags, :active-inputs and :source-ns.
    This compiler entry never walks source, resolves a deftm Var or re-infers its types."
   [primal interface]
+  (effects/init-raster-context!)
   (build-bundle primal interface (revisions)))
 
 (defn- source-envelope?
@@ -1142,6 +1152,7 @@
    Retained dtypes are not storage-default guesses."
   ([map-program source-ns] (linearize-map-element map-program source-ns {}))
   ([map-program source-ns options]
+   (effects/init-raster-context!)
    (let [{:keys [primal interface]} (project-map-element map-program source-ns nil options)]
      (linearize-program primal interface))))
 
@@ -2128,7 +2139,7 @@
       (fail! :ad-normalized-map-programs {:interface (:interface map-programs)})))
   bundle)
 
-(defn validate-map-proof!
+(defn- validate-map-proof!
   [{:keys [source-ns] :as bundle}]
   (validate-proof-header! bundle #{:source-ns :template-revision :compiler-revision
                                    :map-programs :certificate})
@@ -2158,11 +2169,12 @@
 
 (defn validate!
   [bundle]
-  (cond
-    (contains? bundle :sum-programs) (validate-map-sum-proof! bundle)
-    (contains? bundle :map-programs) (validate-map-proof! bundle)
-    (contains? bundle :gather-programs) (validate-indexed-proof! bundle)
-    :else (validate-scalar! bundle)))
+  (method-entry/call-with-definition-inputs
+   #(cond
+      (contains? bundle :sum-programs) (validate-map-sum-proof! bundle)
+      (contains? bundle :map-programs) (validate-map-proof! bundle)
+      (contains? bundle :gather-programs) (validate-indexed-proof! bundle)
+      :else (validate-scalar! bundle))))
 
 ;; One deliberately small non-map node uses the same scalar proof envelope.  Its array geometry
 ;; is a checked contraction fact, never an inference from the derivative programs.
@@ -2371,9 +2383,122 @@
      :tangent-output (gensym "ad_contraction_push_")
      :gradient-outputs [(gensym "ad_contraction_pull_")]}))
 
+(defn- segmented-selected-call
+  "Project an already checked scalar call through existing registered selection.
+   The generated receiver spelling is only an address: selected-definition and
+   the numerical query must authenticate its actual implementation separately."
+  [values expression]
+  (when (seq? expression)
+    (let [{:keys [dispatch? operation arguments lexical-callee]} (descriptor/call-description expression)
+          operation-var (when (symbol? operation) (resolve operation))]
+      (cond
+        (and dispatch? (not lexical-callee)) expression
+        (and (not lexical-callee) (var? operation-var)
+             (:raster.core/dispatch-table (meta operation-var)))
+        (let [tags (mapv #(some-> (expression-dtype values %) tag) arguments)
+              selected (dispatch/selected-call-signature
+                        operation tags (inference/registered-call-selection operation tags))
+              mangled (:mangled-sym selected)]
+          (when-not (and (= :registered (:selection selected)) (= tags (:tags selected))
+                         (= 'double (:return-tag selected))
+                         (every? #{'double} tags) (not-any? some? (:promotion-casts selected))
+                         (qualified-symbol? mangled))
+            (fail! :ad-normalized-segmented-numerical-body {:expression expression}))
+          (with-meta
+            (list* '.invk (symbol (namespace mangled) (str (name mangled) "-impl")) arguments)
+            (assoc (meta expression) :raster.op/original operation)))))))
+
+(defn- prepare-segmented-numerical-frontier!
+  "Prepare all exact selected helper sources before any numerical/physical query.
+   This is initial producer work only; replay and execution validation never prepare."
+  [scalar]
+  (let [selections
+        (vec (distinct
+              (mapcat (fn [phase]
+                        (let [program (get scalar phase)
+                              values (:values (soac/facts program))]
+                          (keep (fn [expression]
+                                  (when-let [call (segmented-selected-call values expression)]
+                                    (let [{:keys [semantic-op implementation-op arguments]}
+                                          (descriptor/call-description call)]
+                                      (or (method-entry/selected-definition
+                                           semantic-op implementation-op (count arguments))
+                                          (fail! :ad-normalized-segmented-numerical-source
+                                                 {:expression expression})))))
+                                (tree-seq coll? seq (bindings program)))))
+                      [:primal :linear :transpose])))
+        sources (vec (distinct (map :source-var selections)))]
+    ;; A missing walk cache is published before semantic source observations.
+    ;; Discover identities only above: current mutable body metadata is not proof.
+    (doseq [source sources]
+      ;; An existing walked cache does not authenticate a cold implementation's
+      ;; source owner. Freeze the original independently; never overwrite cache.
+      (core/prepare-deftm-frontend! source)
+      (core/prepare-emission-source-walk! source))
+    (let [frontends (mapv (fn [source]
+                           (or (method-entry/original-source-frontend source)
+                               (fail! :ad-normalized-segmented-numerical-source {:source source})))
+                         sources)]
+      (doseq [[source frontend] (map vector sources frontends)]
+        (method-entry/prepare-frontend-source!
+         frontend source core/ensure-current-owned-bytecode!)))))
+
+(defn- segmented-scalar-program-lambda
+  "Reify an entire checked Double scalar region through the existing scalar SSA.
+   Actual selected bodies establish numerical domains, not caller JVM carriers.
+   The raw scalar derivation remains authoritative and is replayed unchanged."
+  [program parameters outputs]
+  (let [values (:values (soac/facts program))
+        raw (scalar-program-lambda program parameters outputs)]
+    (if-not (every? #(= :double (:dtype %)) (vals values))
+      raw
+      (let [{:keys [locals]} (soac/lambda-parts raw)
+            join (fn [expression]
+                   (if-let [call (segmented-selected-call values expression)]
+                     (let [recipe (scalar-body/checked-selected-fp-domain-recipe call)
+                           arguments (:arguments (descriptor/call-description call))]
+                       (when-not (and recipe
+                                      (= (:parameter-dtypes recipe)
+                                         (mapv #(expression-dtype values %) arguments)))
+                         (fail! :ad-normalized-segmented-numerical-body {:expression expression}))
+                       (tagged (:expression recipe) (:result-dtype recipe)))
+                     expression))
+            region {:bindings (vec (mapcat (fn [{:keys [id init]}]
+                                            [id (util/postwalk-preserving-meta join init)]) locals))
+                    :results outputs}
+            types (into {} (map (fn [[id value]] [id (scalar-dtype! value)])) values)
+            inputs (select-keys types (:inputs (soac/facts program)))
+            decline! (fn [rule message data]
+                       (fail! :ad-normalized-segmented-numerical-body
+                              (assoc data :rule rule :message message)))
+            lowerer (scalar-body/make-lowerer
+                     {:scalar-types inputs :array-types {} :arrays #{} :index-scope #{}
+                      :source-region region :require-source-types? true :decline! decline!
+                      :lower-index (fn [& _] (decline! :index "scalar region has no index owner" {}))})
+            lowered ((:lower-region lowerer) region (mapv types outputs) types inputs)
+            argument (fn [value]
+                       (if (instance? raster.compiler.ir.kernel_body.Literal value)
+                         (if (= :double (:type value)) (:value value)
+                             (decline! :literal "non-Double scalar literal" {:value value}))
+                         value))
+            projected
+            (mapv (fn [operation]
+                    (let [{:keys [op arguments result-type options]} (:expression operation)
+                          {:keys [id type]} (:result operation)]
+                      (when-not (and (instance? raster.compiler.ir.kernel_body.ScalarCompute operation)
+                                     (instance? raster.compiler.ir.kernel_body.ScalarExpr (:expression operation))
+                                     (= :double type result-type) (contains? #{:+ :*} op)
+                                     (empty? options))
+                        (decline! :operation "unsupported checked scalar operation" {:operation operation}))
+                      (soac/local-value (tagged id type) type
+                                        (tagged (list* (symbol "clojure.core" (name op))
+                                                       (map argument arguments)) type))))
+                  (:operations lowered))]
+        (soac/lambda-form parameters projected (mapv argument (:results lowered)))))))
+
 (defn- lambda-substitute [program parameters outputs substitutions]
   (let [{:keys [locals body-results]}
-        (soac/lambda-parts (scalar-program-lambda program parameters outputs))]
+        (soac/lambda-parts (segmented-scalar-program-lambda program parameters outputs))]
     (soac/lambda-form parameters
                       (mapv (fn [{:keys [id dtype init]}]
                               (soac/local-value
@@ -2712,6 +2837,7 @@
 (defn- segmented-node-lifecycle
   "Allocate or replay one checked segmented node while retaining operation-specific fold proof."
   [description source-ns equation-ids submitted]
+  (binding [*ns* source-ns]
   (let [equation-id (:equation-id description)
         _ (when (and submitted (not= equation-id (:execution-equation submitted)))
             (fail! :ad-normalized-segmented-proof {:node submitted}))
@@ -2727,6 +2853,12 @@
                     (project nil))
         scalar (or submitted-scalar
                    (linearize-program (:primal projected) (:interface projected)))
+        _ (when (= :double (:dtype description))
+            (when-not submitted (prepare-segmented-numerical-frontier! scalar))
+            ;; Verify the original complete scalar body as well as generated
+            ;; regions. Keep its actual original primal operation/evaluation.
+            (segmented-scalar-program-lambda (:primal scalar) (:params scalar)
+                                            (soac/outputs (:primal scalar))))
         description (merge description
                            (select-keys projected
                                         [:active-formal :passive-formal :accumulator]))
@@ -2744,7 +2876,7 @@
                      :scalar-derivation scalar
                      :stage-interface interface
                      :equation-ids equation-ids})]
-    (assoc witness :result (:result description) :active? true :ports ports :stage stage)))
+    (assoc witness :result (:result description) :active? true :ports ports :stage stage))))
 
 (defn- segmented-activation-description
   "Check one bounded segmented product followed by a unary, single-use map spine."
@@ -2930,6 +3062,7 @@
    :active-array retain their existing one-active behavior. Scalar capture activity needs a sum."
   ([source source-ns] (linearize-map-program source source-ns {}))
   ([source source-ns options]
+   (effects/init-raster-context!)
    (let [bundle (build-map-programs source source-ns options)]
      (validate! (assoc bundle :certificate (certificate bundle))))))
 
@@ -2946,7 +3079,10 @@
    new derivative registry, device owner or default-engine migration is involved."
   ([source source-ns] (linearize-equation-program source source-ns {}))
   ([source source-ns options]
-   (let [source (soac/validate! source)
+   (effects/init-raster-context!)
+   (method-entry/call-with-definition-inputs
+    (fn []
+     (let [source (soac/validate! source)
          equations (soac/equations source)
          kinds (mapv soac/operation-kind equations)]
      (cond
@@ -2968,7 +3104,7 @@
          (validate! (assoc bundle :certificate (certificate bundle))))
 
        :else
-       (fail! :ad-normalized-equation-boundary {:operations kinds})))))
+       (fail! :ad-normalized-equation-boundary {:operations kinds})))))))
 
 (defn linearize-map-chain-program
   "Compatibility entry for a multi-equation map composition.
@@ -2979,6 +3115,7 @@
    Canonical adaptation separately checks source, execution scope and residual lineage."
   ([source source-ns] (linearize-map-chain-program source source-ns {}))
   ([source source-ns options]
+   (effects/init-raster-context!)
    (when-not (< 1 (count (soac/equations source)))
      (fail! :ad-normalized-map-chain-boundary
             {:equations (count (soac/equations source))}))
@@ -3257,6 +3394,7 @@
    indices. Primal explicitly snapshots indices. Ordered transpose requires a fresh owned
    typed-zero physical gradient binding; the effect equation does not allocate or zero it."
   [source source-ns]
+  (effects/init-raster-context!)
   (let [revision (revisions)
         {:keys [gather-programs]} (gather-node-lifecycle source source-ns revision)
         bundle (merge revision {:source-ns source-ns :gather-programs gather-programs})]
@@ -3607,6 +3745,7 @@
    Transpose consumes an explicit scalar seed. This entry constructs programs, not execution."
   ([source source-ns] (linearize-map-sum-program source source-ns {}))
   ([source source-ns options]
+   (effects/init-raster-context!)
    (let [map-source (sum-source-map source source-ns)
          bundle (build-map-programs map-source source-ns options)
          map-interface (get-in bundle [:map-programs :interface])
@@ -3623,6 +3762,7 @@
   "Build one validated primal/linear/transpose bundle for a resolved scalar deftm Var.
    :wrt is a vector of distinct original parameter indices; excluded slots retain their primals."
   [resolved wrt]
+  (effects/init-raster-context!)
   (let [revision (revisions)
         metadata (meta resolved)
         params (vec (:raster.core/deftm-params metadata))
@@ -3689,6 +3829,7 @@
    no source, operation or numerical capability. Original failures propagate.
    This is the existing sequential staleness contract, not concurrent mutation protection."
   [bundle parameters body compile-runtime]
+  (effects/init-raster-context!)
   (let [source-ns (:source-ns bundle)
         guard! (execution-guard source-ns (select-keys bundle [:template-revision :compiler-revision])
                                 [{:parameters parameters :body body}])

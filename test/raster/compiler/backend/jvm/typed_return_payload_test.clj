@@ -2,36 +2,43 @@
   (:require [clojure.test :refer [deftest is]]
             [raster.core :as core]
             [raster.numeric :as n]
+            [raster.par]
             [raster.compiler.core.types :as types]
             [raster.compiler.core.method-entry :as entry]
+            [raster.compiler.core.op-descriptor :as descriptor]
+            [raster.compiler.ir.semantic-fingerprint :as semantic]
+            [raster.compiler.pipeline :as pipeline]
             [raster.compiler.backend.jvm.bytecode :as bytecode]
-            [raster.compiler.passes.parallel.scalar-expression-body :as scalar]))
+            [raster.compiler.passes.parallel.scalar-expression-body :as scalar]
+            [raster.compiler.passes.scalar.source-import :as source-import]))
 
 (def ^:private fp {:carrier Double/TYPE :presence :present})
 (def ^:private boxed-fp {:carrier Object :presence :present :builtin-class Double})
 
-(defn- fixture! [scope-name body & [type]]
+(defn- fixture! [scope-name body & [type operation]]
   (let [scope (create-ns (gensym scope-name))
+        operation (or operation '*)
         [left right] (if (vector? type) type [(or type 'Double) (or type 'Double)])]
     (binding [*ns* scope]
       (refer 'clojure.core)
-      (ns-unmap scope '*)
-      (eval (list 'raster.core/deftm '*
+      (ns-unmap scope operation)
+      (eval (list 'raster.core/deftm operation
                   ['x ':- left 'y ':- right]
                   ':- left body)))
-    (let [source (core/resolve-deftm-var (ns-resolve scope '*))]
-      {:scope scope :generic (ns-resolve scope '*) :source source
+    (let [source (core/resolve-deftm-var (ns-resolve scope operation))]
+      {:scope scope :generic (ns-resolve scope operation) :source source :operation operation
        :receiver (ns-resolve scope (symbol (str (:name (meta source)) "-impl")))})))
 
 (defn- with-selected-fixture [fixture run!]
   ;; Only the original operation's table selects this actual typed call. No
   ;; numerical invocation goes through the temporarily described generic root.
-  (let [generic #'n/* original (meta generic)
+  (let [operation (symbol "raster.numeric" (name (:operation fixture)))
+        generic (find-var operation) original (meta generic)
         receiver (:receiver fixture)
         call (with-meta
                (list '.invk (symbol (str (:scope fixture))
                                     (str (:name (meta receiver)))) 'a 'b)
-               {:raster.op/original 'raster.numeric/*})]
+               {:raster.op/original operation})]
     (try
       (alter-meta! generic assoc :raster.core/dispatch-table
                    (:raster.core/dispatch-table (meta (:generic fixture))))
@@ -40,6 +47,295 @@
 
 (defn- payload [call facts]
   (entry/call-with-definition-inputs #(scalar/checked-selected-fp-payload call facts)))
+
+(defn- domain-recipe [call]
+  (entry/call-with-definition-inputs #(scalar/checked-selected-fp-domain-recipe call)))
+
+(deftest unsupported-map-owners-do-not-request-a-current-source-witness
+  (let [call (with-meta '(.invk example/helper_m_double-impl (clojure.core/aget input i))
+               {:raster.op/original 'example/helper})
+        map-form (list 'raster.par/map! 'output 'i 'n 'double call)
+        wrap #(list 'let* ['result %] 'result)
+        attempts (atom 0)
+        construct (#'pipeline/contextual-reduction-constructor
+                   {:dtype :double :source-var #'n/+})]
+    (is (source-import/direct-double-map-helper-candidate? (wrap map-form)))
+    (with-redefs [source-import/prepare-contextual-source-witness
+                  (fn [& _] (swap! attempts inc) (throw (AssertionError. "unsupported owner emitted source")))
+                  core/prepare-owned-source-frontend!
+                  (fn [& _] (throw (AssertionError. "unsupported owner prepared an entry")))]
+      (doseq [source [(wrap (list 'quote map-form))
+                      (wrap (list 'fn* [] map-form))
+                      (wrap (list 'loop* ['iteration 0] map-form))
+                      (wrap (list 'if true map-form nil))
+                      (wrap (list 'raster.par/map! 'output 'j 'n 'float map-form))
+                      (wrap (list 'raster.par/map! 'output 'i 'n 'float call))]]
+        (is (nil? (construct {:kind :direct-double-map-payloads :source source}))))
+      (is (zero? @attempts)))))
+
+(defn- contextual-map-fixture! [body]
+  (let [{:keys [scope receiver] :as fixture}
+        (fixture! "raster.direct-map-payload." body 'Double 'sin)]
+    (binding [*ns* scope]
+      (eval '(raster.core/deftm mapped-sin
+               [input :- (Array double) unused :- (Array double)
+                output :- (Array double) n :- Long] :- (Array double)
+               (raster.par/map! output i n double
+                 (sin (clojure.core/aget input i) (clojure.core/aget unused i))))))
+    (core/ensure-current-owned-bytecode! receiver)
+    (let [source (core/resolve-deftm-var (ns-resolve scope 'mapped-sin))]
+      (entry/call-with-definition-inputs #(core/prepare-owned-source-frontend! source))
+      (assoc fixture :caller source))))
+
+(defn- invoke-contextual-source [witness arguments]
+  (try
+    (.invoke ^java.lang.reflect.Method (:method witness) nil (object-array arguments))
+    (catch java.lang.reflect.InvocationTargetException failure (throw (.getCause failure)))))
+
+(deftest direct-map-payload-source-keeps-unused-input-and-duplicate-formal-uses
+  (let [{:keys [scope caller]} (contextual-map-fixture! '(clojure.core/+ x x))]
+    (try
+      (entry/call-with-definition-inputs
+       (fn []
+         (let [frontend (entry/original-source-frontend caller)
+               source (list 'let* ['mapped (first (:body frontend))] 'mapped)
+               parameters (:raster.core/deftm-params (meta caller))
+               options {:source-var caller :source-ns scope
+                        :lexical-inputs parameters :public-parameters parameters}
+               original (source-import/prepare-contextual-source-witness source options)
+               projection (source-import/project-direct-double-map-results original)
+               rewritten (:form projection)
+               map-form (second (second rewritten))
+               lambda (nth map-form 5 nil)]
+           (is (= 1 (count (:applications projection))))
+           (is (= 'let* (first lambda)))
+           (is (= 4 (count (second lambda))) "both actual arguments receive an ordered slot")
+           (is (string? (semantic/fingerprint rewritten))
+               "portable source contains no borrowed JVM occurrence tokens or receipts")
+           (is (= 2 (count (descriptor/aget-reads lambda)))
+               "duplicate formal uses do not duplicate a read; unused arguments keep their read")
+           (let [compiled (source-import/prepare-contextual-source-witness rewritten options)]
+             (doseq [witness [original compiled]]
+               (let [output (double-array 1)]
+                 (invoke-contextual-source witness [(double-array [3.0]) (double-array [7.0]) output 1])
+                 (is (= [6.0] (vec output))))
+               (is (thrown? NullPointerException
+                            (invoke-contextual-source witness [(double-array [3.0]) nil (double-array 1) 1]))
+                   "an unused second argument is still evaluated")
+               (let [output (double-array [11.0])]
+                 (invoke-contextual-source witness [nil nil output 0])
+                 (is (= [11.0] (vec output)) "operand evaluation stays inside the map loop")))))))
+      (finally (remove-ns (ns-name scope))))))
+
+(deftest lexical-helper-payload-is-not-silently-stripped-of-owned-binding-context
+  (let [{:keys [scope caller]}
+        (contextual-map-fixture! '(let* [copied (clojure.core/double x)] (clojure.core/+ copied 100.0)))]
+    (try
+      (entry/call-with-definition-inputs
+       (fn []
+         (let [frontend (entry/original-source-frontend caller)
+               source (list 'let* ['mapped (first (:body frontend))] 'mapped)
+               parameters (:raster.core/deftm-params (meta caller))
+               witness (source-import/prepare-contextual-source-witness
+                        source {:source-var caller :source-ns scope :lexical-inputs parameters
+                                :public-parameters parameters})]
+           (is (nil? (source-import/project-direct-double-map-results witness))
+               "let/completion payloads remain unsupported rather than losing their context"))))
+      (finally (remove-ns (ns-name scope))))))
+
+(deftest helper-input-slots-cannot-capture-caller-or-callee-identifiers
+  ;; This private AST utility issues no receipt. Force collisions directly so
+  ;; the negative does not depend on a particular global gensym counter.
+  (doseq [[inputs parameters values body]
+          [[[{:operand 'caller}] '[formal] '[caller] 'formal]
+           [[{:operand 1.0 :ports {'caller {}}}] '[formal] '[caller] 'formal]
+           [[{:operand 1.0}] '[formal] '[inner] '(let* [inner 1.0] formal)]
+           [[{:operand 1.0} {:operand 2.0}] '[left right] '[same same] 'left]
+           [[{:operand 1.0}] '[formal] '[foreign/slot] 'formal]]]
+    (is (= :nonfresh-source-import-binder
+           (try (#'source-import/construct-helper-application
+                 nil {} inputs parameters values body {} [] nil false)
+                nil
+                (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))))
+
+(deftest explicit-owned-payload-query-does-not-register-custom-intrinsic-semantics
+  (let [{:keys [scope receiver] :as fixture}
+        (fixture! "raster.custom-owned-payload." '(clojure.core/+ x 100.0) 'Double 'sin)]
+    (try
+      (core/ensure-current-owned-bytecode! receiver)
+      (let [emission (:raster.core/bytecode-emission (meta receiver))
+            method (:invocation-method (bytecode/retained-typed-return-bridge emission))
+            operation (symbol (str scope) "sin")
+            implementation (symbol (str scope) (str (:name (meta receiver))))
+            call (with-meta (list '.invk implementation 'a 'b) {:raster.op/original operation})]
+        (entry/call-with-definition-inputs
+         (fn []
+           (with-redefs [core/ensure-current-owned-bytecode!
+                         (fn [& _] (throw (AssertionError. "owned query prepared a helper")))
+                         core/ensure-bytecode-implementation!
+                         (fn [& _] (throw (AssertionError. "owned query forced the JIT")))]
+             (is (nil? (scalar/checked-selected-fp-payload call [fp fp]))
+                 "the original intrinsic-gated query stays unchanged")
+             (let [recipe (scalar/owned-selected-call-fp-payload call method [fp fp])]
+               (is (= :owned-fp-return-payload (:scope recipe)))
+               (is (identical? emission (:emission recipe)))
+               (is (= method (get-in recipe [:bridge :invocation-method])))
+               (is (= Double/TYPE (:payload-carrier recipe)))
+               (is (some #(= :+ (get-in % [:expression :op]))
+                         (get-in recipe [:computation :operations])))
+               (is (not-any? #(= :sin (get-in % [:expression :op]))
+                             (get-in recipe [:computation :operations]))))
+             (is (nil? (scalar/owned-selected-call-fp-payload
+                        call (.getMethod Math "sin" (into-array Class [Double/TYPE])) [fp fp])))
+             (is (nil? (scalar/owned-selected-call-fp-payload
+                        call method [{:carrier Object :presence :unknown} fp])))))))
+      (finally (remove-ns (ns-name scope))))))
+
+(deftest emitted-helper-occurrence-retains-physical-inputs-and-owned-numerical-slots
+  (let [{:keys [scope receiver]}
+        (fixture! "raster.custom-owned-occurrence." '(clojure.core/+ x 100.0) 'Double 'sin)]
+    (try
+      (binding [*ns* scope]
+        (eval '(raster.core/deftm mapped-sin
+                 [input :- (Array double) output :- (Array double) n :- Long] :- (Array double)
+                 (raster.par/map! output i n double
+                   (sin (clojure.core/aget input i) 1.0)))))
+      (core/ensure-current-owned-bytecode! receiver)
+      (let [source (core/resolve-deftm-var (ns-resolve scope 'mapped-sin))
+            caller-receiver (ns-resolve scope (symbol (str (:name (meta source)) "-impl")))]
+        (core/ensure-current-owned-bytecode! caller-receiver)
+        (entry/call-with-definition-inputs
+         (fn []
+           (let [frontend (entry/original-source-frontend source)
+                 body (:body frontend)
+                 operation (symbol (str scope) "sin")
+                 calls (filter #(and (seq? %) (= operation (descriptor/semantic-op %)))
+                               (tree-seq coll? seq body))
+                 call (first calls)]
+             (is (= 1 (count calls)))
+             (with-redefs [core/ensure-current-owned-bytecode!
+                           (fn [& _] (throw (AssertionError. "occurrence query prepared a helper")))
+                           core/ensure-bytecode-implementation!
+                           (fn [& _] (throw (AssertionError. "occurrence query forced the JIT")))]
+               (let [application (source-import/instantiate-owned-helper-occurrence frontend body call)
+                     projection (:application application)
+                     record (:physical-call projection)
+                     slots (:input-slots projection)
+                     numerical (:numerical-projection projection)]
+                 (is (some? application))
+                 (is (identical? application (source-import/validate-helper-application! application)))
+                 (is (= :owned-fp-return-payload (:scope numerical)))
+                 (is (= '.invk (first (:derived-call projection))))
+                 (is (not (identical? (:expression record) (:derived-call projection))))
+                 (is (= (:receiver record) (second (:derived-call projection))))
+                 (is (every? true? (map identical? (map :operand (:inputs record))
+                                               (drop 2 (:derived-call projection)))))
+                 (is (= (mapv :value slots) (:arguments numerical)))
+                 (is (= (zipmap (:parameters numerical) (mapv :value slots))
+                        (:formal-input-values numerical)))
+                 (doseq [[slot input completed] (map vector slots (:inputs record) (:input-completions record))]
+                   (is (identical? (:operand input) (:operand slot)))
+                   (is (identical? (:ports input) (:ports slot)))
+                   (is (identical? (:context input) (:context slot)))
+                   (is (identical? completed (:completion slot))))
+                 (is (nil? (source-import/instantiate-owned-helper-occurrence
+                            frontend (mapv identity body) call)))
+                 (is (nil? (source-import/instantiate-owned-helper-occurrence
+                            frontend body (with-meta (apply list call) (meta call)))))
+                 (doseq [foreign-emission [(into {} (:emission frontend))
+                                          (assoc (:emission frontend) :invocation-contexts {})]]
+                   (is (nil? (source-import/instantiate-owned-helper-occurrence
+                              (assoc frontend :emission foreign-emission) body call))
+                       "a fresh/copied module is not the historically selected receiver module"))
+                 (is (= :helper-application-correspondence
+                        (try (source-import/validate-helper-application!
+                              (update application :application assoc :numerical-projection nil))
+                             nil
+                             (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))))))))
+      (finally (remove-ns (ns-name scope))))))
+
+(deftest numerical-domain-recipes-prove-actual-ordered-double-bodies
+  (doseq [[operation body expected]
+          [['* '(clojure.core/* (clojure.core/double x) (clojure.core/double y))
+            '(clojure.core/* a b)]
+           ['+ '(clojure.core/+ (clojure.core/double x) (clojure.core/double y))
+            '(clojure.core/+ a b)]]]
+    (let [{:keys [scope receiver] :as fixture}
+          (fixture! "raster.domain-recipe." body 'Double operation)]
+      (try
+        (with-selected-fixture fixture
+          (fn [call]
+            (with-redefs [core/ensure-bytecode-implementation!
+                          (fn [& _] (throw (AssertionError. "domain query forced the JIT")))
+                          core/ensure-current-owned-bytecode!
+                          (fn [& _] (throw (AssertionError. "domain query prepared a module")))]
+              (is (nil? (domain-recipe call))))
+            (is (some? (:raster.core/jit-spec (meta receiver))))
+            (core/ensure-bytecode-implementation! receiver)
+            (let [recipe (with-redefs [core/ensure-bytecode-implementation!
+                                      (fn [& _] (throw (AssertionError. "warm domain query forced the JIT")))
+                                      core/ensure-current-owned-bytecode!
+                                      (fn [& _] (throw (AssertionError. "warm domain query prepared a module")))]
+                           (domain-recipe call))]
+              (is (= {:parameter-dtypes [:double :double] :result-dtype :double
+                      :expression expected} recipe))
+              (is (not-any? #(or (class? %) (instance? java.lang.reflect.Method %) (fn? %))
+                            (tree-seq coll? seq recipe)))
+              (is (nil? (payload call [{:carrier Object :presence :unknown} fp])))
+              (is (nil? (domain-recipe
+                         (with-meta (list '.invk (second call) '(side-effect!) 'b) (meta call)))))
+              (is (nil? (scalar/checked-selected-fp-domain-recipe call))
+                  "a numerical recipe still requires its owning historical guard"))))
+        (finally (remove-ns (ns-name scope)))))))
+
+(deftest numerical-domains-do-not-trust-the-selected-operation-spelling
+  (doseq [[body type]
+          [['(clojure.core/+ x y) 'Double]
+           ['(clojure.core/* y x) 'Double]
+           ['(clojure.core/* x x) 'Double]
+           ['(clojure.core/* (clojure.core/* x y) x) 'Double]
+           ['(clojure.core/float (clojure.core/* x y)) 'Float]
+           ['(clojure.core/* x y) 'Long]]]
+    (let [{:keys [scope receiver] :as fixture}
+          (fixture! "raster.refused-domain-recipe." body type)]
+      (try
+        (core/ensure-bytecode-implementation! receiver)
+        (with-selected-fixture fixture #(is (nil? (domain-recipe %))))
+        (finally (remove-ns (ns-name scope)))))))
+
+(deftest selected-fp-recipes-retain-the-complete-original-module-guard
+  (let [{:keys [scope receiver] :as fixture}
+        (fixture! "raster.domain-module-history." '(clojure.core/* x y))
+        current (atom true)
+        producer (reify entry/RetainedProducerInput
+                   (assert-producer-current! [this]
+                     (when-not @current
+                       (throw (ex-info "test numerical body producer changed"
+                                       {:reason :test-stale-numerical-producer})))
+                     this))
+        compile! bytecode/compile-typed-impl!]
+    (try
+      (with-redefs [bytecode/compile-typed-impl!
+                    (fn [& args]
+                      (entry/adopt-definition-inputs! {:producer-inputs [producer]})
+                      (apply compile! args))]
+        (core/ensure-bytecode-implementation! receiver))
+      (with-selected-fixture fixture
+        (fn [call]
+          (let [domain-owner (atom {:static [] :values []})
+                physical-owner (atom {:static [] :values []})
+                receiver-metadata (meta receiver)]
+            (binding [entry/*emission-inputs* domain-owner]
+              (is (some? (scalar/checked-selected-fp-domain-recipe call))))
+            (binding [entry/*emission-inputs* physical-owner]
+              (is (some? (scalar/checked-selected-fp-payload call [fp fp]))))
+            (reset! current false)
+            (is (identical? receiver-metadata (meta receiver)))
+            (doseq [owner [domain-owner physical-owner]]
+              (is (= :test-stale-numerical-producer
+                     (:reason (ex-data (try (entry/assert-definition-inputs-current! @owner) nil
+                                           (catch clojure.lang.ExceptionInfo failure failure))))))))))
+      (finally (remove-ns (ns-name scope))))))
 
 (defn- execute-fp-program
   "Independent test oracle for this closed FP leaf, not a compiler lowering."
@@ -61,6 +357,8 @@
                             :cast a
                             :* (clojure.core/* (double a) (double b))
                             :+ (clojure.core/+ (double a) (double b))
+                            :neg (clojure.core/- (double a))
+                            :log (Math/log (double a))
                             :div (clojure.core// (double a) (double b)))]
                 (assoc values (get-in operation [:result :id]) (round-value result-type value))))
             inputs operations)]
@@ -230,6 +528,113 @@
                      (raster.numeric// a b) (raster.numeric// a b))]
     (is (nil? (payload expression [fp fp])))
     (is (nil? (scalar/checked-selected-fp-payload expression [fp fp])))))
+
+(deftest math-payload-requires-the-actual-java-method-occurrence
+  (let [{:keys [scope receiver] :as fixture}
+        (fixture! "raster.math-return-payload." '(Math/log (clojure.core/double x)))]
+    (try
+      (with-selected-fixture
+        fixture
+        (fn [call]
+          (with-redefs [core/ensure-bytecode-implementation!
+                        (fn [& _] (throw (AssertionError. "Math query forced the JIT")))]
+            (is (nil? (payload call [fp fp]))))
+          (core/ensure-bytecode-implementation! receiver)
+          (let [emitted (:raster.core/bytecode-emission (meta receiver))
+                original (first (:body emitted))
+                record (bytecode/retained-invocation-context emitted original)
+                method (:method record)
+                proof (payload call [fp fp])
+                owner (atom {:static [] :values []})]
+            (is (= :java-static (:invocation-mode record)))
+            (is (= (.getMethod java.lang.Math "log" (into-array Class [Double/TYPE])) method))
+            (is (= [:double] (mapv :emitted-type (:input-completions record))))
+            (is (= [:identity] (mapv :adaptation (:input-completions record))))
+            (is (nil? (bytecode/retained-invocation-context
+                       emitted (with-meta (apply list original) (meta original)))))
+            (is (= Object (:result-carrier proof)))
+            (is (= Double/TYPE (:payload-carrier proof)))
+            (doseq [x [-1.0 -0.0 0.0 0.5 1.0 Double/MAX_VALUE Double/POSITIVE_INFINITY Double/NaN]]
+              (let [actual (clojure.lang.Reflector/invokeInstanceMethod
+                            @receiver "invk" (object-array [x 7.0]))
+                    projected (execute-fp-program (:computation proof)
+                                                 (zipmap (:parameters proof) [x 7.0]))]
+                (is (instance? Double actual))
+                (is (or (and (Double/isNaN actual) (Double/isNaN projected))
+                        (= (Double/doubleToRawLongBits actual) (Double/doubleToRawLongBits projected))))))
+            (binding [entry/*emission-inputs* owner]
+              (is (some? (scalar/checked-selected-fp-payload call [fp fp]))))
+            (try
+              (ns-unmap scope 'Math)
+              (.importClass scope 'Math java.lang.StrictMath)
+              (is (nil? (payload call [fp fp])) "a current Class lookup cannot replace the emitted Method")
+              (is (= :stale-source-resolution
+                     (:reason (ex-data (try (entry/assert-definition-inputs-current! @owner) nil
+                                           (catch clojure.lang.ExceptionInfo error error))))))
+              (finally
+                (ns-unmap scope 'Math)
+                (.importClass scope 'Math java.lang.Math))))))
+      (finally (remove-ns (ns-name scope))))))
+
+(deftest a-different-actual-java-method-is-not-the-math-payload-recipe
+  (let [{:keys [scope receiver] :as fixture}
+        (fixture! "raster.foreign-math-payload." '(Math/log (clojure.core/double x)))]
+    (try
+      (ns-unmap scope 'Math)
+      (.importClass scope 'Math java.lang.StrictMath)
+      (with-selected-fixture
+        fixture
+        (fn [call]
+          (core/ensure-bytecode-implementation! receiver)
+          (let [emitted (:raster.core/bytecode-emission (meta receiver))
+                original (first (:body emitted))
+                record (bytecode/retained-invocation-context emitted original)]
+            (is (= :java-static (:invocation-mode record)))
+            (is (= java.lang.StrictMath (.getDeclaringClass ^java.lang.reflect.Method (:method record))))
+            (is (nil? (payload call [fp fp]))))))
+      (finally (remove-ns (ns-name scope))))))
+
+(deftest missing-java-call-history-is-not-reconstructed-from-a-current-class
+  (let [{:keys [scope receiver] :as fixture}
+        (fixture! "raster.unrecorded-math-payload." '(Math/log (clojure.core/double x)))
+        retain-var (ns-resolve 'raster.compiler.backend.jvm.bytecode 'retain-invocation-context!)
+        original-retain @retain-var]
+    (try
+      (with-selected-fixture
+        fixture
+        (fn [call]
+          ;; Emit real code without the new optional observation, modeling an
+          ;; older actual emission. Neither its owner nor its Classes are forged.
+          (with-redefs-fn {retain-var
+                          (fn [method receiver arguments mode & remaining]
+                            (when-not (= :java-static mode)
+                              (apply original-retain method receiver arguments mode remaining)))}
+            #(core/ensure-bytecode-implementation! receiver))
+          (is (some? (bytecode/retained-typed-return-bridge
+                      (:raster.core/bytecode-emission (meta receiver)))))
+          (with-redefs [core/ensure-bytecode-implementation!
+                        (fn [& _] (throw (AssertionError. "missing history forced preparation")))]
+            (is (nil? (payload call [fp fp]))))))
+      (finally (remove-ns (ns-name scope))))))
+
+(deftest double-unary-negation-keeps-the-original-primitive-recipe
+  (let [{:keys [scope receiver] :as fixture}
+        (fixture! "raster.double-negation-payload." '(clojure.core/- x))]
+    (try
+      (with-selected-fixture
+        fixture
+        (fn [call]
+          (core/ensure-bytecode-implementation! receiver)
+          (let [proof (payload call [fp fp])]
+            (is (= Double/TYPE (:payload-carrier proof)))
+            (doseq [x [-0.0 0.0 -3.0 Double/POSITIVE_INFINITY Double/NEGATIVE_INFINITY]]
+              (let [actual (clojure.lang.Reflector/invokeInstanceMethod
+                            @receiver "invk" (object-array [x 7.0]))
+                    projected (execute-fp-program (:computation proof)
+                                                 (zipmap (:parameters proof) [x 7.0]))]
+                (is (= (Double/doubleToRawLongBits (clojure.core/- (double x)))
+                       (Double/doubleToRawLongBits actual) (Double/doubleToRawLongBits projected))))))))
+      (finally (remove-ns (ns-name scope))))))
 
 (deftest nested-width-stamps-are-not-actual-producer-carriers
   (let [inner (with-meta '(clojure.core/* x x) {:raster.type/tag 'float})
