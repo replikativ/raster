@@ -20,8 +20,21 @@
   "Keep bounded portable classifier data, never compiler objects or printed inputs."
   [error]
   (when (instance? Throwable error)
-    (let [data (ex-data error)]
-      (into {:class (.getName (class error))}
+    (let [data (ex-data error)
+          source (:source data)
+          ;; A definition's immutable name is diagnostic, not its root, metadata
+          ;; or a source form. In particular do not print arbitrary :source values.
+          source-name (cond
+                        (var? source)
+                        (let [source-ns (.ns ^clojure.lang.Var source)
+                              source-symbol (.sym ^clojure.lang.Var source)]
+                          (when (and (instance? clojure.lang.Namespace source-ns)
+                                     (symbol? source-symbol))
+                            (symbol (str (ns-name source-ns)) (str source-symbol))))
+                        (qualified-symbol? source) (with-meta source nil))]
+      (into (cond-> {:class (.getName (class error))}
+              (and source-name (<= (count (str source-name)) 512))
+              (assoc :source source-name))
             (keep (fn [key]
                     (let [value (get data key)]
                       (when (keyword? value) [key value]))))

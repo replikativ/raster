@@ -4,11 +4,13 @@
 
 ### Current boundary ledger
 
-Latest completed unit/CPU accounting, `2f228eea5` (October 27): unit job 35239
-and CPU-OpenCL job 35238 fail; this branch is not merge-ready. Later checkpoints
-require their own exact-head qualification.
-All sixteen unit shards complete: 7,703 tests, 94,407 passing assertions, 53 failures and 126
-errors across 145 failing Vars. CPU-OpenCL has all four completed shards: 677
+Latest completed unit accounting, `ae8300076` (October 27): unit job 35256
+fails; this branch is not merge-ready. All sixteen unit shards complete: 7,717
+tests, 94,716 passing assertions, 53 failures and 125 errors across 144 failing
+Vars. All 7,709 previously reported outcome Vars and their 94,679 assertions
+are retained; nine new outcome Vars add 228 assertions. Emission job 35253 fails
+at the same public mixed-scale boundary. CPU-OpenCL job 35252 is still pending;
+the preceding `b8f86362e` CPU job 35245 has all four completed shards: 677
 tests, 7,404 passing assertions, 12 failures and 81 errors across 83 failing Vars.
 Setup and build pass; emitted-source fails on `mixed-storage/mixed-scale`, so
 dependent vendor compiler gates have not qualified this head. The stricter
@@ -29,7 +31,7 @@ the older nested-MMM test expecting the now-owned helper cases to refuse. Those
 including default/selected gradients, empty reductions and unchanged inputs.
 The five affected AD namespaces pass 43 tests / 718 assertions with the
 committed inliner. Unknown Object/compound-array and active-discrete refusals
-remain independently tested. The 145 unit and 83 CPU failing Vars are
+remain independently tested. The 144 unit and 83 CPU failing Vars are
 still unqualified; this test migration does not waive them.
 Between the earlier `32ff5587a` and `280a9a3a7` reports, all 7,679 shared unit outcome Vars and
 95,417 shared assertions are retained; eleven new Vars add 363 assertions. CPU
@@ -139,6 +141,14 @@ materialized, owned-import and public AOT execution; affected object/SIMD/return
 gates pass 58 / 984. Independent review found no blocker. The public mixed-scale
 GPU fixture still refuses at the protected body boundary, so source-context and
 numerical correspondence must be completed before treating that vertical as green.
+
+CI exception summaries now retain a bounded qualified definition name when the
+error supplies a Var or qualified symbol, never its root, metadata or source
+form. Anonymous Vars and arbitrary source objects remain omitted; symbol
+metadata is stripped. The runner gate passes 14 tests / 96 assertions. This
+improves cold-failure attribution without weakening freshness checks or retry
+limits. The old AMR snapshot-mismatch errors are not present in the new complete
+unit run; current AMR coverage instead refuses a value-type-local escape.
 
 The next source closure must combine request-local cold readiness with a verified
 projection of complete result-context regions. Queries must remain non-preparing;

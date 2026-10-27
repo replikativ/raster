@@ -107,6 +107,27 @@
         (is (= 1 (:schema-version report)) "timing fields keep their existing schema"))
       (finally (delete-timing-report! file)))))
 
+(deftest definition-failure-classifiers-retain-names-not-source-values
+  (let [diagnostic #'timed/exception-diagnostic
+        source #'timing-preserves-results-and-records-exceptions
+        source-name 'raster.ci.timed-runner-test/timing-preserves-results-and-records-exceptions
+        base {:class "clojure.lang.ExceptionInfo" :reason :unstable-definition-proof-input}]
+    (is (= (assoc base :source source-name)
+           (diagnostic (ex-info "not retained" {:reason :unstable-definition-proof-input
+                                                :source source}))))
+    (is (= (assoc base :source source-name)
+           (diagnostic (ex-info "not retained" {:reason :unstable-definition-proof-input
+                                                :source source-name}))))
+    (is (nil? (meta (:source (diagnostic
+                             (ex-info "not retained"
+                                      {:source (with-meta source-name {:secret (Object.)})}))))))
+    (doseq [unknown [(Object.) (clojure.lang.Var/create nil)
+                     '(secret inputs) "secret" 'unqualified
+                     (symbol "probe" (apply str (repeat 513 "x")))]]
+      (is (= base (diagnostic (ex-info "not retained"
+                                      {:reason :unstable-definition-proof-input
+                                       :source unknown})))))))
+
 (deftest failure-classifiers-are-portable-bounded-and-do-not-inspect-runtime-inputs
   (let [file (java.io.File/createTempFile "raster-ci-diagnostics-" ".edn")
         v #'timing-preserves-results-and-records-exceptions
