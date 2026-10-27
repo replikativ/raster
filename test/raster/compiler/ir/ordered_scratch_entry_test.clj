@@ -92,6 +92,48 @@
       (is (= :invocation-ordered-entry-role-root
              (reason #(#'invocation-link/checked-ordered-entry-root-roles changed)))))))
 
+(deftest scratch-aliases-use-original-parameter-evidence-not-an-initializer
+  (let [{:keys [state]} (entry-fixture)
+        roles (with-accesses {'scratch :read-write 'out :write}
+                #(invocation-link/ordered-entry-roles state {'scratch :scratch}))
+        layout (invocation-link/ordered-entry-layout state roles)
+        parameter (get (invocation-link/ordered-entry-buffers state) 'scratch)
+        token (:id parameter)
+        realized {:buffers {'scratch token}
+                  :storage {token {:id token :compiler-values #{'scratch} :abstract (:value parameter)
+                                   :shape (:shape parameter) :role :scratch
+                                   :source nil :initialization :unspecified}}}
+        state (assoc state :entry-roles roles :entry-refresh (:entry-refresh layout) :realized realized)
+        root-roles (#'invocation-link/checked-ordered-entry-root-roles state)
+        evidence (#'invocation-link/ordered-scratch-alias-evidence state root-roles)
+        prefix {:program-buffers {'alias parameter}}
+        values {'alias (:value parameter)}
+        retain (fn [state prefix evidence]
+                 (#'invocation-link/retain-materialized-storage-aliases state prefix values evidence))
+        actual (retain realized prefix evidence)]
+    (is (identical? parameter (get evidence token)))
+    (is (= token (get-in actual [:buffers 'alias])))
+    (is (= realized (-> actual (update :buffers dissoc 'alias)
+                                   (assoc-in [:storage token :compiler-values] #{'scratch}))))
+    (is (nil? (get-in actual [:storage token :source])))
+    (is (= :unspecified (get-in actual [:storage token :initialization])))
+    (is (nil? (:acquired-storage actual)))
+    (is (= :invocation-ordered-input-storage
+           (reason #(retain realized prefix {})))
+        "a scratch-shaped descriptor alone cannot authorize host-identity erasure")
+    (doseq [[bad-realized bad-prefix bad-evidence]
+            [[realized (assoc-in prefix [:program-buffers 'alias :source] (float-array 2)) evidence]
+             [realized prefix (assoc-in evidence [token :id] :foreign)]
+             [realized prefix (assoc-in evidence [token :shape] [1])]
+             [realized prefix (assoc-in evidence [token :value] (av/tensor {:dtype :double :shape [2]}))]
+             [(assoc-in realized [:storage token :role] :state) prefix evidence]
+             [(assoc-in realized [:storage token :initialization] :zero) prefix evidence]]]
+      (is (= :invocation-ordered-input-storage
+             (reason #(retain bad-realized bad-prefix bad-evidence)))))
+    (is (= :invocation-ordered-entry-role-root
+           (reason #(#'invocation-link/checked-ordered-entry-root-roles
+                     (assoc state :entry-refresh {})))))))
+
 (deftm scratch-written-then-read
   [scratch :- (Array float), out :- (Array float), n :- Long] :- (Array float)
   (let [written (par/map! scratch i 2 float (+ 10.0 (float i)))

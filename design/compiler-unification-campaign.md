@@ -4,7 +4,29 @@
 
 ### Current boundary ledger
 
-Latest completed exact-head CI is `667d2c8ca`: all sixteen unit shards
+Latest completed exact-head CI is `b9178db99`: all sixteen unit shards
+(35319) finish with 7,759 tests / 95,289 pass / 47 failures / 115 errors across
+134 failing Vars. Three prior Vars recover; two new failures require correction.
+All previous outcome Vars remain; shared assertions increase 95,239→95,251 and
+19 new Vars add 213 assertions. CPU-OpenCL 35318 finishes all four shards:
+678 tests / 7,461 pass / 12 failures / 74 errors across 76 failing Vars. Three
+Vars recover there and one scratch-alias regression appears; all previous
+outcomes remain, with 7,544→7,547 shared assertions. Emission 35315 fails and
+downstream vendor gates remain unqualified. The draft is not merge-ready.
+
+The three regressions have focused corrections, not waivers. Scratch discards
+its host initializer by design; alias reconciliation now compares against the
+independently checked original parameter evidence without restoring that source
+or granting initialization/readiness. Pure scratch controls pass 3 tests / 38
+assertions, and actual OpenCL/Level Zero scratch replay passes 62 assertions.
+The map-spine negative test now mutates the real child owner of its return
+observation. The generated-helper CI log showed identical NaN gradients rejected
+by ordinary equality; its six edge cases now compare raw bits and actual
+storage/element Classes, with explicit NaN-payload/signed-zero oracle controls.
+Both complete JVM namespaces pass 34 tests / 555 assertions. Exact-head CI for
+these corrections remains required.
+
+Previous completed exact-head CI is `667d2c8ca`: all sixteen unit shards
 (35308) finish with 7,740 tests / 95,063 pass / 46 failures / 117 errors across
 135 failing Vars. Both resident preflight regressions recover, no new failing
 Vars appear, and all prior outcome Vars remain. CPU-OpenCL 35309 finishes all

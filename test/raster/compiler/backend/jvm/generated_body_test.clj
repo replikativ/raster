@@ -744,9 +744,40 @@
   (try
     (let [values (invoke function arguments)]
       {:value-bits (Double/doubleToRawLongBits (double (first values)))
+       :gradient-class (class (second values))
        :gradient (vec (second values)) :inactive (vec (drop 2 values))})
     (catch java.lang.reflect.InvocationTargetException error [:error (class (.getCause error))])
     (catch Throwable error [:error (class error)])))
+
+(defn- bitwise-gradient-observation [observation]
+  (if (map? observation)
+    (update observation :gradient
+            (fn [gradient]
+              (mapv (fn [value]
+                      [(class value)
+                       (cond
+                         (instance? Float value) (Float/floatToRawIntBits value)
+                         (instance? Double value) (Double/doubleToRawLongBits value)
+                         :else value)])
+                    gradient)))
+    observation))
+
+(deftest gradient-observation-preserves-nan-payload-zero-and-storage-class
+  (let [observe-array (fn [gradient]
+                        (bitwise-gradient-observation
+                         {:gradient-class (class gradient) :gradient (vec gradient)}))
+        nan (Float/intBitsToFloat 0x7fc00001)
+        other-nan (Float/intBitsToFloat 0x7fc00002)]
+    (is (= (observe-array (float-array [nan]))
+           (observe-array (float-array [nan]))))
+    (is (not= (observe-array (float-array [nan]))
+              (observe-array (float-array [other-nan]))))
+    (is (not= (observe-array (float-array [0.0]))
+              (observe-array (float-array [-0.0]))))
+    (is (not= (observe-array (float-array [1.0]))
+              (observe-array (double-array [1.0]))))
+    (is (= [:error NullPointerException]
+           (bitwise-gradient-observation [:error NullPointerException])))))
 
 (deftest unchanged-training-whole-helpers-preserve-values-and-failure-domains
   (entry/call-with-definition-inputs
@@ -851,7 +882,10 @@
                           [(float-array 17) (float-array 1) (float-array 1) 1 17]
                           [(float-array 17) (float-array 17) (float-array 0) 1 17]
                           [(float-array 17) (float-array 0) (float-array 0) 0 17]]]
-         (is (= (observe original arguments) (observe compiled arguments))))))))
+         ;; Numeric equality rejects separately boxed NaNs. Keep their exact
+         ;; payload bits and actual storage/element Classes in this oracle.
+         (is (= (bitwise-gradient-observation (observe original arguments))
+                (bitwise-gradient-observation (observe compiled arguments)))))))))
 
 (deftest unused-helper-arguments-are-converted-before-body-effects
   (entry/call-with-definition-inputs

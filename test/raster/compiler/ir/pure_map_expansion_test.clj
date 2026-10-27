@@ -180,12 +180,14 @@
                         (assoc-in emission [:pmap-expansions token :recipe :count] 'foreign-count)
                         (assoc-in emission [:pmap-expansions token :status] :ambiguous)]]
          (is (nil? (bytecode/retained-pmap-spine changed original))))
-       (doseq [role [:map-return :root-return]
-               changed [(assoc-in emission [:pmap-results [token role] :status] :ambiguous)
-                        (update-in emission [:pmap-results [token role] :local :slot] inc)
-                        (assoc-in emission [:pmap-results [token role] :local :reference-class]
+       (is (some? (:map-effect expansion)))
+       (doseq [[role owner] [[:map-return (:map-effect expansion)]
+                             [:root-return token]]
+               changed [(assoc-in emission [:pmap-results [owner role] :status] :ambiguous)
+                        (update-in emission [:pmap-results [owner role] :local :slot] inc)
+                        (assoc-in emission [:pmap-results [owner role] :local :reference-class]
                                   (class (double-array 0)))
-                        (assoc-in emission [:pmap-results [token role] :expression]
+                        (assoc-in emission [:pmap-results [owner role] :expression]
                                   (with-meta (symbol (name (get expansion role)))
                                     (meta (get expansion role))))]]
          (is (nil? (bytecode/retained-pmap-spine changed original))))))))

@@ -418,7 +418,9 @@
    This only retains logical names: it never creates storage, acquires it, changes
    its source/initialization, or proves a producer completed. The caller must
    validate materialization first; identical tokens alone are not alias proof."
-  [realized materialized program-values]
+  ([realized materialized program-values]
+   (retain-materialized-storage-aliases realized materialized program-values {}))
+  ([realized materialized program-values scratch-parameters]
   (reduce-kv
    (fn [realized compiler-value buffer]
      (let [token (:id buffer)
@@ -430,7 +432,18 @@
            (when-not (and (= token (:id owned))
                           (or (nil? existing) (= existing token))
                           (= (:shape owned) (:shape buffer))
-                          (identical? (:source owned) (:source buffer))
+                          (or (identical? (:source owned) (:source buffer))
+                              ;; Owned scratch deliberately discards its host
+                              ;; initializer. Compare aliases to the separately
+                              ;; checked original parameter, never restore it.
+                              (when-let [parameter (get scratch-parameters token)]
+                                (and (= :scratch (:role owned))
+                                     (nil? (:source owned))
+                                     (= :unspecified (:initialization owned))
+                                     (= token (:id parameter))
+                                     (= (:shape owned) (:shape parameter))
+                                     (identical? (:source parameter) (:source buffer))
+                                     (av/storage-contract-compatible? (:value parameter) (:value buffer)))))
                           (av/storage-contract-compatible? (:abstract owned) (:value buffer))
                           (av/storage-contract-compatible? expected (:value buffer)))
              (fail! :invocation-ordered-input-storage
@@ -439,7 +452,7 @@
            (-> realized
                (assoc-in [:buffers compiler-value] token)
                (update-in [:storage token :compiler-values] conj compiler-value))))))
-   realized (:program-buffers materialized)))
+   realized (:program-buffers materialized))))
 
 (defn- lower-loop-storage
   [state invocation-id equation scalars caller-options]
@@ -670,6 +683,26 @@
                  "realized scratch cannot change role or acquire a host initializer"
                  {:storage token :role (:role storage) :initialization (:initialization storage)})))
       expected)))
+
+(defn- ordered-scratch-alias-evidence
+  "Retain host identity evidence only for independently checked public scratch roots."
+  [state root-roles]
+  (if-not (some #{:scratch} (vals root-roles))
+    {}
+    (reduce-kv
+     (fn [result _ buffer]
+       (let [token (:id buffer)]
+         (if-not (= :scratch (get root-roles token))
+           result
+           (do
+             (when-let [prior (get result token)]
+               (when-not (and (= (:shape prior) (:shape buffer))
+                              (identical? (:source prior) (:source buffer))
+                              (av/storage-contract-compatible? (:value prior) (:value buffer)))
+                 (fail! :invocation-ordered-input-storage
+                        "scratch aliases disagree on their original public parameter" {:storage token})))
+             (assoc result token buffer)))))
+     {} (ordered-entry-buffers state))))
 
 (defn- retain-ordered-scratch-storage
   [realized root-roles]
@@ -1552,8 +1585,9 @@
           overwrite (write-before-read-inputs boundaries available scalars)
           acquired (:acquired-storage state)
           root-roles (checked-ordered-entry-root-roles state)
+          scratch-parameters (ordered-scratch-alias-evidence state root-roles)
           realized-prefix (retain-materialized-storage-aliases
-                           (:realized state) available (:values program))
+                           (:realized state) available (:values program) scratch-parameters)
           unacquired (update available :program-buffers
                              (fn [buffers]
                                (into {} (remove (fn [[id buffer]]
@@ -1566,7 +1600,7 @@
                                                     true))) buffers)))
           realized (add-materialized-inputs realized-prefix unacquired (:values program)
                                             overwrite required)
-          realized (retain-materialized-storage-aliases realized available (:values program))
+          realized (retain-materialized-storage-aliases realized available (:values program) scratch-parameters)
           realized (retain-ordered-scratch-storage realized root-roles)
           realized (lower-equation-storage realized (get-in materialization [:plan :id]) equation
                                             (:values program) scalars (:projections (checked-ordered-validation state))
@@ -2085,8 +2119,10 @@
                   (= (:source-cursor state) (count (:source-order state))))
      (fail! :invocation-ordered-incomplete "source work has not completed" {}))
    (let [materialized (materialization/finish-materialization (:materialization state))
+         root-roles (checked-ordered-entry-root-roles state)
          state (update state :realized retain-materialized-storage-aliases
-                       materialized (get-in state [:program :values]))
+                       materialized (get-in state [:program :values])
+                       (ordered-scratch-alias-evidence state root-roles))
          initialized-tokens (into #{}
                                   (keep (fn [[token storage]]
                                           (when (= :zero (:initialization storage)) token)))
@@ -2099,7 +2135,6 @@
                                     {:equation (:id equation)}))
                            (:results step)))
          entry-refresh (:entry-refresh state)
-         _ (checked-ordered-entry-root-roles state)
          captured (into #{} (keep (fn [[token role]] (when (not= :input role) token))) entry-refresh)
          project
          (fn [candidate]
