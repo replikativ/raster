@@ -1619,6 +1619,24 @@
           (assoc child :source-original
                  (get (:invocation-catalog emission) (::call-occurrence (meta operand)))))))))
 
+(defn- retained-immediate-source-input
+  [emission source input]
+  (let [actual (:operand input)
+        scope-token (::binding-scope-occurrence (meta source))
+        call-token (::call-occurrence (meta source))
+        completed (retained-owned-completion-context emission source)
+        reduction (retained-reduction-emission emission source)]
+    (when (or (and scope-token
+                   (identical? source (get (:binding-catalog emission) scope-token))
+                   (identical? scope-token (::binding-scope-occurrence (meta actual))))
+              (and call-token
+                   (identical? source (get (:invocation-catalog emission) call-token))
+                   (identical? call-token (::call-occurrence (meta actual))))
+              (and completed
+                   (or (identical? actual source) (identical? actual (:expression completed))))
+              (and reduction (identical? actual (get-in reduction [:bound :expression]))))
+      (assoc input :source-original source))))
+
 (defn ^:no-doc retained-input-source-context
   "Associate a compound input with its ORIGINAL owned source occurrence.
    This proves correspondence, not semantic equivalence of arbitrary expanded
@@ -1631,29 +1649,8 @@
       (when (and (integer? input-index) (<= 0 input-index)
                  (= (count arguments) (count (:inputs parent)))
                  (< input-index (count arguments)))
-        (let [source (nth arguments input-index)
-              input (nth (:inputs parent) input-index)
-              actual (:operand input)
-              scope-token (::binding-scope-occurrence (meta source))
-              call-token (::call-occurrence (meta source))
-              completed (retained-owned-completion-context emission source)
-              reduction (retained-reduction-emission emission source)]
-          (when (or (and scope-token
-                         (identical? source (get (:binding-catalog emission) scope-token))
-                         (identical? scope-token (::binding-scope-occurrence (meta actual))))
-                    (and call-token
-                         (identical? source (get (:invocation-catalog emission) call-token))
-                         (identical? call-token (::call-occurrence (meta actual))))
-                    ;; A canonical input completion is its own catalogued occurrence.
-                    ;; Preserve the immediate wrapper, not just a nested call token.
-                    (and completed
-                         (or (identical? actual source)
-                             (identical? actual (:expression completed))))
-                    ;; Reduction expansion changes the immediate input's
-                    ;; syntax. Its actual emitted bound scope, not a copied
-                    ;; source token, establishes this parent/region edge.
-                    (and reduction (identical? actual (get-in reduction [:bound :expression]))))
-            (assoc input :source-original source)))))))
+        (retained-immediate-source-input
+         emission (nth arguments input-index) (nth (:inputs parent) input-index))))))
 
 (defn- retain-scalar-conversion! [ctx operand input-type target-carrier locals & [source-operation]]
   (when-let [token (::call-occurrence ctx)]
@@ -3284,7 +3281,7 @@
              (range) source-arguments owned-arguments inputs)]
         (when (every? some? edges) edges)))))
 
-(defn- retain-zero-array-allocation! [ctx array-class count-source count-type locals proof]
+(defn- retain-zero-array-allocation! [ctx array-class count-source count-type locals proof operand-policy]
   (when me/*emission-inputs*
     (retain-call-observation!
        ctx :array-allocation-contexts
@@ -3293,6 +3290,7 @@
         :primitive-count? (and (contains? #{:int :long} count-type) (empty? (:open proof)))
         :count-routes (:routes proof)
         :count (assoc (physical-operand-input count-source locals ctx)
+                      :source-policy operand-policy
                       :input-type count-type :completed-type :int
                       :completion :raw-jvm-int)} nil)))
 
@@ -3302,6 +3300,28 @@
    Filled/literal allocations and copied source occurrences have no observation."
   [emission original]
   (retained-call-observation emission original :array-allocation-contexts))
+
+(defn ^:no-doc retained-input-array-count-context
+  "Join one exact original newarray count to its actual consumed input.
+   The allocation is an opcode producer, not a fabricated invocation Method.
+   This grants correspondence only: no callback, capacity, range or replay proof."
+  [emission input-body original]
+  (when-let [owned (input-origin emission input-body original :invocation)]
+    (when-let [record (retained-zero-array-allocation emission owned)]
+      (let [source-arguments (vec (util/call-args original))
+            owned-arguments (vec (util/call-args owned))
+            source (first source-arguments) owned-count (first owned-arguments)
+            input (:count record)
+            compound? (some #(identical? owned-count (input-origin emission input-body source %))
+                            [:invocation :binding :completion :reduction])
+            edge (when compound? (retained-immediate-source-input emission owned-count input))
+            leaf? (and (or (symbol? source) (types/numeric-literal-carrier source))
+                       (identical? source owned-count) (identical? source (:operand input)))]
+        (when (and (= 1 (count source-arguments) (count owned-arguments))
+                   (source-policy/valid? (:source-policy input))
+                   (or leaf? (and edge (identical? owned-count (:source-original edge)))))
+          (assoc input :source-original source :owned-source owned-count
+                       :source-input original :allocation record))))))
 
 (defn ^:no-doc retained-map-effect-expansion
   "The consumed standard map expansion and its actual bound/return observations.
@@ -3750,10 +3770,11 @@
                        ;; (double-array n) — size-only, zero-filled
                        :else
                        (do (let [proof (atom {:open {} :routes []})
+                                 operand-policy (source-policy/capture)
                                  t (emit-form code arg locals (assoc ctx ::index-proof proof))]
                              (when (not= t :int) (emit-coerce code t :int))
                              (when (= 1 (count args))
-                               (retain-zero-array-allocation! ctx (class (double-array 0)) arg t locals @proof)))
+                               (retain-zero-array-allocation! ctx (class (double-array 0)) arg t locals @proof operand-policy)))
                            (.newarray code java.lang.classfile.TypeKind/DOUBLE) :ref)))
     "float-array"  (let [arg (first args)]
                      (cond
@@ -3791,10 +3812,11 @@
                        ;; (float-array n) — size-only, zero-filled
                        :else
                        (do (let [proof (atom {:open {} :routes []})
+                                 operand-policy (source-policy/capture)
                                  t (emit-form code arg locals (assoc ctx ::index-proof proof))]
                              (when (not= t :int) (emit-coerce code t :int))
                              (when (= 1 (count args))
-                               (retain-zero-array-allocation! ctx (class (float-array 0)) arg t locals @proof)))
+                               (retain-zero-array-allocation! ctx (class (float-array 0)) arg t locals @proof operand-policy)))
                            (.newarray code java.lang.classfile.TypeKind/FLOAT) :ref)))
     ;; Casts
     "double" (let [t (emit-form code (first args) locals ctx)]
@@ -8189,11 +8211,15 @@
 
 (defn- compile-raw-int-input-region
   [emission input input-type element-type guard]
-  (compile-owned-input-region
-   emission input Integer/TYPE
-   {:return-tag 'int :walked-body [(:operand input)]
-    :element-type element-type
-    ::body-input-context (:context input) ::expected-body-type input-type} guard))
+  (let [policy (:source-policy input)]
+    (when-not (source-policy/valid? policy)
+      (throw (ex-info "Array count replay lacks its original operand source policy"
+                      {:reason :unclosed-bytecode-array-count-policy})))
+    (compile-owned-input-region
+     emission input Integer/TYPE
+     {:return-tag 'int :walked-body [(:operand input)] :source-policy policy
+      :element-type element-type
+      ::body-input-context (:context input) ::expected-body-type input-type} guard)))
 
 (defn ^:no-doc compile-array-index-region
   "Outline an owned read's actual index and source Int completion.

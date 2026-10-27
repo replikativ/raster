@@ -1,6 +1,7 @@
 (ns raster.compiler.backend.jvm.array-allocation-emission-test
   (:require [clojure.test :refer [deftest is]]
             [raster.core :as core :refer [deftm]]
+            [raster.compiler.core.types :as types]
             [raster.compiler.backend.jvm.bytecode :as bytecode]))
 
 (deftm fresh-doubles [n :- Long] :- (Array double) (double-array n))
@@ -104,3 +105,79 @@
               (update emission :completed-definition-revision inc) source)
              nil
              (catch clojure.lang.ExceptionInfo failure (:reason (ex-data failure))))))))
+
+(defn- fresh-count-emission [unchecked? operand]
+  (let [node (list 'clojure.core/double-array operand)
+        input-body [node]
+        interface (types/ensure-fn-interface! '[long long])
+        emitted (binding [*unchecked-math* unchecked?]
+                  (core/emit-owned-bytecode!
+                   bytecode/compile-typed-impl! "raster.compiled.FrozenArrayCount"
+                   '[x y] '[long long] 'Object input-body
+                   (the-ns 'raster.compiler.backend.jvm.array-allocation-emission-test)
+                   (:iface-name interface) 'frozen-array-count))
+        original (first (filter #(bytecode/retained-zero-array-allocation (:emission emitted) %)
+                                (vals (get-in emitted [:emission :invocation-catalog]))))]
+    (assoc emitted :input-body input-body :source node :original original)))
+
+(defn- count-outcome [f & arguments]
+  (try {:value (apply f arguments)} (catch Throwable failure {:error (class failure)})))
+
+(deftest array-count-replay-retains-frozen-operand-policy-under-opposite-ambient-policy
+  (doseq [unchecked? [false true]]
+    (let [operand '(clojure.core/+ (clojure.core/int x) y)
+          {:keys [implementation emission input-body source original]}
+          (fresh-count-emission unchecked? operand)
+          input (bytecode/retained-input-array-count-context emission input-body source)
+          region (binding [*unchecked-math* (not unchecked?)]
+                   (bytecode/compile-array-count-region emission original))]
+      (is (= {:unchecked-math unchecked?} (:source-policy input)))
+      (is (identical? operand (:source-original input)))
+      (is (identical? (:operand input) (get-in input [:allocation :count :operand])))
+      (is (= '[x y] (:parameters region)))
+      (is (= {:unchecked-math unchecked?} (get-in region [:spec :source-policy])))
+      (doseq [[x y] [[0 0] [3 2] [-1 0] [4294967297 0]]]
+        (let [count-result (count-outcome (:invoke region) x y)
+              allocated (count-outcome #(alength (implementation %1 %2)) x y)]
+          (if-let [error (:error count-result)]
+            (is (= error (:error allocated)))
+            (if (neg? (:value count-result))
+              (is (= NegativeArraySizeException (:error allocated)))
+              (is (= count-result allocated))))))))
+  (let [{:keys [emission original]} (fresh-count-emission false 'x)
+        region (binding [*unchecked-math* true]
+                 (bytecode/compile-array-count-region emission original))]
+    (is (= 1 ((:invoke region) 4294967297)))
+    (is (= -1 ((:invoke region) -1)) "the raw Int count region never allocates")))
+
+(deftest array-count-origin-and-policy-cannot-be-copied-or-filled-from-ambient-state
+  (let [{:keys [emission input-body source original]}
+        (fresh-count-emission false '(clojure.core/+ x y))
+        foreign (fresh-count-emission false '(clojure.core/+ x y))
+        token (:raster.compiler.backend.jvm.bytecode/call-occurrence (meta original))
+        constructions (atom 0)]
+    (is (some? (bytecode/retained-input-array-count-context emission input-body source)))
+    (is (nil? (bytecode/retained-input-array-count-context
+               (assoc-in emission [:array-allocation-contexts token :status] :ambiguous)
+               input-body source)))
+    (is (nil? (bytecode/retained-input-array-count-context
+               (update-in emission [:array-allocation-contexts token :count] dissoc :source-policy)
+               input-body source)))
+    (doseq [[owner body node]
+            [[emission input-body (with-meta (apply list source) (meta source))]
+             [emission (vec (seq input-body)) source]
+             [(:emission foreign) input-body source]]]
+      (is (nil? (bytecode/retained-input-array-count-context owner body node))))
+    (with-redefs [bytecode/compile-specialized-class!
+                  (fn [& _] (swap! constructions inc)
+                    (throw (AssertionError. "unowned count reached class construction")))]
+      (is (= :unclosed-bytecode-array-count-policy
+             (try (bytecode/compile-array-count-region
+                   (update-in emission [:array-allocation-contexts token :count] dissoc :source-policy)
+                   original)
+                  :accepted
+                  (catch clojure.lang.ExceptionInfo failure (:reason (ex-data failure))))))
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (bytecode/compile-array-count-region
+                    (update emission :completed-definition-revision inc) original)))
+      (is (zero? @constructions)))))
