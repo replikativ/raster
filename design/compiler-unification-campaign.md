@@ -220,8 +220,19 @@ full assertions/adoption, standalone required/optional semantics, owner CAS and
 authentic prerequisite propagation remain intact. No analysis result is memoized
 in this slice. Independent review found no remaining blocker; the combined
 source, AD-lifetime, inlining, normal-return, pipeline and fingerprint gate passes
-206 tests / 1,639 assertions. Remaining structural union and lexical-environment
+207 tests / 1,643 assertions, including real registered-pipeline activation.
+Remaining structural union and lexical-environment
 construction costs must be measured rather than described as constant time.
+
+Qualification exposed a REPL orchestration trap: `pass-specs` captures function
+objects, so re-evaluating the `pass-fixpoint` Var alone leaves public dispatch on
+the old pass. The initial post-isolation warm timing therefore cannot establish
+the new pass's performance. The reload/probe now refreshes and verifies registry
+identity, and a public `run-passes` regression checks actual analysis activation.
+With the registry current, the small optimizer probe admits 285 queries and
+retains strict fallback for 76 (previously all 361 were fallback). Its capacity
+refusal remains unchanged. A corrected whole-GSDM timing is still required;
+further source-normalization scope expansion is held pending that measurement.
 
 One independent convergence-domain defect is corrected: compiler fixpoints now
 use pair-local retained-source equality, allowing exact immutable Class identity,

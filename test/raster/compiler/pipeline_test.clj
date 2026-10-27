@@ -3,6 +3,7 @@
             [clojure.test :refer [deftest testing is]]
             [pattern.nanopass.dialect :as nanopass]
             [raster.compiler.pipeline :as pipeline]
+            [raster.compiler.core.method-entry :as method-entry]
             [raster.compiler.passes.scalar.simplify :as simplify]
             [raster.compiler.passes.scalar.inline :as inline]
             [raster.compiler.passes.scalar.soa-lower :as soa-lower]
@@ -14,18 +15,40 @@
             [raster.compiler.ir.dialects :as dialects]
             [raster.ad.reverse :as rad]))
 
-(defn- isolated-fixpoint [input expand]
+(defn- isolated-fixpoint
   ;; Isolate termination from producer behavior. Real compiled workloads remain
   ;; covered by pipeline-quality-test; these controls exercise metadata invisible
   ;; to Clojure = without asking another pass to invent that metadata for us.
-  (with-redefs-fn
+  ([input expand] (isolated-fixpoint input expand #(#'pipeline/pass-fixpoint % {})))
+  ([input expand run!]
+   (with-redefs-fn
     {#'inline/expand-for-backends (fn [form & _] (expand form))
      #'soa-lower/lower-local-constructors (fn [form & _] form)
      #'local-products/lower-local-products (fn [form _context] form)
      #'pipeline/tag-binding-types (fn [form & _] form)
      #'pipeline/carry-void-binding-contracts identity
      #'pipeline/record-fixpoint-census! (fn [& _])}
-    #(#'pipeline/pass-fixpoint input {})))
+    #(run! input))))
+
+(deftest registered-fixpoint-runs-the-definition-analysis-owner-through-public-pipeline
+  (let [input '(let* [x 1.0] x)
+        owner (atom {:static [] :values []})
+        calls (atom 0)
+        analysis! method-entry/call-with-definition-analysis]
+    ;; pass-specs stores function VALUES: replacing/reloading only the private
+    ;; Var can otherwise leave public orchestration on an obsolete function.
+    (is (identical? @#'pipeline/pass-fixpoint (get-in @#'pipeline/pass-specs [:fixpoint :fn])))
+    (binding [method-entry/*emission-inputs* owner]
+      (with-redefs [method-entry/call-with-definition-analysis
+                    (fn [construct]
+                      (swap! calls inc)
+                      (analysis! construct))]
+        (is (= input
+               (isolated-fixpoint
+                input identity
+                #(pipeline/run-passes % [:fixpoint] {} :structured-reductions))))))
+    (is (= 1 @calls))
+    (is (method-entry/assert-definition-inputs-current! @owner))))
 
 (deftest fixpoint-consumes-metadata-only-repairs
   (let [input '(let* [value 1.0] value)
