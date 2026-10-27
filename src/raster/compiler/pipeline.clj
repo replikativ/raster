@@ -904,6 +904,8 @@
       (when-let [policy (ns-resolve source-emitter 'binding-completion-plan)]
         (binding-completion/capture-resolution-context policy)))))
 
+(def ^:private ^:dynamic *gpu-source-construction* false)
+
 (defn- contextual-reduction-constructor
   "One attempt-local owner service shared by map projection and reductions.
    Each exact current source candidate has at most one witness, not one per call."
@@ -922,7 +924,7 @@
                         ;; prepare it. Do that explicitly in orchestration
                         ;; before the first current-source witness, including
                         ;; reduction requests preceding the public footer.
-                        (let [prepared (rcore/prepare-owned-source-frontend! source-var)]
+                        (let [prepared (me/demand-original-source-frontend! source-var)]
                           (vreset! original prepared)
                           prepared))))
         owner! (fn [source]
@@ -1036,7 +1038,8 @@
   ;; again inside admission would defeat the shared identity-keyed witness.
   (let [source (if (device/gpu-target? (:target-device opts))
                  (inline/flatten-nested-lets source) source)]
-   (if (and (device/gpu-target? (:target-device opts)) (var? (:source-var opts)))
+   (if (and *gpu-source-construction*
+            (device/gpu-target? (:target-device opts)) (var? (:source-var opts)))
     (let [construct (contextual-reduction-constructor opts)
           projection (construct {:kind :direct-double-map-payloads :source source})
           source (or (:form projection) source)]
@@ -1458,8 +1461,6 @@
     (let [result (gensym "parallel_result_")]
       (with-meta (list 'let* [result source] result) (meta source)))))
 
-(def ^:private ^:dynamic *gpu-source-construction* false)
-
 (defn ^:no-doc call-with-gpu-source-construction
   "Share one local generated-source constructor across a GPU frontend request.
    Derived AD code carries executable return computations, not early-node proof
@@ -1781,7 +1782,8 @@
                        (let [raw-form (if (= 1 (count walked-body))
                                         (first walked-body)
                                         (list* 'do walked-body))
-                             form (run-passes raw-form forward-passes opts)
+                             form (call-with-gpu-source-construction
+                                   target-device #(run-passes raw-form forward-passes opts))
                              hoist-opts (cond-> {:dtype effective-dtype :reuse-buffers? reuse-buffers?
                                                 :prepare-static-source rcore/prepare-original-static-source!}
                                           param-env (assoc :param-env param-env)
@@ -2248,6 +2250,8 @@
                       :or {on-non-resident :throw gemm-precision :mixed-f16-f32}}]
   (me/call-with-definition-inputs
    (fn []
+    (call-with-gpu-source-construction device-id
+   (fn []
   (when (dispatch/host-only? f-var)
     (throw (ex-info "GPU compilation was requested for an explicitly host-only deftm"
                     {:reason :gpu-compiler-host-only
@@ -2682,7 +2686,7 @@
          (report/with-residency
            (report/from-pipeline
             (diagnostic->pipeline-map raw-form :opencl compiler-diagnostic))
-           (count (:allocs prog))))})))))
+           (count (:allocs prog))))})))))))
 
 (defn- realize-identity-tail
   "Expose an uncoerced final initializer at the source projection's tail.

@@ -30,6 +30,23 @@
      #'pipeline/record-fixpoint-census! (fn [& _])}
     #(run! input))))
 
+(deftest gpu-target-metadata-does-not-authorize-source-construction
+  (let [constructed (atom 0)
+        source '(let* [result 1.0] result)
+        options {:target-device :ocl:0 :source-var #'identity}
+        attempt #(do (#'pipeline/semantic-program-attempt source options nil))]
+    ;; Only dispatch is isolated. The public construction scope and its actual
+    ;; definition-input owner are real; no fabricated physical proof is issued.
+    (with-redefs-fn
+      {#'pipeline/contextual-reduction-constructor
+       (fn [_] (swap! constructed inc) (fn [_] nil))
+       #'pipeline/semantic-program-attempt* (fn [form _ _] {:source form})}
+      (fn []
+        (is (= {:source source} (attempt)))
+        (is (zero? @constructed) "a target-tagged optional query remains nonconstructing")
+        (is (= {:source source} (pipeline/call-with-gpu-source-construction :ocl:0 attempt)))
+        (is (= 1 @constructed) "only the explicit public construction scope authorizes its service")))))
+
 (deftest registered-fixpoint-runs-the-definition-analysis-owner-through-public-pipeline
   (let [input '(let* [x 1.0] x)
         owner (atom {:static [] :values []})
