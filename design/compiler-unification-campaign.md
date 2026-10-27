@@ -4,17 +4,23 @@
 
 ### Current boundary ledger
 
-Latest exact-head accounting, `97ee525e7` (October 26): unit job 35142 and
-CPU-OpenCL job 35143 fail; this branch is not merge-ready. All sixteen unit
-shards complete: 7,648 tests, 95,069 passing assertions, 23 failures and 28
-errors across 40 failing Vars. CPU-OpenCL has all four completed shards: 676
+Latest completed unit/CPU accounting, `9fa741b79` (October 27): unit job 35165
+and CPU-OpenCL job 35161 fail; this branch is not merge-ready. The newer pushed
+array-identity checkpoint `406740f2f` also has red unit/CPU checks; its detailed
+failure inventory is not yet reconciled here.
+All sixteen unit shards complete: 7,659 tests, 95,156 passing assertions, 22 failures and 28
+errors across 39 failing Vars. CPU-OpenCL has all four completed shards: 676
 tests, 8,617 passing assertions, 6 failures and 27 errors across 31 failing Vars.
-Setup, build, emitted-source, CUDA and HIP compiler checks pass. Compiler-only
+Setup, build and emitted-source checks pass at this checkpoint; the last
+completed CUDA/HIP gates passed at `be3adbe0a`. Compiler-only
 vendor checks do not establish native execution or waive the failed unit/device
 gates. These complete reports supersede the older incomplete checkpoint counts
 below; failure-count changes against incomplete shards are not regression or
 test-removal measurements. The source-capacity alias refusals remain under
 investigation; completed-boundary fixture repairs are locally qualified below.
+The constructor/inactive-input checkpoint adds nine tests and 53 passing
+assertions without losing any previously observed Var or assertion; the same
+39 unit and 31 CPU failing Vars remain. This is not a failure waiver.
 
 The shared hardware-free output fixture now constructs a valid effect-checked
 plan, exact buffer/view geometry, and an initially uncompleted owner. Storage and
@@ -40,6 +46,12 @@ It requires the original checked expression to remain and still refuses that
 same expression if forged into a pure `ScalarCompute`. The affected namespace
 passes 14 tests / 82 assertions; this updates an obsolete test expectation,
 not the runtime effect or completion contract.
+
+The `be3adbe0a` unit artifacts retain all 7,649 previously observed Vars and
+add one differential-oracle test (17 assertions); no previously observed Var
+or assertion is missing. The checked-completion expectation accounts for the
+one removed failure. The remaining failure families are unchanged; this is not
+qualification of the full campaign.
 
 The in-progress correction distinguishes an attached InvocationPlan from actual
 scalar-proof demand: strict source correspondence is necessary when a leaf uses
@@ -262,6 +274,34 @@ A warmed alternating-order probe on the captured small optimizer
 source measures about 301 KB per call for the old traversal versus 107 KB for
 the accumulator (65% less thread allocation). This is a local analysis result,
 not an end-to-end compile-time speedup; full-model measurements remain separate.
+
+The optimizer capacity investigation rejected a physical-field shortcut: the
+generated immutable container's array-declared fields are physically `Object`,
+so a normal field read alone supplies no primitive-array payload proof. That
+draft was removed before publication. The next bounded transfer uses a prior
+authentic typed invocation's checked array argument: only its successful
+successor boundary may refine the stable argument's conditional storage fact.
+Earlier field-definition facts and numerical consumers must remain unchanged;
+the original call, checked conversion and exception order must remain in source.
+The draft transfer passes the mixed-precision SGD/Adam regression (1 test / 20
+assertions), existing boundary suites (74 / 659), and the two-layer GSDM forward
+and five-update Adam case (2 / 3). Its warm training preparation takes 163.5
+seconds; this is not a controlled speedup. The latest profile still highlights
+effect analysis and source-footprint validation, rather than free-symbol set
+construction. Neither the draft nor these overlapping gates qualify all training.
+
+Stronger tests exposed a separate shared-inliner miscompile and block landing:
+a typed array-argument helper returning a constant loses its argument CHECKCAST.
+With an Object-valued field containing a String, original code throws after the
+first observable write; compiled code returns 7 and performs the second write.
+`argument-substitution` skips primitive-array bindings, so an unused formal and
+its check disappear at whole-call expansion, before DCE. The repair must preserve
+actual invocation input completions in argument order through the shared
+`build-inline-expansion` boundary; unavailable physical context must retain the
+call. Formal type tags are not completion evidence. Both expansion routes,
+argument failure/evaluation order and portable alias handling require tests.
+The nullable-helper/runtime-zero-map case currently refuses capacity admission;
+that refusal is not a substitute for repairing the lost check.
 
 One independent convergence-domain defect is corrected: compiler fixpoints now
 use pair-local retained-source equality, allowing exact immutable Class identity,
@@ -7338,3 +7378,97 @@ this is not a controlled compile-time benchmark. Full 2-layer/32-dimensional
 GSDM statistical training, Adam/EMA coverage, real-weight Gemma adapter gates,
 and normalized AD general composition/default migration remain separate open
 acceptance obligations.
+
+### Whole-call preservation checkpoint (2026-10-27, not yet release-qualified)
+
+Inlining an authenticated helper body is not by itself a sound replacement for
+its invocation. The replacement must retain, in order, operand evaluation and
+input conversions, the callee's body evaluation context, compute-return conversion,
+one interface-result publication, and the caller's result conversion. Unused
+arguments still owe their original checks; one returned Object must not become
+separate boxing operations at each use.
+
+The current focused draft passes differential tests for Double-to-Float input
+rounding, a failing unused array argument before a later effectful argument,
+nullable unused arrays, and repeated reference identity of a boxed return. The
+capacity proof remains conditional on the successful original typed call and
+does not grant non-nullness, ownership or freshness. A genuine selected typed
+helper also exercises actual expansion, rather than passing by retaining all
+calls. These are bounded positive and negative checks, not complete language
+coverage.
+
+Integration remains open: generic AD cannot transpose the invocation's checks
+and publication nodes as if they were numerical operators. Consolidation must
+reuse the existing owned helper/paired-program producer, preserve the primal
+completion spine, and differentiate only its authenticated numerical program.
+Do not relax unowned-completion rejection or accept a caller-supplied numerical
+payload as evidence. Current broader inlining/AD tests still fail, so this draft
+must not be merged or described as a completed AD migration.
+
+At the public GPU compilation boundary, source selection now supplies body,
+parameters, namespace and owner from one dtype-selected frontend projection.
+The prior independent first-overload selection could disagree with the walked
+body. Seven focused CPU/GPU ownership checks pass (129 assertions); native/device
+execution and the broader whole-call integration remain separate gates.
+
+The shared application constructor is now factored into SourceImport. Emitted
+and bounded static evidence feed the same ordered input/body/return construction;
+neither grants a numerical projection merely by matching dtypes. Exact selected
+Method/source/implementation and historical capture guards remain owner-local.
+Foreign same-interface captures, modified artifacts, non-call inputs, stale
+capture guards and sibling-history isolation have regression controls. The
+generated-body/invocation/terminal integration gate passes 53 tests / 846
+assertions; the later overlapping focused constructor gate passes 7 / 111.
+
+The existing owned-bytecode AD input producer also handles inactive Int/Long
+controls and unused nullable arrays through its original outlined-region path.
+A separate proved-identity case reuses the original array value and its activity
+only when an exact retained symbol/port/completion and verifier Class make the
+CHECKCAST redundant. This preserves the existing memory root rather than
+inventing an alias for an opaque outlined return. Object/unverified references,
+compound active-array operands and active discrete conversions still refuse at
+this producer; these refusals do not redefine the capabilities of other AD paths.
+Four affected AD namespaces pass 41 tests / 598 assertions with the committed
+inliner, and the genuine mixed array/count/scalar helper regression passes under
+the unfinished inliner draft too. Portable GPU projection and the broader draft
+remain open; no full-suite or performance conclusion follows from these gates.
+
+The next producer can join an original helper occurrence to its exact emitted
+call through InputOrigins, authenticate that caller module through the existing
+historical receiver-emission check, and derive a closed FP computation from the
+selected helper body. Original, physical and constructed semantic calls remain
+distinct under the receipt. A user helper named `sin` keeps its actual `+100`
+body; it is never registered as builtin sine. Numerical ports are completed
+input slots, not unevaluated source operands. The shared constructor now also
+rejects slot collisions with caller operands/ports and imported body binders.
+The five affected namespaces pass 100 tests / 1,226 assertions with the committed
+inliner. This qualifies the producer and its refusal controls only. Transport
+through source construction and the primitive map-result consumer are the next
+required steps; no general box erasure or GPU execution is granted by this receipt.
+
+### Compilation-latency follow-up: closed analysis results, not wider memoization
+
+The local JAX/MLIR review reinforces the existing ownership boundary. JAX's
+`linear_util.cache` restores transformation auxiliary stores along with cached
+answers; its call abstract evaluation returns retained output/effect summaries.
+MLIR's operation-local AnalysisManager records analysis dependencies and
+invalidates dependent analyses. These are useful models for retaining a result
+*with its original dependency observations*, not for authenticating an old
+result with fresh observations from a new compilation.
+
+The warm two-layer GSDM sample still spends substantial inclusive time in
+effect descriptors/Beichte analysis and dependency validation. These sample
+counts overlap and must not be added. The open-expression effect path currently
+rebuilds semantic syntax, local bindings and analyzer context; a closed-registry
+cache deliberately does not cover it. Do not widen that cache until its complete
+lookup dependencies are captured.
+
+After the whole-call correctness gate, measure a request-local analysis owner
+over immutable source revisions: selected-call, normal-return and effect-summary
+results retain their original dependency closure, reuse it under validation,
+and adopt that closure on hits. Keep purity distinct from casts, allocation
+checks and identity obligations. Source revision, math policy, lexical scope or
+changed obligations invalidate reuse; Classes, Methods, readiness and leases
+remain outside portable executable artifacts. Record actual analysis executions,
+cache hits, validation cost and retained-guard counts in the registered pipeline
+before claiming a compilation-time improvement.

@@ -1297,6 +1297,14 @@
          (assert-definition-inputs-current! @*emission-inputs*)
          observed)))))
 
+(defn ^:no-doc observed-frontend-emission
+  "Observe the exact receiver-owned module and retain its ORIGINAL history.
+   This grants freshness/module identity only, not source occurrence, numerical
+   equivalence or permission to execute/import an arbitrary transformed body."
+  [frontend]
+  (when *emission-inputs*
+    (frontend-emission-observation frontend identity)))
+
 (defn frontend-primitive-body-return-bridge
   "Observe the owned primitive body return, allowing primitive-array parameters.
    This query checks actual primitive completion, including array-taking helpers.

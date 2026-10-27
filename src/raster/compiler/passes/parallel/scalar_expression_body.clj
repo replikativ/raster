@@ -13,6 +13,7 @@
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.types :as types]
             [raster.compiler.core.method-entry :as method-entry]
+            [raster.compiler.core.call-boundary :as call-boundary]
             [raster.compiler.core.intrinsic-source :as intrinsic-source]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.kernel-body :as body]
@@ -1463,14 +1464,13 @@
          node)))
    body))
 
-(defn- selected-scalar-source
+(defn- selected-scalar-source*
   "Read the actual selected source and its emission without granting scalar
    semantics. Numerical constructors below separately close the complete body."
   [expression]
   (let [{:keys [dispatch? semantic-op implementation-op arguments lexical-callee]}
         (descriptor/call-description expression)]
-    (when (and dispatch? (not lexical-callee)
-               (some-> semantic-op intrinsics/canonical intrinsics/descriptor))
+    (when (and dispatch? (not lexical-callee))
       ;; Discover only the candidate identity. Current metadata is not proof
       ;; that an existing implementation was emitted from that metadata.
       (when-let [candidate (method-entry/selected-definition
@@ -1486,6 +1486,13 @@
               {:definition definition :entry entry :body body :original-body (first source-body)
                :body-context body-context :arguments arguments
                :operation semantic-op :implementation-op implementation-op})))))))
+
+(defn- selected-scalar-source [expression]
+  ;; Existing intrinsic/presence queries keep their original admission gate.
+  ;; The explicit owned-call query below separately proves actual selection.
+  (when (some-> (:semantic-op (descriptor/call-description expression))
+                intrinsics/canonical intrinsics/descriptor)
+    (selected-scalar-source* expression)))
 
 (defn- selected-strict-scalar-source [expression]
   ;; Keep the old generic presence-query grammar. A new numerical source
@@ -1849,3 +1856,36 @@
                   (every? true? (map completed-fp-argument?
                                      argument-facts (:parameter-carriers entry))))
          (selected-fp-body-recipe source))))))
+
+(defn owned-selected-call-fp-payload
+  "Derive a selected helper's FP payload from its actual registered Method.
+   Unlike intrinsic queries this does not assign primitive semantics by name.
+   The caller owns the original global occurrence and completed argument facts;
+   this query independently closes the selected source, emission and return
+   bridge. No preparation, box erasure, source substitution or motion is granted."
+  [expression actual-method argument-facts]
+  (method-entry/call-with-optional-definition-inputs
+   (fn []
+     (when (and method-entry/*emission-inputs* (seq? expression)
+                (= '.invk (first expression)))
+       (let [{:keys [semantic-op implementation-op arguments lexical-callee]}
+             (descriptor/call-description expression)
+             signature (when-not lexical-callee
+                         (call-boundary/selected-typed-signature
+                          semantic-op implementation-op (count arguments) actual-method))]
+         (when (= :known (:status signature))
+           (when-let [{:keys [entry definition] :as source} (selected-scalar-source* expression)]
+             (when (and (not (:pending-source? entry)) (:emission entry)
+                        (= actual-method (:invocation-method entry))
+                        (every? #(identical? (get definition %)
+                                            (get-in signature [:definition %]))
+                                [:source-var :receiver-var :entry])
+                        (identical? (get-in signature [:definition :entry :typed-impl])
+                                    (get-in entry [:emission :implementation]))
+                        (vector? argument-facts)
+                        (= (count arguments) (count argument-facts) (count (:parameter-carriers entry)))
+                        (every? true? (map completed-fp-argument?
+                                          argument-facts (:parameter-carriers entry))))
+               (when-let [recipe (selected-fp-body-recipe source)]
+                 (when (= actual-method (get-in recipe [:bridge :invocation-method]))
+                   (assoc recipe :definition definition :emission (:emission entry))))))))))))

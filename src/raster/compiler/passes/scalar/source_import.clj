@@ -1102,6 +1102,20 @@
 (defn- construct-helper-application
   [frontend invocation inputs parameters values body binding-facts return-contracts
    return-tag expose-spine?]
+  (letfn [(symbols [node]
+            (cond
+              (symbol? node) #{node}
+              (and (seq? node) (contains? '#{quote clojure.core/quote} (first node))) #{}
+              (map? node) (reduce into #{} (map symbols (mapcat identity node)))
+              (coll? node) (reduce into #{} (map symbols node))
+              :else #{}))]
+    (let [reserved (into (into (set parameters) (symbols body))
+                         (mapcat #(concat (symbols (:operand %)) (keys (:ports %))) inputs))]
+      (when-not (and (= (count inputs) (count parameters) (count values) (count (set values)))
+                     (every? #(and (symbol? %) (nil? (namespace %))
+                                   (not (contains? reserved %))) values))
+        (fail! :nonfresh-source-import-binder
+               "helper input slots must not capture caller operands or imported bindings" {}))))
   (let [argument-bindings
         (mapv (fn [value input]
                 [value (completion/complete-value (:contract input) (:operand input))])
@@ -1117,7 +1131,9 @@
                      :selected-method (:method invocation) :frontend frontend
                      :input-slots (mapv (fn [ordinal formal value input]
                                           {:ordinal ordinal :formal formal :value value
-                                           :operand (:operand input) :contract (:contract input)})
+                                           :operand (:operand input) :contract (:contract input)
+                                           :input input :completion (:completion input)
+                                           :ports (:ports input) :context (:context input)})
                                         (range) parameters values inputs)
                      :payload-ports values :numerical-projection nil
                      :return-recipe return-contracts
@@ -1323,3 +1339,106 @@
   (when method-entry/*emission-inputs*
     (method-entry/call-with-independent-definition-inputs
      #(construct-static-helper candidate occurrence source-options))))
+
+(defn- assert-helper-occurrence-current!
+  [frontend emission input-body original record]
+  (method-entry/assert-frontend-source! frontend (get-in frontend [:source-entry :source-var]))
+  ;; This is the module authenticated BEFORE receipt issuance. Its original
+  ;; history/physical-selection guards are already retained; never reenter a
+  ;; collecting frontend query from the enclosing receipt's reuse guard.
+  (method-entry/assert-emission-inputs-current! emission)
+  (let [current ((helper-backend 'retained-input-invocation-context)
+                 emission input-body original)]
+    (when-not (and (identical? emission (:emission frontend))
+                   (identical? input-body (:body frontend))
+                   (identical? original (:source-input current))
+                   (every? #(identical? (get record %) (get current %))
+                           [:expression :method :receiver :inputs :input-completions]))
+      (fail! :helper-application-occurrence
+             "helper application lost its exact original emitted occurrence" {}))))
+
+(defn- owned-occurrence-typed-call [original record]
+  ;; The emitter may desugar the actual expression to (. receiver invk ...).
+  ;; InputOrigins owns that construction edge; this is a NEW typed-call view,
+  ;; not a dot-form recognizer or a claim about an original syntax object.
+  (let [{:keys [dispatch? semantic-op implementation-op arguments lexical-callee]}
+        (descriptor/call-description original)
+        receiver (:receiver record)
+        inputs (:inputs record)]
+    (when (and dispatch? (not lexical-callee) (qualified-symbol? semantic-op)
+               (qualified-symbol? receiver) (= implementation-op receiver)
+               (= (count arguments) (count inputs))
+               (= :known (:status (call-boundary/selected-typed-signature
+                                   semantic-op receiver (count inputs) (:method record)))))
+      (with-meta (list* '.invk receiver (mapv :operand inputs))
+        {:raster.op/original semantic-op}))))
+
+(defn- construct-owned-helper-occurrence [caller input-body original]
+  (let [caller-emission (method-entry/observed-frontend-emission caller)]
+    (when (and caller-emission (identical? input-body (:body caller)))
+      (when-let [record ((helper-backend 'retained-input-invocation-context)
+                        caller-emission input-body original)]
+        (when (and (= :known (:status record))
+                   (= :global-typed-indy (:invocation-mode record))
+                   (identical? Object (:return-carrier record))
+                   (identical? original (:source-input record))
+                   ((helper-backend 'completed-invocation-inputs?) record)
+                   (not-any? :unretained-sibling-calls? (:inputs record)))
+          (let [^java.lang.reflect.Method method (:method record)
+                carriers (vec (.getParameterTypes method))
+                ;; These facts describe slots AFTER the retained positional
+                ;; conversions below, never the original unevaluated operands.
+                facts (mapv #(hash-map :carrier % :presence :present) carriers)
+                typed-call (owned-occurrence-typed-call original record)
+                recipe (when typed-call
+                         ((requiring-resolve
+                           'raster.compiler.passes.parallel.scalar-expression-body/owned-selected-call-fp-payload)
+                          typed-call method facts))
+                source (get-in recipe [:definition :source-var])
+                frontend (when source (method-entry/original-source-frontend source))
+                emission (:emission recipe)
+                bridge (:bridge recipe) saved (:body-context bridge)]
+            (when (and frontend emission (identical? emission (:emission frontend))
+                       (= method (:invocation-method bridge)) saved
+                       (not (:unretained-sibling-calls? saved))
+                       (= (get-in caller [:source-entry :source-policy])
+                          (get-in frontend [:source-entry :source-policy])))
+              (let [{:keys [body binding-facts]}
+                    (qualified-helper-body emission (get-in caller [:source-entry :source-ns]))
+                    body (if (= 1 (count body)) (first body) (list* 'do body))
+                    inputs (mapv (fn [input completed carrier]
+                                   (assoc input :completion completed
+                                          :contract (completion/planned-bytecode-input-contract
+                                                     carrier (:context input) (:emitted-type completed))))
+                                 (:inputs record) (:input-completions record) carriers)
+                    values (mapv #(with-meta (gensym "owned_call_input__")
+                                    {:raster.type/tag % :raster.effect/effectful true}) (:tags emission))
+                    contracts [(completion/bytecode-result-context-contract
+                                (:result-context saved) (:emitted-result-type saved))
+                               completion/object-input-contract]
+                    artifact (construct-helper-application
+                              frontend record inputs (:params emission) values body binding-facts
+                              contracts (:return-tag emission) true)
+                    ;; Only COMPLETED slot IDs are numerical argument ports.
+                    ;; The physical/source lexical relation and use-closed box
+                    ;; erasure remain separate obligations of a future consumer.
+                    projection (assoc recipe :arguments values
+                                      :formal-input-values (zipmap (:parameters recipe) values))
+                    artifact (update artifact :application assoc
+                                     :numerical-projection projection :caller-frontend caller
+                                     :caller-input-body input-body :original-call original
+                                     :physical-call record :derived-call typed-call
+                                     :input-ports (mapv :ports (:inputs record)))]
+                (retain-owned-import!
+                 artifact frontend
+                 #(assert-helper-occurrence-current! caller caller-emission input-body original record))))))))))
+
+(defn ^:no-doc instantiate-owned-helper-occurrence
+  "Construct an emitted fragment from one exact original caller occurrence.
+   Keeps actual positional operands, contexts, completion records and physical
+   ports. It grants no substitution into the original source lexical scope,
+   box erasure, motion or GPU admission. No helper is prepared by this query."
+  [caller-frontend exact-input-body original-call]
+  (when method-entry/*emission-inputs*
+    (method-entry/call-with-independent-definition-inputs
+     #(construct-owned-helper-occurrence caller-frontend exact-input-body original-call))))
