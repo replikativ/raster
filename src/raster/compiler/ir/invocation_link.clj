@@ -1404,7 +1404,9 @@
 (defn ^:no-doc prepare-source-allocation
   "Prepare the exact next source allocation, not an unspecified numerical result buffer.
    evaluate-size is the trusted typed host evaluator returning the source value and its actual
-   constructor count. Acquisition and zero initialization must complete before cursor advance."
+   constructor count. The public allocator promise may remain unspecified, but
+   an independently rederived constructor must actually zero storage here.
+   Acquisition and zero initialization must complete before cursor advance."
   [state evaluate-size caller-options]
   (when-not (= caller-options (:caller-options state))
     (fail! :invocation-ordered-request "ordered realization cannot change its caller math request" {}))
@@ -1443,8 +1445,11 @@
         definition-projection
         (invocation-source/allocation-definition-projection projection)
         initialization (:initialization projection)
+        initializations (descriptor/allocation-projection-initializations projection)
         retained-projections (keep :source-projection [step claim action])]
-    (when-not (and destination (= :zero initialization)
+    (when-not (and destination (contains? #{:zero :unspecified} initialization)
+                   (= initialization (:public initializations))
+                   (= :zero (:realized initializations))
                    (av/abstract-value? physical-value) (av/abstract-value? abstract)
                    (av/storage-contract-compatible? physical-value abstract)
                    (invocation-source/allocation-corresponds?
@@ -1518,7 +1523,11 @@
                                :pending {:kind :source-allocation :storage token
                                          :source-cursor (:source-cursor state)})
            :nodes (:nodes layout) :values (:values layout)
-           :storage token :initialization :zero :elements elements})))))
+           ;; :zero is the requested physical action, not successful completion.
+           ;; The caller's existing synchronous zero operation supplies readiness;
+           ;; the source step/claim retain their original weaker public contract.
+           :storage token :initialization :zero :public-initialization initialization
+           :elements elements})))))
 
 (defn ^:no-doc advance-source-alias
   "Bind one validated source alias to already acquired storage. This neither acquires storage

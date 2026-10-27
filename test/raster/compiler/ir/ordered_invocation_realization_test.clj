@@ -851,6 +851,59 @@
     (is (zero? @calls))
     (is (empty? (:acquired-storage initial)))))
 
+(deftest delegated-unspecified-allocation-prepares-only-its-proved-zero-realization
+  (let [compilation (equation-first/compile #'fixture/helper-source-unspecified-observed
+                                          {:target :ocl:0 :dtype :double})
+        initial (invocation-link/begin-ordered-realization
+                 compilation [(double-array [7 8]) (double-array 1) 2] nil)
+        position (first (keep-indexed #(when (= 'out (:storage %2)) %1) (:source-order initial)))
+        step-index (first (keep-indexed #(when (= 'out (:symbol %2)) %1)
+                                      (get-in initial [:materialization :plan :steps])))
+        state (assoc initial :source-cursor position)
+        claim (get-in state [:source-allocations 'out])
+        calls (atom 0)
+        evaluate (fn [expression scalars]
+                   (swap! calls inc)
+                   (scalar/evaluate-array-size (:source-ns compilation)
+                                               (update-vals scalars :value) expression))
+        prepared (invocation-link/prepare-source-allocation state evaluate nil)
+        token (:storage prepared)]
+    (is (= 1 position) "the allocation still follows the earlier numerical write")
+    (is (some? step-index))
+    (is (= :unspecified (:initialization claim)))
+    (is (= :unspecified (get-in state [:materialization :plan :steps step-index :initialization])))
+    (is (= {:public-initialization :unspecified :realized-initialization :zero}
+           (select-keys (:source-projection claim) [:public-initialization :realized-initialization])))
+    (is (= :unspecified (:public-initialization prepared)))
+    (is (= :zero (:initialization prepared)) "the existing runtime must execute the actual zero action")
+    (is (= 2 (:elements prepared)))
+    (is (= claim (get-in prepared [:state :source-allocations 'out])))
+    (is (= :unspecified
+           (get-in prepared [:state :materialization :plan :steps step-index :initialization])))
+    (is (= position (get-in prepared [:state :source-cursor])))
+    (is (= {:kind :source-allocation :storage token :source-cursor position}
+           (get-in prepared [:state :pending])))
+    (is (empty? (get-in prepared [:state :acquired-storage]))
+        "preparing a zero request does not acquire or initialize its storage")
+    (is (= 1 @calls))
+    (doseq [changed [(-> state
+                         (update-in [:source-allocations 'out] dissoc :source-projection)
+                         (update-in [:materialization :plan :steps step-index] dissoc :source-projection))
+                     (assoc-in state [:source-allocations 'out :source-projection
+                                      :realized-initialization] :unspecified)
+                     (assoc-in state [:materialization :plan :steps step-index :source-projection
+                                      :public-initialization] :zero)]]
+      (is (= :invocation-ordered-allocation-definition
+             (reason #(invocation-link/prepare-source-allocation
+                       changed (fn [& _] (swap! calls inc)
+                                 (throw (AssertionError. "unowned allocation evaluated a count"))) nil)))))
+    (is (= 1 @calls) "a public unspecified label cannot supply a missing zero-constructor proof")
+    (is (thrown? IllegalStateException
+                 (invocation-link/prepare-source-allocation
+                  state (fn [& _] (throw (IllegalStateException. "count failed"))) nil)))
+    (is (empty? (:acquired-storage state)))
+    (is (empty? (get-in state [:realized :storage])))))
+
 (deftest literal-helper-source-allocation-prepares-without-replaying-the-helper
   (let [compilation (equation-first/compile #'fixture/literal-helper-source-zero-observed
                                           {:target :ocl:0 :dtype :float})

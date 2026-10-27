@@ -4,6 +4,29 @@
 
 ### Current boundary ledger
 
+Latest completed unit CI is `061bf13ef` (35338, all16): 7,769 tests /
+95,508 pass / 53 failures / 112 errors across132 failing Vars. Three prior Vars
+recover; three newly failing Vars expose bare session/descriptor paths that do
+not consume ordered source preparation (symbolic contraction, functional prefill
+softmax, dot-rows). They remain required migration work, not waived errors.
+All7,763 prior outcomes remain, shared assertions95,512→95,567; seven new Vars
+add119 assertions. Its CPU-OpenCL35339 was pending at the last check. Previous
+diagnostic-fix head470b77b0f completes unit35329 with7,762 /95,339 pass /46 fail /
+114 errors across132 Vars: its cold diagnostic regression recovers, no new
+failing Vars and no removed outcomes. CPU35330 is unchanged679 /7,505 pass /
+12 fail /73 errors across75 Vars. Emission remains red; no merge/release.
+
+The reviewed follow-up leaves proved-inert lexical arguments unchanged and
+exports only compound-input bindings, retaining the complete private positional
+frame. This removes unnecessary reference aliases rather than inferring array
+origins. Prefix16/151 and actual OCL+ZE replay1/84 pass; attention allocation
+ownership recovers all nine original assertions. Separately, an authenticated
+concrete zero constructor can prepare the existing zero action while its public
+promise remains unspecified; actual synchronous zeroing still precedes readiness.
+The complete allocation-contract namespace passes21 tests /341 assertions.
+The broader ordered-root device gate reaches182 assertions then declines at the
+known incomplete TypedSOAC route; it is not a full device pass.
+
 Latest completed exact-head CI is `430545f99`: all sixteen unit shards
 (35322) finish with 7,762 tests / 95,322 pass / 46 failures / 115 errors across
 133 failing Vars. Both JVM regression repairs recover. A new cold diagnostic

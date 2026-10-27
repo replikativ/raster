@@ -85,6 +85,10 @@
                                                 (.getCause error) error))})))]
              (is (= (take 2 before) (take 2 after)) "the original global call/receiver remain")
              (is (= 2 (count (get-in frame [:frame :bindings]))))
+             (is (= [1] (:exported-ordinals frame)))
+             (is (= 1 (count (:exported-bindings frame))))
+             (is (identical? (nth before 2) (nth after 2))
+                 "the inert array argument retains its original source view")
              (is (every? symbol? (drop 2 after)))
              (is (every? completion/canonical-form? (map second (get-in frame [:frame :bindings]))))
              (is (some #(contains? (meta %) :raster.compiler.backend.jvm.bytecode/call-occurrence)

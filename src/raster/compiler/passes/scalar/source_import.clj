@@ -2290,9 +2290,17 @@
                                              (:emitted-type completion)))) inputs completed)
             values (mapv #(with-meta (gensym "completed_call_input__") {:raster.type/tag %}) tags)
             frame (construct-invocation-input-frame inputs parameters values (:scope witness) source-operands)
-            call (util/remake-from original (list* '.invk (second original) values))]
+            ;; Only compounds need a new definition. The predicates above have
+            ;; proved every remaining argument an inert lexical load with an
+            ;; identity/assignable-reference conversion. Keep its EXACT source
+            ;; symbol, rather than inventing a new reference-view alias.
+            exported-ordinals (vec (keep-indexed #(when (seq? %2) %1) arguments))
+            exported-bindings (mapv #(nth (:bindings frame) %) exported-ordinals)
+            call-arguments (mapv (fn [argument value] (if (seq? argument) value argument)) arguments values)
+            call (util/remake-from original (list* '.invk (second original) call-arguments))]
         (retain-owned-artifact!
-         {:frame frame :call call :original original :witness witness :physical-call record}
+         {:frame frame :exported-ordinals exported-ordinals :exported-bindings exported-bindings
+          :call call :original original :witness witness :physical-call record}
          #(do (validate-contextual-source-witness! witness)
               (method-entry/assert-source-entry-current! (:source-entry entry))
               (assert-helper-occurrence-current! emission input-body original record)))))))
@@ -2334,7 +2342,7 @@
                                  ;; from the final witness, not leak the old JVM tokens.
                                  frame (into (mapcat (fn [[id initializer]]
                                                        [id ((helper-backend 'detach-emission-occurrences) initializer)])
-                                                     (get-in frame [:frame :bindings]))))
+                                                     (:exported-bindings frame))))
                    constructed (conj constructed binder (or (:call frame) original))
                    frames (cond-> frames frame (conj frame))
                    result ((:value projector) (:emission witness) (:before observed) facts (:initializer observed))]
