@@ -19,6 +19,23 @@
   (let [ignored '(let [reference_input__0 :quoted] reference_input__0)]
     value))
 
+(deftm ready-local-effects [values :- (Array double)
+                            events :- (Array long)
+                            n :- Long] :- (Array double)
+  (let [alias values
+        before (clojure.core/aset events 0
+                                  (inc (clojure.core/aget events 0)))
+        old (clojure.core/aget alias n)
+        changed (clojure.core/aset alias n (+ old 1.0))
+        result alias]
+    result))
+
+(deftm ready-top-effect [values :- (Array double)
+                         events :- (Array long)
+                         n :- Long] :- (Array double)
+  (let [ignored (clojure.core/aset events 0 n)]
+    values))
+
 ;; This pair is deliberately never invoked or compiled elsewhere in the namespace.
 (deftm cold-array-first [value :- (Array double) n :- Long] :- (Array double)
   value)
@@ -39,6 +56,12 @@
           quoted-op (symbol ns-name "ready-quoted-array")
           quoted-impl (symbol ns-name "ready-quoted-array_m_doubles_long-impl")
           quoted-receiver (receiver quoted-op quoted-impl 2 'doubles)
+          effects-op (symbol ns-name "ready-local-effects")
+          effects-impl (symbol ns-name "ready-local-effects_m_doubles_longs_long-impl")
+          effects-receiver (receiver effects-op effects-impl 3 'doubles)
+          top-effect-op (symbol ns-name "ready-top-effect")
+          top-effect-impl (symbol ns-name "ready-top-effect_m_doubles_longs_long-impl")
+          top-effect-receiver (receiver top-effect-op top-effect-impl 3 'doubles)
           cold-op (symbol ns-name "cold-array-first")
           cold-impl (symbol ns-name "cold-array-first_m_doubles_long-impl")
           cold-receiver (receiver cold-op cold-impl 2 'doubles)]
@@ -54,12 +77,19 @@
        (list 'raster.core/deftm 'quoted-ready-reference-caller
              '[value :- (Array double) n :- Long] ':- 'Object
              (list 'let ['result (list '.invk quoted-receiver 'value 'n)] 'result))
+       (list 'raster.core/deftm 'local-effects-ready-reference-caller
+             '[values :- Object events :- (Array long) n :- Long] ':- 'Object
+             (list 'let ['result (list '.invk effects-receiver 'values 'events 'n)] 'result))
+       (list 'raster.core/deftm 'top-effect-ready-reference-caller
+             '[values :- Object events :- (Array long) n :- Long] ':- 'Object
+             (list 'let ['result (list '.invk top-effect-receiver 'values 'events 'n)] 'result))
        (list 'raster.core/deftm 'cold-reference-caller
              '[value :- (Array double) n :- Long] ':- 'Object
              (list 'let ['result (list '.invk cold-receiver 'value 'n)] 'result))))))
 
 (declare ordered-ready-reference-caller checked-ready-reference-caller
-         quoted-ready-reference-caller cold-reference-caller)
+         quoted-ready-reference-caller local-effects-ready-reference-caller
+         top-effect-ready-reference-caller cold-reference-caller)
 (define-reference-callers)
 
 (defn- implementation-var [source-var]
@@ -117,6 +147,43 @@
     (is (pos? accepted))
     (is (identical? value (quoted-ready-reference-caller value 0)))
     (is (identical? value (compiled value 0)))))
+
+(deftest complete-ready-reference-expression-keeps-locals-effects-and-result-identity
+  (ensure-ready! #'ready-local-effects)
+  (ensure-ready! #'ready-top-effect)
+  (let [[compiled accepted]
+        (compile-through-ready-fallback #'local-effects-ready-reference-caller)
+        [top-compiled top-accepted]
+        (compile-through-ready-fallback #'top-effect-ready-reference-caller)]
+    (is (pos? accepted))
+    (is (pos? top-accepted))
+    (doseq [invoke [local-effects-ready-reference-caller compiled]]
+      (let [values (double-array [2.0]) events (long-array 1)
+            result (invoke values events 0)]
+        (is (identical? values result))
+        (is (= [3.0] (vec values)) "the helper-local store executes exactly once")
+        (is (= [1] (vec events)) "the visible counter store executes exactly once"))
+      (let [events (long-array 1)]
+        (is (thrown? ClassCastException (invoke "wrong array" events 0)))
+        (is (= [0] (vec events)) "the input CHECKCAST precedes the helper body"))
+      (let [events (long-array 1)]
+        (is (thrown? NullPointerException (invoke nil events 0)))
+        (is (= [1] (vec events)) "null passes CHECKCAST and fails at the original read site")))
+    ;; This helper's tail is the input itself. Reassembling the artifact from
+    ;; argument-bindings + result-form appears to work but silently loses the
+    ;; extracted unused-store binding; consuming the complete expression retains it.
+    (doseq [invoke [top-effect-ready-reference-caller top-compiled]]
+      (let [values (double-array [4.0]) events (long-array 1)
+            result (invoke values events 7)]
+        (is (identical? values result))
+        (is (= [4.0] (vec values)))
+        (is (= [7] (vec events))))
+      (let [events (long-array 1)]
+        (is (thrown? ClassCastException (invoke "wrong array" events 7)))
+        (is (= [0] (vec events))))
+      (let [events (long-array 1)]
+        (is (nil? (invoke nil events 7)))
+        (is (= [7] (vec events)))))))
 
 (deftest cold-reference-query-does-not-prepare-a-module
   (let [helper (core/resolve-deftm-var #'cold-array-first)

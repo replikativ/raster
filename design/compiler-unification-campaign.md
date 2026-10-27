@@ -4,13 +4,17 @@
 
 ### Current boundary ledger
 
-Latest completed unit/CPU accounting, `280a9a3a7` (October 27): unit job 35231
-and CPU-OpenCL job 35235 fail; this branch is not merge-ready. Later checkpoints
+Latest completed unit/CPU accounting, `2f228eea5` (October 27): unit job 35239
+and CPU-OpenCL job 35238 fail; this branch is not merge-ready. Later checkpoints
 require their own exact-head qualification.
-All sixteen unit shards complete: 7,689 tests, 95,717 passing assertions, 22 failures and 28
-errors across 39 failing Vars. CPU-OpenCL has all four completed shards: 677
-tests, 8,629 passing assertions, 6 failures and 27 errors across 31 failing Vars.
-Setup, build, emitted-source, CUDA and HIP compiler checks pass at this checkpoint. Compiler-only
+All sixteen unit shards complete: 7,703 tests, 94,407 passing assertions, 53 failures and 126
+errors across 145 failing Vars. CPU-OpenCL has all four completed shards: 677
+tests, 7,404 passing assertions, 12 failures and 81 errors across 83 failing Vars.
+Setup and build pass; emitted-source fails on `mixed-storage/mixed-scale`, so
+dependent vendor compiler gates have not qualified this head. The stricter
+whole-call migration exposes substantial additional source/projection coverage
+regressions; focused green gates below do not qualify that migration globally.
+Compiler-only
 vendor checks do not establish native execution or waive the failed unit/device
 gates. These complete reports supersede the older incomplete checkpoint counts
 below; failure-count changes against incomplete shards are not regression or
@@ -25,9 +29,9 @@ the older nested-MMM test expecting the now-owned helper cases to refuse. Those
 including default/selected gradients, empty reductions and unchanged inputs.
 The five affected AD namespaces pass 43 tests / 718 assertions with the
 committed inliner. Unknown Object/compound-array and active-discrete refusals
-remain independently tested. The other 39 unit and 31 CPU failing Vars are
+remain independently tested. The 145 unit and 83 CPU failing Vars are
 still unqualified; this test migration does not waive them.
-Between the last two complete reports, all 7,679 shared unit outcome Vars and
+Between the earlier `32ff5587a` and `280a9a3a7` reports, all 7,679 shared unit outcome Vars and
 95,417 shared assertions are retained; eleven new Vars add 363 assertions. CPU
 coverage is unchanged. Neither a removed test nor an incomplete shard explains
 the remaining failures.
@@ -76,9 +80,16 @@ the existing helper-application constructor and saved input/body/return recipes;
 it never forces JIT preparation, grants native placement or expands the scalar
 AD companion's return domain. Nullable identity, wrong returned Class, quoted
 data opacity, exact ordered input slots, cold abstention and stale/replaced
-modules pass 4 tests / 25 assertions. The combined inliner/input/reference gate
-passes 51 / 404. Non-leaf effectful arguments still abstain; input-slot assertions
+modules and complete body-spine execution pass 5 tests / 55 assertions. The combined inliner/input/reference gate
+passes 52 / 434. Non-leaf effectful arguments still abstain; input-slot assertions
 are not a claim that those wider calls are supported.
+Independent follow-up review found a consumer reconstruction error: extracted
+helper body bindings were retained only in the complete expression, not the
+input-only binding view or result-tail view. Ordinary inlining now consumes the
+receipt-authenticated complete expression once. A control using the old consumer
+accepts a real fallback yet drops its let-bound store; the fixed public-compile
+regression preserves that write, local mutation, result identity and original
+null/ClassCast order. No numerical projection or native authority follows.
 
 Sequential `do`/`let*` site planning now shares context construction with the
 actual JVM emitter, including statement, initializer, Object-result and tail

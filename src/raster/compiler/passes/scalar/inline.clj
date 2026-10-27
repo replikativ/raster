@@ -473,11 +473,14 @@
                                    (source-import/instantiate-ready-reference-helper
                                     (:candidate planned) caller (:source-options planned)))]
           (source-import/validate-helper-application! application)
-          (let [arguments (:argument-bindings application)
-                returned (:result-form application)]
+          (let [complete (:expression application)]
             (if result-sym
-              {:argument-bindings arguments :bindings (conj arguments [result-sym returned])}
-              {:argument-bindings arguments :body returned})))))))
+              ;; The owned artifact's expression is the sole executable recipe.
+              ;; Its input completions and extracted helper binding spine must
+              ;; stay together; rebuilding from split descriptive fields can
+              ;; drop stores/locals or evaluate inputs twice.
+              {:argument-bindings [] :bindings [[result-sym complete]]}
+              {:argument-bindings [] :body complete})))))))
 
 
 ;; ================================================================
