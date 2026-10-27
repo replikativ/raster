@@ -60,14 +60,13 @@ behavior coverage. Resolution no longer qualifies/alpha-renames a body that the
 owned constructor must import again. Exact caller/input planning precedes that
 import; body/exit certification still follows it in a disposable owner. The
 history oracle closes first-invocation publication before measuring expansion,
-and observes one body import for its admitted application. Unplanned calls
+and observes one body import per admitted application. Unplanned calls
 import nothing and retain wrong-arity diagnostics. The checked-input/capacity
 gate and public input-completion cases separately pass 13 tests / 79 assertions.
 The mixed-precision optimizer's real generated field→typed-check→update route
 passes one test / 20 assertions with the migration. Independent review found
 no blocker in its ordered conversion, publication, history and causal-storage
-boundaries. It deliberately retains unplanned calls: multi-call heat composition
-still lacks a complete sequential site plan. GSDM training gets past the earlier
+boundaries. It deliberately retains unplanned calls. GSDM training gets past the earlier
 host-alias refusal but then correctly refuses an unexpanded array-return helper;
 neither workload is qualified by these narrow passing gates.
 
@@ -80,6 +79,27 @@ data opacity, exact ordered input slots, cold abstention and stale/replaced
 modules pass 4 tests / 25 assertions. The combined inliner/input/reference gate
 passes 51 / 404. Non-leaf effectful arguments still abstain; input-slot assertions
 are not a claim that those wider calls are supported.
+
+Sequential `do`/`let*` site planning now shares context construction with the
+actual JVM emitter, including statement, initializer, Object-result and tail
+contexts. It admits only resolved Object-result calls and propagates only broad
+raw reference slots. Unknown boundaries stop the suffix; a quote-opaque syntax
+inventory rejects any invocation identity shared with another site, including
+an otherwise skipped scope. Four focused tests pass 50 assertions. The history
+gate passes 34 / 300 with all two/sixteen independent calls expanded exactly once
+and a constant inherited-history fence count; arithmetic, gather, reference and
+AD gates also remain green. Independent review found no blocker. Heat now has
+both sequential call plans but still lacks a complete owned numerical projection
+of its helper bodies: a plan alone is not successful GPU compilation.
+
+The next source closure must combine request-local cold readiness with a verified
+projection of complete result-context regions. Queries must remain non-preparing;
+neither removing result-context barriers nor warming all helpers indiscriminately
+is a substitute for that proof. The separate residency follow-up must preserve
+the difference between deferred source identity and actual physical completion:
+the existing ordered executor interleaves source work and GPU stages, so no
+general whole-final-plan-before-first-write hook exists. AMR/capture consumers
+need stage checks and final leased evidence, not fabricated early physical plans.
 
 The shared AD prerequisite now closes the previously failing helper/allocation
 boundary. It isolates AD from an enclosing pipeline's source-call context and

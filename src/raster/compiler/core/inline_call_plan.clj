@@ -1,5 +1,5 @@
 (ns raster.compiler.core.inline-call-plan
-  "Unpublished whole-call plans for ordinary flat initializer expansion.
+  "Unpublished whole-call plans for ordinary sequential source expansion.
    Unknown physical input/body/exit facts retain the original call. No emitter
    is loaded and no source is prepared or evaluated by an optional query."
   (:require [raster.compiler.core.binding-completion :as binding]
@@ -20,7 +20,7 @@
 (defn source-context [options]
   (when (and entry/*emission-inputs* (:source-var options))
     (let [functions (into {} (map (fn [name] [name (backend name)]))
-                          '[ordinary-evaluation-base binding-initializer-context resolved-parameter-locals
+                          '[ordinary-evaluation-base source-evaluation-context binding-initializer-context resolved-parameter-locals
                             plan-form-carrier plan-resolved-invocation-inputs builtin-jvm-info binding-hint])]
       (when (every? val functions)
         (when-let [{:keys [parameters invocation-method source-entry] :as physical}
@@ -33,10 +33,13 @@
             (doseq [[name v] functions]
               (entry/observe-definition-input! v (:ns (meta v)) name))
             (when-let [locals ((functions 'resolved-parameter-locals) invocation-method parameters)]
-              {:functions functions :physical physical :locals locals
-               :source-options options :policy (:source-policy source-entry)
-               :context ((functions 'binding-initializer-context)
-                         ((functions 'ordinary-evaluation-base) (:source-ns source-entry)))})))))))
+              (let [base ((functions 'ordinary-evaluation-base) (:source-ns source-entry))
+                    result ((functions 'builtin-jvm-info) (:return-tag source-entry))]
+                (cond-> {:functions functions :physical physical :locals locals
+                         :source-options options :policy (:source-policy source-entry)
+                         :context ((functions 'binding-initializer-context) base)}
+                  result (assoc :body-context ((functions 'source-evaluation-context)
+                                               base :method (:stack-type result))))))))))))
 
 (defn- binding-facts [_scope _id _expression raw _locals]
   ;; The actual shared binding producer stores the initializer's raw carrier;
@@ -48,26 +51,89 @@
   (when (leaf? expression)
     ((get-in scope [:functions 'plan-form-carrier]) expression locals context)))
 
+(defn- invocation-occurrence-counts [source]
+  ;; Syntax inventory only: the eventual inliner visits children outside this
+  ;; planner's admitted spine too. An identity shared with ANY such child must
+  ;; not borrow a plan from its recognized occurrence. Quoted data is opaque.
+  (let [counts (java.util.IdentityHashMap.)]
+    (letfn [(visit [node]
+              (when-not (and (seq? node) (contains? '#{quote clojure.core/quote} (first node)))
+                (when (and (seq? node) (= '.invk (first node)))
+                  (.put counts node (inc (long (or (.get counts node) 0)))))
+                (when (coll? node)
+                  (doseq [child node] (visit child)))))]
+      (visit source))
+    counts))
+
 (defn call-plans [scope source]
-  (let [plans (java.util.IdentityHashMap.)]
-    (when (and scope (form/binding-form? source) (vector? (second source)))
-      (loop [pairs (seq (partition 2 (second source))) locals (:locals scope)]
-        (when-let [[id initializer] (first pairs)]
-          (when (and (symbol? id) (not (contains? locals id)))
-            (if-let [raw (raw-leaf scope initializer locals (:context scope))]
-              (when-let [facts (binding-facts scope id initializer raw locals)]
-                (recur (next pairs) (assoc locals id facts)))
-              ;; Initial domain ends at an unknown initializer. A direct call
-              ;; can acquire a plan here, but its unobserved result never seeds
-              ;; the rest of the prefix through logical annotations.
-              (when (and (seq? initializer) (= '.invk (first initializer))
-                         (every? leaf? (drop 2 initializer)))
-                (when-let [{:keys [plan physical arguments] :as call}
-                           (checked/typed-call-plan initializer (set (keys locals)) #{})]
-                  (when-let [inputs ((get-in scope [:functions 'plan-resolved-invocation-inputs])
-                                    (:method plan) arguments locals (:context scope))]
-                    (.put plans initializer (assoc call :inputs inputs :caller-policy (:policy scope)
-                                                   :candidate source :source-options (:source-options scope)))))))))))
+  (let [plans (java.util.IdentityHashMap.)
+        occurrences (when scope (invocation-occurrence-counts source))
+        context-for (get-in scope [:functions 'source-evaluation-context])]
+    (when scope
+      (letfn [(call! [expression locals lexical context]
+                (when (and context (seq? expression) (= '.invk (first expression)))
+                  ;; One AST identity cannot stand for sites with potentially
+                  ;; different lexical or evaluation contexts.
+                  (when (= 1 (.get occurrences expression))
+                      (when (every? leaf? (drop 2 expression))
+                        (when-let [{:keys [plan arguments] :as call}
+                                   (checked/typed-call-plan expression lexical #{} context)]
+                          ;; The existing application constructor publishes one
+                          ;; Object result. A primitive caller result requires a
+                          ;; separate owned adaptation, never a return-tag guess.
+                          (when (and (identical? Object (:interface-result-class plan))
+                                     (nil? (:primitive-result-class plan)))
+                            (when-let [inputs ((get-in scope [:functions 'plan-resolved-invocation-inputs])
+                                              (:method plan) arguments locals context)]
+                              (.put plans expression
+                                    (assoc call :inputs inputs :caller-policy (:policy scope)
+                                           :caller-context context :candidate source
+                                           :source-options (:source-options scope)))
+                              :ref)))))))
+              (initializer! [expression locals lexical context]
+                (or (raw-leaf scope expression locals context)
+                    (call! expression locals lexical context)))
+              (body! [expressions locals lexical context]
+                (loop [remaining (seq expressions)]
+                  (if-not remaining
+                    true
+                    (let [tail? (nil? (next remaining))
+                          site (if tail? :body-result :statement)]
+                      (when (visit! (first remaining) locals lexical
+                                    (context-for context site) tail?)
+                        (recur (next remaining)))))))
+              (visit! [expression locals lexical context result?]
+                (let [head (when (seq? expression) (first expression))
+                      sequential? (contains? '#{let let* do} head)
+                      context (if (and context result? (:object-result? context))
+                                (context-for context (if sequential? :object-region :object-call))
+                                context)]
+                  (cond
+                    (contains? '#{let let*} head)
+                    (let [bindings (second expression)]
+                      (when (and (vector? bindings) (even? (count bindings)))
+                        (loop [pairs (seq (partition 2 bindings)) locals locals lexical lexical]
+                          (if-not pairs
+                            (when context (body! (drop 2 expression) locals lexical context))
+                            (let [[id initializer] (first pairs)
+                                  initializer-context (if context (context-for context :initializer)
+                                                          (:context scope))]
+                              (when (and (symbol? id) (nil? (namespace id))
+                                         (not (contains? lexical id)))
+                                (when-let [raw (initializer! initializer locals lexical initializer-context)]
+                                  (when-let [facts (binding-facts scope id initializer raw locals)]
+                                    ;; A resolved Object-return call contributes
+                                    ;; only its raw reference slot, never an array
+                                    ;; Class, presence, alias or successful return.
+                                    (recur (next pairs) (assoc locals id facts) (conj lexical id))))))))))
+
+                    (= 'do head) (when context (body! (rest expression) locals lexical context))
+                    (leaf? expression) (when context (raw-leaf scope expression locals context))
+                    (= '.invk head) (call! expression locals lexical context)
+                    ;; Unknown calls, quotes, branches, loops, nested operands
+                    ;; and other scopes do not expose later sibling sites.
+                    :else nil)))]
+        (visit! source (:locals scope) (set (keys (:locals scope))) (:body-context scope) true)))
     plans))
 
 (defn- body-plan [scope expression locals lexical context]
@@ -132,8 +198,9 @@
                  (every? some? parameter-info) result-info permitted-return?
                  (= (mapv :class parameter-info) (:parameter-carriers physical))
                  (identical? Object (:result-carrier physical)))
-        (let [context (assoc ((functions 'ordinary-evaluation-base) (:source-ns lineage))
-                             :object-result? (= :ref (:stack-type result-info)))
+        (let [context ((functions 'source-evaluation-context)
+                       ((functions 'ordinary-evaluation-base) (:source-ns lineage))
+                       :method (:stack-type result-info))
               locals ((functions 'resolved-parameter-locals) (:invocation-method physical) params)
               raw (policy/call-with-policy (:source-policy lineage)
                     #(body-plan scope body locals (set params) context))]

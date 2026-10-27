@@ -1684,6 +1684,23 @@
 ;; Forward declarations for mutual recursion
 (declare emit-form emit-object-value emit-boxed-ifn-call)
 
+(defn ^:no-doc source-evaluation-context
+  "The ordinary emitter's sequential evaluation contexts, shared with bounded
+   source planning. This selects context only: no source, carrier, successful
+   completion or permission to move an expression follows from this factory."
+  ([ctx site] (source-evaluation-context ctx site nil))
+  ([ctx site result-stack]
+   (case site
+     :method (assoc ctx :object-result? (= :ref result-stack))
+     :initializer (assoc (dissoc ctx :void-context :object-result?)
+                         :preserve-source-call-results? true)
+     :statement (assoc (dissoc ctx :object-result?) :void-context true)
+     :body-result (if (:void-context ctx) ctx (dissoc ctx :void-context))
+     :object-input (assoc (dissoc ctx :object-result? :void-context :object-call-result?)
+                          :preserve-source-call-results? true)
+     :object-region (assoc (source-evaluation-context ctx :object-input) :object-result? true)
+     :object-call (assoc (source-evaluation-context ctx :object-input) :object-call-result? true))))
+
 (defn- emit-result-form [code expression locals ctx]
   (if (:object-result? ctx)
     (emit-object-value code expression locals (dissoc ctx :object-result? :void-context))
@@ -1700,7 +1717,7 @@
   [code forms locals ctx]
   (let [stmts (butlast forms)
         last-form (last forms)
-        void-ctx (assoc (dissoc ctx :object-result?) :void-context true)]
+        void-ctx (source-evaluation-context ctx :statement)]
     (loop [remaining (seq stmts)]
       (if (seq remaining)
         (let [s (first remaining)
@@ -1715,7 +1732,7 @@
           ;; Preserve void-context if the enclosing form is already in void context.
           ;; Otherwise dissoc so the last form's value is kept on the stack.
           (emit-result-form code last-form locals
-                            (if (:void-context ctx) ctx (dissoc ctx :void-context)))
+                            (source-evaluation-context ctx :body-result))
           :void)))))
 
 ;; Counter for unique anonymous class names
@@ -4384,11 +4401,10 @@
   "The actual lexical initializer context, shared with pre-emission planning.
    This chooses evaluation context, not a value's physical carrier."
   [ctx]
-  (assoc (dissoc ctx :void-context :object-result?) :preserve-source-call-results? true))
+  (source-evaluation-context ctx :initializer))
 
 (defn- object-input-context [ctx]
-  (assoc (dissoc ctx :object-result? :void-context :object-call-result?)
-         :preserve-source-call-results? true))
+  (source-evaluation-context ctx :object-input))
 
 (defn ^:no-doc binding-hint
   "The existing emitter's lexical hint selection, not raw carrier inference.
@@ -6369,9 +6385,9 @@
                               {:reason :unsupported-jvm-object-literal})))
             parts (emit-canonical-completion code expression locals ctx true)
             (contains? #{'let 'let* 'letfn* 'loop* 'do 'if 'try 'case*} head)
-            (emit-form code expression locals (assoc ctx :object-result? true))
+            (emit-form code expression locals (source-evaluation-context ctx :object-region))
             (seq? expression)
-            (emit-form code expression locals (assoc ctx :object-call-result? true))
+            (emit-form code expression locals (source-evaluation-context ctx :object-call))
             :else (emit-form code expression locals ctx))]
     (cond
       (= :diverge t) :diverge
@@ -7072,11 +7088,12 @@
                                                               (update result parameter merge
                                                                       (select-keys original [:hint :verified :reference-class])))
                                                             locals input-port-layout)))
-                                                       ctx (merge (ordinary-evaluation-base source-ns)
+                                                       ctx (merge (source-evaluation-context
+                                                                   (ordinary-evaluation-base source-ns)
+                                                                   :method return-stack-type)
                                                            {:class-desc       class-desc
                                                             :prepare-static-source prepare-source!
                                                             :literal-owner literal-owner
-                                                            :object-result? (= :ref return-stack-type)
                                                             :element-type     element-type
                                                             :sibling-methods  sibling-methods
                                                             :typed-sibling-methods typed-sibling-methods
@@ -7208,11 +7225,12 @@
                                                                                                           (not= tag 'Object)
                                                                                                           (not (typed-interface? tag))))})))
                                                                {} (map vector params param-infos tags))
-                                                       ctx (merge (ordinary-evaluation-base source-ns)
+                                                       ctx (merge (source-evaluation-context
+                                                                   (ordinary-evaluation-base source-ns)
+                                                                   :method (:stack-type return-info))
                                                            {:class-desc class-desc
                                                             :prepare-static-source prepare-source!
                                                             :literal-owner literal-owner
-                                                            :object-result? (= :ref (:stack-type return-info))
                                                             :next-slot  next-slot
                                                             :typed-sibling-methods typed-sibling-methods})
                                                        expanded-body (binding [*ns* source-ns]

@@ -157,8 +157,9 @@
                   parameters header #(hash-map :projection expanded :body expanded))
                  input (double-array [1.0 2.0 3.0])]
              (is (pos? source-calls))
-             (is (< expanded-calls source-calls) "a proved helper call actually expands")
-             (is (= 1 @imports) "only the admitted application imports the helper body")
+             (is (zero? expanded-calls) "every independently proved sequential call expands")
+             (is (= (- source-calls expanded-calls) @imports)
+                 "each admitted application imports once; resolving candidates adds no duplicate import")
              (is (= 7 (@caller input) (compiled input)))
              (is (= [1.0 2.0 3.0] (vec input)))
              (is (contains? (:definition-proofs @parent) helper))
