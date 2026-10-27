@@ -7338,61 +7338,109 @@
               id)
             (check-ports! [ports env]
               (when-not (every? (fn [[id facts]] (= facts (get-in env [id :facts]))) ports) (fail!)))
-            (lower-integer-input [region env prefix]
-              (let [name (ad-gensym (str prefix "_region"))
+            (lower-owned-input [region env prefix]
+              (let [^java.lang.reflect.Method method (:method region)
+                    carrier (when (instance? java.lang.reflect.Method method)
+                              (.getReturnType method))
+                    tag (cond
+                          (identical? carrier Integer/TYPE) 'int
+                          (identical? carrier Long/TYPE) 'long
+                          :else (some (fn [[tag array-class]]
+                                        (when (identical? carrier array-class) tag))
+                                      types/primitive-array-info))
+                    expected-return-tag (if (and carrier (.isPrimitive ^Class carrier)) tag carrier)
+                    _ (when-not (and tag (= expected-return-tag (get-in region [:spec :return-tag])))
+                        (fail! {:phase :input-region-carrier :carrier carrier}))
+                    name (ad-gensym (str prefix "_region"))
                     spec (assoc (:spec region) :name name)
                     validate-spec! (fn [candidate]
                                      (when-not (identical? spec candidate)
-                                       (throw (ex-info "Integer input sibling lost its owning spec"
+                                       (throw (ex-info "Input sibling lost its owning spec"
                                                        {:reason :ad-unowned-bytecode-input-spec}))))
                     operands (mapv #(get-in env [% :value]) (:parameters region))]
                 (swap! state update :input-regions conj
                        (assoc region :spec spec :validate-spec! validate-spec!))
-                (append! (ad-gensym prefix 'int) (list* name operands))))
+                (append! (ad-gensym prefix tag) (list* name operands))))
             (lower-call [expression env]
               (let [context (retained emission expression)
                     {:keys [dispatch? lexical-callee operation implementation-op]} (op/call-description expression)]
                 (when-not (and context dispatch? (nil? lexical-callee)
+                               (instance? java.lang.reflect.Method (:method context))
                                (contains? #{Float/TYPE Double/TYPE Object} (:return-carrier context)))
                   (fail! {:phase :call-context :form expression}))
-                ;; The current completed-input producer owns FP parameters,
-                ;; not arbitrary array/integer helper signatures. Refuse at
-                ;; the AD boundary with its retained active ports/form instead
-                ;; of leaking an unrelated value-completion construction error.
-                (when-not (every? #{Float/TYPE Double/TYPE}
-                                  (.getParameterTypes ^java.lang.reflect.Method (:method context)))
-                  (throw (ex-info "Derived helper inputs have no owned floating completion region"
-                                  {:reason :ad-unowned-derived-pullback
-                                   :op operation :implementation-op implementation-op
-                                   :form expression :scope :bytecode-input-completion
-                                   :active (ordered-active-inputs
-                                            expression
-                                            (into {} (map (fn [[id port]]
-                                                            [id (get-in @state [:activity (:value port)])])) env))})))
-                (let [inputs
+                (let [^java.lang.reflect.Method method (:method context)
+                      carriers (when (instance? java.lang.reflect.Method method)
+                                 (vec (.getParameterTypes method)))
+                      activity (:activity @state)
+                      active-inputs (ordered-active-inputs
+                                     expression
+                                     (into {} (map (fn [[id port]]
+                                                     [id (get activity (:value port))])) env))
+                      unowned! (fn []
+                                 (throw (ex-info "Derived helper input has no owned completion region"
+                                                 {:reason :ad-unowned-derived-pullback
+                                                  :op operation :implementation-op implementation-op
+                                                  :form expression :scope :bytecode-input-completion
+                                                  :active active-inputs})))
+                      selected (capture-selected-helper-emission
+                                operation implementation-op (count (:inputs context)) method)
+                      callee-params (get-in selected [:emission :params])
+                      used-callee-params (util/free-syms
+                                          (list* 'do (get-in selected [:emission :body])))
+                      _ (when-not (= (count carriers) (count (:inputs context)) (count callee-params))
+                          (unowned!))
+                      inputs
                       (mapv (fn [index input]
                               (check-ports! (:ports input) env)
-                              (let [projection (into {} (map (fn [[id port]] [id (:value port)])) env)
-                                    ordered (ordered-bytecode-input-program
-                                             emission {:physical-ports (:ports input)} expression index
-                                             params (vec (keep (fn [[id active?]] (when active? id)) (:activity @state)))
-                                             projection
-                                             (fn [parent index input]
-                                               (let [source ((requiring-resolve 'raster.compiler.backend.jvm.bytecode/retained-input-source-context)
-                                                             emission parent index)]
-                                                 (when-not source (fail!))
-                                                 ;; The exact original occurrence
-                                                 ;; now reenters this SAME lexical
-                                                 ;; producer, before the enclosing
-                                                 ;; input's captured FP completion.
-                                                 (let [value (lower (:source-original source) env)]
-                                                   {:value value :active? (boolean (get-in @state [:activity value]))}))))]
-                                (.putAll calls ^java.util.Map (:calls ordered))
-                                (swap! state update :helpers into (:helpers ordered))
-                                (doseq [[id init] (partition 2 (:bindings ordered))] (append! id init))
-                                (:result ordered)))
+                              (let [carrier (nth carriers index)
+                                    input-active? (boolean
+                                                   (some (fn [id]
+                                                           (get-in @state [:activity (get-in env [id :value])]))
+                                                         (keys (:ports input))))
+                                    array-tag (some (fn [[tag array-class]]
+                                                      (when (identical? carrier array-class) tag))
+                                                    types/primitive-array-info)
+                                    projection (into {} (map (fn [[id port]] [id (:value port)])) env)]
+                                (if (contains? #{Float/TYPE Double/TYPE} carrier)
+                                  (let [ordered
+                                        (ordered-bytecode-input-program
+                                         emission {:physical-ports (:ports input)} expression index
+                                         params (vec (keep (fn [[id active?]] (when active? id))
+                                                           (:activity @state)))
+                                         projection
+                                         (fn [parent index input]
+                                           (let [source ((requiring-resolve 'raster.compiler.backend.jvm.bytecode/retained-input-source-context)
+                                                         emission parent index)]
+                                             (when-not source (fail!))
+                                             ;; The exact original occurrence
+                                             ;; now reenters this SAME lexical
+                                             ;; producer, before the enclosing
+                                             ;; input's captured FP completion.
+                                             (let [value (lower (:source-original source) env)]
+                                               {:value value :active? (boolean (get-in @state [:activity value]))}))))]
+                                    (.putAll calls ^java.util.Map (:calls ordered))
+                                    (swap! state update :helpers into (:helpers ordered))
+                                    (doseq [[id init] (partition 2 (:bindings ordered))] (append! id init))
+                                    (:result ordered))
+                                  (do
+                                    ;; Discrete/reference arguments stay wholly
+                                    ;; primal. Their exact original conversion is
+                                    ;; an opaque owned sibling, never a new AD rule.
+                                    (when (or input-active?
+                                              (and array-tag
+                                                   (contains? used-callee-params (nth callee-params index)))
+                                              (not (or (contains? #{Integer/TYPE Long/TYPE} carrier)
+                                                       array-tag)))
+                                      (unowned!))
+                                    (let [region ((requiring-resolve
+                                                   'raster.compiler.backend.jvm.bytecode/compile-invocation-input-region)
+                                                  emission expression index)]
+                                      (when-not (and (identical? input (:input region))
+                                                     (identical? carrier
+                                                                 (get-in region [:input-contract :target-carrier])))
+                                        (unowned!))
+                                      (lower-owned-input region env "call_input"))))))
                             (range) (:inputs context))
-                      selected (capture-selected-helper-emission operation implementation-op (count inputs) (:method context))
                       indices (vec (keep-indexed #(when (get-in @state [:activity %2]) %1) inputs))
                       helper (get-paired-helper-program (:emission selected) indices)
                       companion (vary-meta (ad-gensym "body_helper") assoc
@@ -7461,7 +7509,7 @@
                             outlined?
                             (let [region ((requiring-resolve 'raster.compiler.backend.jvm.bytecode/compile-array-index-region)
                                           emission original)]
-                              (lower-integer-input region env "array_index"))
+                              (lower-owned-input region env "array_index"))
                             :else index)]
                   (append! result (with-meta (list 'clojure.core/aget (:value source) index-value)
                                             {:raster.type/tag tag
@@ -7487,7 +7535,7 @@
                   (fail! {:phase :array-allocation :form expression}))
                 (let [region ((requiring-resolve 'raster.compiler.backend.jvm.bytecode/compile-array-count-region)
                               emission expression)
-                      count-value (lower-integer-input region env "allocation_count")
+                      count-value (lower-owned-input region env "allocation_count")
                       constructor (if (= array-tag 'doubles) 'clojure.core/double-array 'clojure.core/float-array)]
                   ;; Keep the potentially failing allocation immediately after
                   ;; its original completed count. Freshness is not permission
@@ -7804,7 +7852,7 @@
                                   :validate-input-regions!
                                   (fn [regions]
                                     (when-not (identical? regions (:input-regions ordered))
-                                      (throw (ex-info "Integer input siblings lost their enclosing caller"
+                                      (throw (ex-info "Input siblings lost their enclosing caller"
                                                       {:reason :ad-unowned-bytecode-input-spec}))))}}
            :program program :helpers helpers})))))
 
