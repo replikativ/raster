@@ -3990,11 +3990,13 @@
                 (contains? #{:double :float :long :int :bool}
                            (:type (get locals arg))))))))
 
-(defn- emit-dot-handler
-  "Emit bytecode for (. obj method args...) — instance method or field access.
+(def ^{:private true :arglists '([code args locals ctx])
+       :doc "Emit bytecode for (. obj method args...) — instance method or field access.
   Handles two paths:
   - invokedynamic path: .invk on a namespace-qualified -impl var with IFn__ interface
-  - Regular path: invokeinterface/invokevirtual with optional instanceof guard"
+  - Regular path: invokeinterface/invokevirtual with optional instanceof guard"}
+  emit-dot-handler
+  (fn emit-dot-handler
   [code args locals ctx]
   (let [[obj member & margs] args
         object-call-result? (or (:object-call-result? ctx) (:preserve-source-call-results? ctx))
@@ -4002,7 +4004,9 @@
         [meth-name method-args] (if (seq? member)
                                   [(first member) (rest member)]
                                   [member margs])
-        meth-str (str meth-name)]
+        meth-str (str meth-name)
+        ;; Lookup may load/link Classes, but must not execute their initializers.
+        member-loader (.getClassLoader (class emit-dot-handler))]
     ;; invokedynamic path: .invk on a namespace-qualified -impl var
     ;; with an IFn__ interface tag. Emits invokedynamic instead of
     ;; RT.var().getRawRoot() + invokeinterface, giving C2 a
@@ -4173,8 +4177,8 @@
                                    cls-name (namespace s)
                                    meth-name (name s)
                                    src-ns (or (:source-ns ctx) *ns*)
-                                   cls (or (try (Class/forName cls-name) (catch Exception _ nil))
-                                           (when-let [r (ns-resolve src-ns (symbol cls-name))]
+                                   cls (or (try (Class/forName cls-name false member-loader) (catch Exception _ nil))
+                                           (when-let [r (types/resolve-type-reference-symbol src-ns (symbol cls-name) false)]
                                              (when (class? r) r)))]
                                (when cls
                                  (when-let [m (first (filter #(= (.getName ^java.lang.reflect.Method %)
@@ -4187,14 +4191,14 @@
             type-verified? (and (nil? obj-meta-tag) (some? obj-hint))
             src-ns (or (:source-ns ctx) *ns*)
             cls (when (and obj-tag (pos? (count (str obj-tag))))
-                  (or (try (Class/forName (str obj-tag)) (catch Exception _ nil))
-                      (when-let [r (ns-resolve src-ns (symbol (str obj-tag)))]
+                  (or (try (Class/forName (str obj-tag) false member-loader) (catch Exception _ nil))
+                      (when-let [r (types/resolve-type-reference-symbol src-ns (symbol (str obj-tag)) false)]
                         (when (class? r) r))
                       ;; Inlined helpers retain their declared type tag even when
                       ;; the caller's namespace does not import that class.
                       ;; Reuse the compiler's class authority, not a name search.
                       (let [resolved (binding [*ns* src-ns]
-                                       (types/tag->check-class (symbol (str obj-tag))))]
+                                       (types/tag->check-class (symbol (str obj-tag)) false))]
                         (when-not (= Object resolved) resolved))))]
         (if-not cls
           (throw (ex-info (str "Cannot resolve class for: (. " obj " " meth-str ")")
@@ -4223,9 +4227,9 @@
                        ;; Resolve arg classes from tags
                         arg-classes (mapv (fn [tag]
                                             (when (and tag (pos? (count (str tag))))
-                                              (try (Class/forName (str tag))
+                                              (try (Class/forName (str tag) false member-loader)
                                                    (catch Exception _
-                                                     (try (when-let [r (ns-resolve src-ns (symbol (str tag)))]
+                                                     (try (when-let [r (types/resolve-type-reference-symbol src-ns (symbol (str tag)) false)]
                                                             (when (class? r) r))
                                                           (catch Exception _ nil))))))
                                           arg-tags)]
@@ -4389,12 +4393,12 @@
                       long    (do (emit-unbox-to-prim code :long) :long)
                       int     (do (emit-unbox-to-prim code :int) :int)
                     ;; Default: try as class, CHECKCAST if ref
-                      (if-let [cls (try (Class/forName (str registry-tag))
+                      (if-let [cls (try (Class/forName (str registry-tag) false member-loader)
                                         (catch Exception _ nil))]
                         (do (.checkcast code (class-desc-of cls))
                             (class-type->stack cls))
                         jvm-type))
-                    jvm-type))))))))))
+                    jvm-type)))))))))))
 
 ;; ================================================================
 ;; emit-form handlers — extracted from the main dispatch for clarity
@@ -4470,17 +4474,20 @@
         (throw (ex-info (str "Unresolved symbol in bytecode emit: " form)
                         {:symbol form :locals (keys locals)}))))))
 
-(defn- emit-keyword-invoke
-  "Emit bytecode for (:key obj) or (:key obj default) — keyword invocation."
+(def ^{:private true :arglists '([code head args locals ctx])
+       :doc "Emit bytecode for (:key obj) or (:key obj default) — keyword invocation."}
+  emit-keyword-invoke
+  (fn emit-keyword-invoke
   [code head args locals ctx]
   (let [obj-form (first args)
         obj-hint (when (symbol? obj-form) (:hint (get locals obj-form)))
         field-name (name head)
         jvm-field-name (.replace ^String field-name "-" "_")
         src-ns (or (:source-ns ctx) *ns*)
+        member-loader (.getClassLoader (class emit-keyword-invoke))
         field-cls (when obj-hint
-                    (or (try (Class/forName (str obj-hint)) (catch Exception _ nil))
-                        (when-let [r (ns-resolve src-ns (symbol (str obj-hint)))]
+                    (or (try (Class/forName (str obj-hint) false member-loader) (catch Exception _ nil))
+                        (when-let [r (types/resolve-type-reference-symbol src-ns (symbol (str obj-hint)) false)]
                           (when (class? r) r))))
         field (when field-cls
                 (try (.getField ^Class field-cls jvm-field-name) (catch Exception _ nil)))]
@@ -4509,7 +4516,7 @@
             :ref)
           (do (.invokeinterface code ifn-cd "invoke"
                                 (MethodTypeDesc/of obj-cd (into-array ClassDesc [obj-cd])))
-              :ref))))))
+              :ref)))))))
 
 (defn- loop-recur-value-type
   "A recurrence may join different numeric branch widths even when the emitted
