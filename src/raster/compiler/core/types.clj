@@ -486,9 +486,26 @@
 
 (declare resolve-type-ref->class)
 
+(defn resolve-type-reference-symbol
+  "Resolve a type-reference symbol through the existing namespace policy.
+   With initialization disabled, project only Clojure's dotted/array Class-name
+   branch onto RT's noninitializing lookup; other symbol resolution is unchanged.
+   This preserves RT's initiating-loader policy and can still load/link classes."
+  [source-ns tag initialize?]
+  (if (and (not initialize?) (nil? (namespace tag))
+           (or (and (pos? (.indexOf ^String (name tag) "."))
+                    (not (.endsWith ^String (name tag) ".")))
+               (.startsWith ^String (name tag) "[")))
+    (try (clojure.lang.RT/classForNameNonLoading (name tag))
+         (catch ClassNotFoundException _ nil))
+    (ns-resolve source-ns tag)))
+
 (defn tag->check-class
-  "Resolve tag to the Class used in instanceof checks."
-  [tag]
+  "Resolve tag to the Class used in instanceof checks. The optional flag
+   controls initialization for lookup-only compiler consumers; the default
+   preserves the existing dispatch/construction policy."
+  ([tag] (tag->check-class tag true))
+  ([tag initialize?]
   (let [base (compound-tag-base tag)]
     (or (get primitive-info base)
         (get primitive-array-info base)
@@ -502,34 +519,40 @@
           (if (and (str/includes? (name base) "__")
                    (get @tag-class-registry base))
             (get @tag-class-registry base)
-            (if-let [cls (resolve-type-ref->class base)]
+            (if-let [cls (resolve-type-ref->class base initialize?)]
               cls
               (get @tag-class-registry base Object))))
-        Object)))
+        Object))))
 
-(defn resolve-type-ref->class
-  "Normalize a type reference symbol to a Class."
-  [tag]
+(def ^{:arglists '([tag] [tag initialize?])
+       :doc "Normalize a type reference to a Class. Noninitializing lookup retains this resolver's own defining loader; it can still load/link classes."}
+  resolve-type-ref->class
+  (fn resolve-type-ref->class
+  ([tag] (resolve-type-ref->class tag true))
+  ([tag initialize?]
   (if (compound-tag? tag)
-    (resolve-type-ref->class (compound-tag-base tag))
+    (resolve-type-ref->class (compound-tag-base tag) initialize?)
     (let [resolved
           (or
            (when (and (namespace tag)
                       (str/includes? (namespace tag) "."))
-             (try (Class/forName (str tag))
+             (try (Class/forName (str tag) initialize?
+                                 (.getClassLoader (class resolve-type-ref->class)))
                   (catch ClassNotFoundException _ nil)))
            (when-let [alias-ns (and (namespace tag)
                                     (get (ns-aliases *ns*) (symbol (namespace tag))))]
-             (ns-resolve alias-ns (symbol (name tag))))
-           (resolve tag)
+             (resolve-type-reference-symbol alias-ns (symbol (name tag)) initialize?))
+           (if initialize? (resolve tag)
+               (resolve-type-reference-symbol *ns* tag false))
            (when (and (nil? (namespace tag))
                       (str/includes? (name tag) "."))
-             (try (Class/forName (name tag))
+             (try (Class/forName (name tag) initialize?
+                                 (.getClassLoader (class resolve-type-ref->class)))
                   (catch ClassNotFoundException _ nil))))]
       (cond
         (class? resolved) resolved
         (var? resolved) (let [v @resolved] (when (class? v) v))
-        :else nil))))
+        :else nil))))))
 
 (defn boxed-return-incompatible?
   "A known primitive result cannot box into an unrelated declared reference.
