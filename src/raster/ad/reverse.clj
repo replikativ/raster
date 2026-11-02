@@ -4906,6 +4906,32 @@
                 (list 'raster.par/reduce acc init-sym idx bound body))))
       (emit-carry-scan spec))))
 
+(def ^:dynamic *shift-ordered-origins*
+  "Whether AD preparation rewrites an ordered reduction counting from a nonzero
+  literal origin into one counting from 0 (`shift-origin`). The reverse path
+  does; forward mode differentiates such loops directly (its ordered-loop rule
+  keeps the origin) and binds this false."
+  true)
+
+(defn- shift-origin
+  "A carry recurrence counting from `origin` as one counting from 0, as
+  par/reduce and par/scan do: a fresh index runs over [0, max(0, bound −
+  origin)) and the body rebinds the source index to fresh + origin, so its
+  reads and update are unchanged. Identity for origin 0."
+  [origin {:keys [idx bound body dtype] :as spec}]
+  (if (zero? origin)
+    spec
+    (with-ad-gensym
+      (let [shifted (ad-gensym "origin_idx" 'long)]
+        (assoc spec
+               :idx shifted
+               :bound (list 'clojure.core/max 0 (list 'clojure.core/- bound origin))
+               ;; the scope around the update carries the carry's proven dtype
+               :body (let [scope (list 'let* [idx (list 'clojure.core/+ shifted origin)] body)]
+                       (if-let [tag (case dtype :double 'double :float 'float nil)]
+                         (with-meta scope {:raster.type/tag tag})
+                         scope)))))))
+
 (defn- carry-loop->scan
   "Rewrite a carry loop into its canonical par/scan form, or nil when the
   soundness gates decline (see patterns/match-carry-loop). Two shapes:
@@ -4966,7 +4992,9 @@
            dtype (or (carry-scan-dtype acc-init)
                      (carry-scan-dtype scoped-update-expr))]
        (when (and (seq bindings)
-                  (= 0 index-init)
+                  (integer? index-init)
+                  (or (zero? index-init)
+                      (and *shift-ordered-origins* (<= 0 index-init Long/MAX_VALUE)))
                   (= :exclusive bound-mode)
                   (patterns/acc-ref? else-expr acc-sym)
                   (not (patterns/contains-sym? bound-expr index-sym))
@@ -4980,12 +5008,14 @@
                   (some? dtype)
                   (carry-dtype-consistent? dtype scoped-update-expr)
                   (active-reads-match-dtype? dtype scoped-update-expr))
-         (emit-carry-recurrence {:out nil
-                           :dtype dtype
-                           :cast (case dtype :float 'float :double nil)
-                           :acc acc-sym :idx index-sym
-                           :bound bound-expr :init acc-init
-                           :body scoped-update-expr}))))))
+         (emit-carry-recurrence
+          (shift-origin index-init
+                        {:out nil
+                         :dtype dtype
+                         :cast (case dtype :float 'float :double nil)
+                         :acc acc-sym :idx index-sym
+                         :bound bound-expr :init acc-init
+                         :body scoped-update-expr})))))))
 
 (defn- canonicalize-carry-loops
   "Walk a (post-lift) prep form and materialize surviving carry loops as
