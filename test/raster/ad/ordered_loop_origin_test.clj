@@ -68,3 +68,27 @@
         [v _ d] (f ys mu)]
     (is (close? v (reduce + (map #(- (+ (* 0.5 (- % mu) (- % mu)) 0.9189385332046727 0.6931471805599453)) ys))))
     (is (close? d (reduce + (map #(- % mu) ys))))))
+
+;; Two carries where only one reaches the result: the other carry's cotangent at
+;; loop exit is zero. Its per-step pullback treats the double-tagged cotangent as
+;; present, so the backward loop must seed it with 0.0, not nil.
+(deftm carried-variance [theta :- (Array double), ys :- (Array double), cnt :- Long] :- Double
+  (let [mu (ra/aget theta 0) a0 (ra/aget theta 1) a1 (ra/aget theta 2) b1 (ra/aget theta 3)]
+    (loop [t 1 s 1.0 acc 0.0]
+      (if (< t cnt)
+        (let [e (n/- (ra/aget ys (- t 1)) mu)
+              s2 (n/+ a0 (n/+ (n/* a1 (n/* e e)) (n/* b1 s)))
+              r (n// (n/- (ra/aget ys t) mu) s2)]
+          (recur (inc t) s2 (n/- acc (n/+ (n/* 0.5 (n/* r r)) s2))))
+        acc))))
+
+(deftest absent-carry-cotangents-stay-nil-safe-when-compiled
+  (let [compiled (rev/value+grad #'carried-variance :wrt [0] :compile? true)
+        theta [0.1 1.2 0.3 0.4]
+        [v g] (compiled (double-array theta) ys 20)
+        h 1e-6
+        f #(carried-variance (double-array %) ys 20)]
+    (is (close? v (f theta)))
+    (doseq [j (range 4)]
+      (is (< (Math/abs (- (aget ^doubles g j) (/ (- (f (update theta j + h)) (f (update theta j - h))) (* 2 h))))
+             1e-5)))))

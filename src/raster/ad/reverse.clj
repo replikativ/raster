@@ -2373,7 +2373,13 @@
               (if result-var
                 ;; Simple result: seed the matching loop var with dy, others nil
                 (mapcat (fn [lv d-sym]
-                          [d-sym (if (= lv result-var) 'dy__rad nil)])
+                          [d-sym (cond (= lv result-var) 'dy__rad
+                                       ;; A typed scalar carry that does not reach the
+                                       ;; result has a zero cotangent at exit. Seed it as
+                                       ;; a present 0.0: its per-step pullback treats a
+                                       ;; double-tagged cotangent as present.
+                                       (= 'double (:raster.type/tag (meta lv))) 0.0
+                                       :else nil)])
                         active-loop-vars d-lv-syms)
                 ;; Compound result: use pre-computed seed symbols
                 (mapcat (fn [d-sym seed-sym] [d-sym seed-sym])
