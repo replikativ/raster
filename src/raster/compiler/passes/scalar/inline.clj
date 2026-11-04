@@ -637,7 +637,10 @@
                                  ;; A successfully substituted single-use lambda no
                                  ;; longer has a value use. Remove its pure closure
                                  ;; construction before activity sees its captures.
-                                 references (reduce into #{} (map util/free-syms (concat transformed body')))
+                                 ;; Only scopes that bind a transparent lambda can
+                                 ;; drop a binding, so only they pay for the scan.
+                                 references (when (some #(get local-known %) binders)
+                                              (reduce into #{} (map util/free-syms (concat transformed body'))))
                                  pairs (filterv (fn [[binder _]]
                                                   (not (and (get local-known binder)
                                                             (not (contains? references binder)))))
@@ -650,10 +653,13 @@
                   (let [clean (vary-meta expression dissoc :raster.op/lexical-callee)
                         {:keys [implementation-op arguments]} (op/call-description clean)
                         callee (when (contains? lexical implementation-op) implementation-op)
-                        args (mapv #(go % lexical known) arguments)
                         info (get known callee)]
-                    (if (and info (= (count (:params info)) (count args)))
-                      (let [argument-bindings (atom [])
+                    ;; Walk the arguments only on the substitution path. The other
+                    ;; path walks every child below, and walking arguments for both
+                    ;; doubles the work at each nesting level (2^depth).
+                    (if (and info (= (count (:params info)) (count arguments)))
+                      (let [args (mapv #(go % lexical known) arguments)
+                            argument-bindings (atom [])
                             subst (argument-substitution (:params info) args nil param-env
                                                          #(swap! argument-bindings conj %) true)
                             body (util/subst-syms subst (:body info))]
