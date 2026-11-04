@@ -244,3 +244,18 @@
         (is (= (meta params) (meta vector)))
         (is (= 'double (:raster.type/tag (meta binder))))
         (is (nil? (:tag (meta binder))) "vector return hint does not become a formal coercion")))))
+
+(deftest nested-calls-are-walked-once
+  ;; Each call level used to walk its arguments twice, so preparation time
+  ;; doubled with every nesting level. Sixty levels would never finish.
+  (let [depth 60
+        nested (reduce (fn [inner _] (list 'clojure.core/+ inner 1.0))
+                       '(square x) (range depth))
+        body (list 'let* '[square (fn* [v] (* v v))] nested)
+        prepared (deref (future (inline/inline-transparent-lexical-calls body {'x 'double}))
+                        10000 ::timeout)]
+    (is (not= ::timeout prepared))
+    (is (not-any? #{'square} (filter symbol? (tree-seq coll? seq prepared)))
+        "the single-use lambda is still substituted at the innermost call")
+    (is (= (execute-source body '[x] [3.0])
+           (execute-source prepared '[x] [3.0])))))
