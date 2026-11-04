@@ -23,8 +23,8 @@
           c (compiled/instantiate! prepared)
           foreign (compiled/instantiate! prepared)]
       (try
-        (let [fact (compiled/measure-storage-representation! c :float)
-              foreign-fact (compiled/measure-storage-representation! foreign :float)
+        (let [foreign-fact (compiled/measure-storage-representation! foreign :float)
+              fact (compiled/measure-storage-representation! c :float)
               session (:session (:executable c))
               order (:byte-order @fact)]
           (is (= (probe/expected-bytes :float order) (:observed-bytes @fact)))
@@ -63,6 +63,9 @@
                                                 :ocl:0 'raster.gpu.ocl-runtime) 'kernel-registry)
                 registry-entry (fn [name] (get @(deref registry) name))
                 cached-kernel (:kernel-handle (registry-entry "rstr_storage_probe_float"))]
+            (is (= (:arena-id @session)
+                   (:arena-id (registry-entry "rstr_storage_probe_float")))
+                "the cached probe registration belongs to the measured session")
             (compiled/measure-storage-representation! c :float)
             (is (some? cached-kernel))
             (is (identical? cached-kernel (:kernel-handle (registry-entry "rstr_storage_probe_float")))

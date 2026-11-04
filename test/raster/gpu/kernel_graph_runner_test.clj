@@ -96,7 +96,7 @@
             "buffer-as-float-buffer" identity
             "buffer-as-int-buffer" identity
             "free-buffer!" #(swap! freed conj %)
-            "register-kernel!" (fn [kernel-name artifact]
+            "register-kernel!" (fn [kernel-name artifact _arena-id]
                                  (swap! registered conj [kernel-name artifact]))
             "bind-kernel-call" (fn [call & _]
                                  (let [prepared {:mock-call call}]
@@ -203,7 +203,7 @@
         resolver
         (fn [_ name]
           (case name
-            "register-kernel!" (fn [kernel-name emitted]
+            "register-kernel!" (fn [kernel-name emitted _arena-id]
                                  (swap! registered conj [kernel-name emitted]))
             "bind-kernel-call" (fn [call & _] {:kernel-call call})
             "record-graph!" (fn [prepared opts]
@@ -490,3 +490,116 @@
             (is (= [[:profile-lock true] :profile-complete :destroy] @calls))
             (is (= :closed (:lifecycle @sess)))
             (finally (deliver proceed true))))))))
+
+(deftest public-session-bindings-retire-their-own-registrations
+  ;; Model the existing backend registry contract, including its two-argument
+  ;; ambient fallback. Registration Cleanup owners survive bound-handle release;
+  ;; only closing the correct session arena retires them.
+  (doseq [ambient [nil :foreign-arena]
+          boundary [:graph :call :descriptor-artifact :descriptor-graph]]
+    (let [registry (atom {}) released (atom [])
+          register! (fn register!
+                      ([name artifact] (register! name artifact ambient))
+                      ([name artifact arena]
+                       (let [owner (cleanup/owner
+                                     [{:id :registration
+                                       :release #(do (swap! released conj name)
+                                                     (swap! registry dissoc name))}])]
+                         (swap! registry assoc name {:artifact artifact :arena arena
+                                                     ::cleanup/owner owner}))))
+          close-arena! (fn [arena]
+                         (doseq [[_ entry] @registry :when (= arena (:arena entry))]
+                           (cleanup/release! (::cleanup/owner entry))))
+          rename-artifact (fn [prefix operation]
+                            (let [old (:kernel-name operation) name (str prefix old)]
+                              (artifact/make
+                               (assoc (into {} operation) :kernel-name name
+                                      :source (.replace (:source operation) old name)))))
+          executable (fn [prefix]
+                       (if (contains? #{:graph :descriptor-graph} boundary)
+                         (update (emitted-graph) :nodes
+                                 #(mapv (fn [node]
+                                          (update node :operation (partial rename-artifact prefix))) %))
+                         (rename-artifact prefix (probe-artifact))))
+          session (fn [id]
+                    (let [allocation (bview/allocation
+                                      {:id [id :input] :byte-size 4100 :memory-space :shared
+                                       :device :ze:0 :coherence :host-coherent :ownership :borrowed})
+                          output-allocation (assoc allocation :id [id :output])
+                          input {:id [id :input] :dtype :float :n-elements 1025 :byte-size 4100}
+                          output (assoc input :id [id :output])]
+                      (atom {:device-id :ze:0 :session-id id :arena-id id
+                             :buffers {:x input :values input :out output}
+                             :allocations {:x allocation :values allocation :out output-allocation}
+                             :buffer-owners {} :prepared {} :graphs {} :kernel-graphs {} :events {}
+                             :closed? false})))
+          first-session (session :first-session) second-session (session :second-session)
+          first-executable (executable "first_") second-executable (executable "second_")
+          names (fn [operation]
+                  (if (contains? #{:graph :descriptor-graph} boundary)
+                    (set (map #(get-in % [:operation :kernel-name]) (:nodes operation)))
+                    #{(:kernel-name operation)}))
+          resolver (fn [_ name]
+                     (case name
+                       "register-kernel!" register!
+                       "close-kernel-arena!" close-arena!
+                       "bind-kernel-call" (fn [call & _]
+                                             {:kernel-call call ::cleanup/owner (cleanup/owner [])})
+                       "record-graph!" (fn [prepared opts] {:prepared prepared :opts opts})
+                       "make-buffer" (fn [n dtype opts]
+                                       (lifecycle/native-buffer
+                                        #(hash-map :dtype dtype :n-elements n :byte-size (* 4 n))
+                                        (fn [_]) opts))
+                       "free-buffer!" (fn [buffer] (cleanup/release! (::cleanup/owner buffer)))
+                       (throw (ex-info "unexpected ownership fixture runtime request" {:name name}))))
+          soft-resolver (fn [_ name]
+                          (case name
+                            "destroy-graph!" (fn [_])
+                            "destroy-prepared!" (fn [prepared]
+                                                  (cleanup/release! (::cleanup/owner prepared)))
+                            nil))
+          bind! (fn [sess operation]
+                  (case boundary
+                    :graph (gpu/bind-kernel-graph! sess :bound operation {'values :values 'out :out}
+                                                  {'n {:type :int :value 1025}})
+                    :call (gpu/bind-kernel-call! sess :bound operation
+                                                [:x :out {:type :int :value 1025}])
+                    (:descriptor-artifact :descriptor-graph)
+                    (gpu/bind-step!
+                     sess {:convention :executable :phase :bound :artifact operation
+                           :kernel-name (:kernel-name operation)
+                           :argument-specs
+                           (mapv (fn [slot symbol]
+                                   (if (= :scalar (:kind slot))
+                                     {:kind :scalar :sym symbol :type (:dtype slot)
+                                      :value-fn (constantly 1025)}
+                                     {:kind (:kind slot) :sym symbol}))
+                                 (:abi operation) (:arguments operation))}
+                     [] {'x :x 'values :values 'out :out})))]
+      (with-redefs-fn
+        {(ns-resolve 'raster.gpu.core 'rt-resolve) resolver
+         (ns-resolve 'raster.gpu.core 'rt-resolve-soft) soft-resolver}
+        (fn []
+          (register! "foreign_bound_call_probe" (rename-artifact "foreign_" (probe-artifact)) ambient)
+          (try
+            (bind! first-session first-executable)
+            (bind! second-session second-executable)
+            (doseq [[sess operation] [[first-session first-executable]
+                                    [second-session second-executable]]]
+              (is (= (names operation)
+                     (set (keep (fn [[name entry]]
+                                  (when (= (:arena-id @sess) (:arena entry)) name)) @registry)))
+                  (str boundary " registration belongs to its owning session, ambient=" ambient)))
+            (gpu/close-session! first-session)
+            (is (= (conj (names second-executable) "foreign_bound_call_probe") (set (keys @registry)))
+                "closing one session preserves the other session and foreign registration")
+            (is (= (names first-executable) (set @released)))
+            (gpu/close-session! second-session)
+            (is (= #{"foreign_bound_call_probe"} (set (keys @registry))))
+            (is (= (into (names first-executable) (names second-executable)) (set @released)))
+            (finally
+              (gpu/close-session! first-session)
+              (gpu/close-session! second-session)
+              (close-arena! ambient)))
+          (is (empty? @registry))
+          (is (= (count @released) (count (set @released))) "registration release occurs once"))))))
