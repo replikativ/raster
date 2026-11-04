@@ -164,6 +164,70 @@
     (throw (ex-info "Borrowed CUDA slice has no destruction authority" {:reason :missing-cleanup-owner})))
   (cleanup/release! (::cleanup/owner buffer)))
 
+(defn copy-buffer-range!
+  "Copy a checked resident element range on the runtime's explicit stream.
+   Both canonical buffer uses remain owned until completion or retained rollback debt."
+  [src dst src-element dst-element elements]
+  (assert-buffer-live! src)
+  (assert-buffer-live! dst)
+  (when-not (= (:dtype src) (:dtype dst))
+    (throw (ex-info "CUDA resident copy requires identical storage dtypes"
+                    {:reason :cuda-copy-dtype :source-dtype (:dtype src)
+                     :destination-dtype (:dtype dst)})))
+  (when-not (and (every? #(and (integer? %) (<= 0 % Long/MAX_VALUE))
+                         [src-element dst-element elements])
+                 (<= (+' src-element elements) (:n-elements src))
+                 (<= (+' dst-element elements) (:n-elements dst)))
+    (throw (ex-info "CUDA resident copy range exceeds its buffer capacity"
+                    {:reason :cuda-copy-range :src-element src-element
+                     :dst-element dst-element :elements elements})))
+  (when (pos? elements)
+    (let [width (long (dtype/bytes-of (:dtype src)))
+          bytes (Math/multiplyExact (long elements) width)
+          src-pointer (Math/addExact (long (:device-pointer src))
+                                     (Math/multiplyExact (long src-element) width))
+          dst-pointer (Math/addExact (long (:device-pointer dst))
+                                     (Math/multiplyExact (long dst-element) width))
+          src-end (Math/addExact src-pointer bytes)
+          dst-end (Math/addExact dst-pointer bytes)]
+      ;; Liveness above admits one exact context generation. Physical intervals
+      ;; detect overlap even when different borrowed views share an allocation.
+      (when (and (< src-pointer dst-end) (< dst-pointer src-end))
+        (throw (ex-info "CUDA resident copy ranges overlap"
+                        {:reason :cuda-copy-overlap})))
+      (let [ledger (:prepared-execution @state) stream (:stream @state)
+            pending (prepared-execution/binding-state)
+            src-use (volatile! nil) dst-use (volatile! nil)
+            operation-owner
+            (cleanup/owner
+             [{:id :pending-completion
+               :release #(prepared-execution/drain! ledger pending stream native!)}
+              {:id :source-use :after #{:pending-completion}
+               :release #(when-let [lease @src-use]
+                           (cleanup/release! (::cleanup/owner lease)))}
+              {:id :destination-use :after #{:pending-completion}
+               :release #(when-let [lease @dst-use]
+                           (cleanup/release! (::cleanup/owner lease)))}])
+            value
+            (cleanup/build!
+             operation-owner
+             (fn []
+               ;; Pure owner admission precedes queue/root locking. A rejected
+               ;; reservation acquired nothing; earlier reservations can roll back.
+               (vreset! src-use (cleanup/retain-use! (owner! src)))
+               (vreset! dst-use (cleanup/retain-use! (owner! dst)))
+               (prepared-execution/submit!
+                ledger pending stream native!
+                #(do (assert-buffer-live! src) (assert-buffer-live! dst))
+                :copy [dst-pointer src-pointer bytes stream] false)
+               {})
+             #(prepared-execution/retain-debt! ledger %))]
+        (try (cleanup/release! (::cleanup/owner value))
+             (catch Throwable failure
+               (prepared-execution/retain-debt! ledger (::cleanup/owner value))
+               (throw failure))))))
+  dst)
+
 (defn- host-segment [host]
   (if (instance? MemorySegment host) host (MemorySegment/ofArray host)))
 
