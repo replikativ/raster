@@ -9,7 +9,8 @@
             [raster.compiler.backend.jvm.bytecode :as bytecode]
             [raster.compiler.backend.jvm.hoisted :as hoisted]
             [raster.compiler.core.inference :as inf]
-            [raster.compiler.passes.scalar.normal-return :as normal-return])
+            [raster.compiler.passes.scalar.normal-return :as normal-return]
+            [raster.compiler.core.outline :as outline])
   (:import [java.lang.reflect Method]))
 
 ;; ================================================================
@@ -123,6 +124,15 @@
     (form/binding-form? expr)
     (expr-returns-void? (last expr))
     :else false))
+
+(def ^:private ^:const OUTLINE_THRESHOLD
+  "Estimated size above which a helper's loop-body blocks are outlined.
+   HotSpot refuses to JIT-compile methods over 8000 bytes of bytecode."
+  6000)
+
+(def ^:private ^:const OUTLINE_CHUNK_BUDGET
+  "Target estimated size of each outlined chunk method."
+  2500)
 
 (defn- extractable-binding?
   "True if a binding's init expression should be extracted to a separate method.
@@ -320,16 +330,42 @@
                      (if (extractable-binding? expr)
                        ;; Extract to a separate method
                        (let [method-name (symbol (str "helper_" (swap! helper-counter inc)))
+                             ;; A helper above HotSpot's 8000-byte JIT limit runs
+                             ;; interpreted forever. Split oversized loop-body blocks
+                             ;; into sibling methods before the helper is emitted.
+                             outlined (when (> (estimate-bytecode-size expr) OUTLINE_THRESHOLD)
+                                        (let [chunk-counter (atom 0)]
+                                          (outline/outline
+                                           expr
+                                           {:size-of estimate-bytecode-size
+                                            :block-threshold OUTLINE_THRESHOLD
+                                            :chunk-budget OUTLINE_CHUNK_BUDGET
+                                            :new-name #(symbol (str method-name "_chunk_"
+                                                                    (swap! chunk-counter inc)))
+                                            :env (merge (into {} (map (fn [p] [p (tag-for-param p)])
+                                                                      all-compute-params))
+                                                        @type-env)})))
+                             chunk-names (set (map :name (:helpers outlined)))
+                             _ (doseq [{:keys [name params return-tag body]} (:helpers outlined)]
+                                 (swap! helper-specs conj
+                                        {:name name
+                                         :params params
+                                         :return-tag return-tag
+                                         :walked-body [(desugar-invk body)]
+                                         :element-type element-type
+                                         :source-binding sym
+                                         :source-expr body}))
+                             expr (if outlined (:form outlined) expr)
                              ;; Declare all in-scope locals, including earlier bindings,
                              ;; so a name colliding with a clojure.core fn (e.g.
                              ;; `seq`, `first`, `count`) is still captured into the
                              ;; helper — otherwise free-syms drops it as a core var and
                              ;; the helper body resolves it to the global fn (→ CCE).
-                             free (disj (binding [util/*shadowing-locals*
-                                                  (into util/*shadowing-locals*
-                                                        (keys @result-facts))]
-                                          (free-syms expr))
-                                        '.invk)
+                             free (apply disj (binding [util/*shadowing-locals*
+                                                        (into util/*shadowing-locals*
+                                                              (keys @result-facts))]
+                                                (free-syms expr))
+                                         '.invk chunk-names)
                              ;; Order free vars deterministically, params first
                              ordered-free (vec (concat
                                                 (filter free all-compute-params)
@@ -404,6 +440,37 @@
          inner-bindings (vec (mapcat identity rewritten-pairs))
          ;; Compute form: zero-fills + rewritten inner bindings
          compute-form (list* 'let* (vec (concat zero-fills inner-bindings)) body-exprs)
+         ;; The orchestrator can itself exceed HotSpot's 8000-byte JIT limit
+         ;; once a large program's bindings are inlined into it. Outline its
+         ;; straight-line bindings into sibling chunk methods; values keep the
+         ;; physical tag of their binding site (Object stays Object).
+         compute-form (if (<= (estimate-bytecode-size compute-form) OUTLINE_THRESHOLD)
+                        compute-form
+                        (let [frames (outline/new-frames)
+                              counter (atom 0)
+                              outlined (outline/outline-bindings
+                                        (mapv vec (partition 2 (concat zero-fills inner-bindings)))
+                                        (vec body-exprs)
+                                        (merge (into {} (map (fn [p] [p (tag-for-param p)]) all-compute-params))
+                                               @type-env)
+                                        {:size-of estimate-bytecode-size
+                                         :chunk-budget OUTLINE_CHUNK_BUDGET
+                                         :new-name #(symbol (str "compute_chunk_" (swap! counter inc)))
+                                         :frames frames
+                                         :lenient? true
+                                         :exclude (set (map :name @helper-specs))})]
+                          (if (seq (:helpers outlined))
+                            (do (doseq [{:keys [name params return-tag body]} (:helpers outlined)]
+                                  (swap! helper-specs conj
+                                         {:name name :params params :return-tag return-tag
+                                          :walked-body [(desugar-invk body)]
+                                          :element-type element-type
+                                          :source-binding name :source-expr body}))
+                                (list* 'let* (vec (mapcat identity
+                                                          (concat (outline/frame-bindings frames (:frame outlined))
+                                                                  (:pairs outlined))))
+                                       body-exprs))
+                            compute-form)))
          compute-form (desugar-invk compute-form)
          ;; Re-tag all bindings after extraction — helper calls return Object,
          ;; and the let* handler needs :tag metadata to emit checkcast
