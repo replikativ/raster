@@ -1931,7 +1931,7 @@ stable physical-leaf order on every backend."}
 ;; Late-pipeline type inference (moved from inline.clj to break cycle)
 ;; ================================================================
 
-(defn- var-ref-tag
+(defn var-ref-tag
   "Type tag for a QUALIFIED symbol that resolves to a constant Var — taken from
   the var's declared `:tag` (e.g. `(def ^{:tag 'double} pi ...)`) or, for a
   `:const` var, its numeric value's class. Returns nil for functions, generic

@@ -1443,6 +1443,13 @@
                                ;; infer-rewritten-tag deliberately does not stamp a
                                ;; standalone aget because JVM case merges still box it.
                                (inf/infer-aget-type rewr type-env)
+                               ;; A bare reference to a constant Var is qualified only in
+                               ;; the walked argument; type it by its declaration there
+                               ;; (`:const` or primitive `:tag`), as try-resolve-call does
+                               ;; for an already-qualified reference.
+                               (when (and (symbol? orig) (symbol? rewr) (namespace rewr)
+                                          (not (contains? type-env orig)))
+                                 (inf/var-ref-tag rewr))
                                (when (seq? rewr)
                                  (binding [*ns* source-ns]
                                    (inf/infer-rewritten-tag rewr orig type-env)))))
