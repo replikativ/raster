@@ -113,11 +113,9 @@
 ;; ================================================================
 
 (def ^:private valhalla?*
-  "Check if Valhalla value classes are available at runtime."
-  (try
-    (Class/forName "java.lang.classfile.ClassFile")
-    (>= (.feature (Runtime/version)) 27)
-    (catch ClassNotFoundException _ false)))
+  "Check if Valhalla value classes are available at runtime. One definition,
+  in the JVM backend, so the probe and its fallbacks cannot drift apart."
+  @(requiring-resolve 'raster.compiler.backend.jvm.valhalla/valhalla-available?))
 
 (defn gen-defvalue-class!
   "Generate and load a class for the given GA signature.

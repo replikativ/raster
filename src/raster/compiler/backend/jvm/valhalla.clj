@@ -11,16 +11,37 @@
 ;; JDK detection
 ;; ================================================================
 
+(defn- value-class-definable?
+  "Define a throwaway value class (no ACC_IDENTITY, class file 71.65535) in a
+  scratch loader. False when the JVM refuses it: preview features not enabled
+  (UnsupportedClassVersionError), or no Valhalla support. When the JDK exposes
+  Class::isValue, the probe class must also report itself as a value class."
+  []
+  (try
+    (eval
+     '(let [desc (java.lang.constant.ClassDesc/of "raster.valhalla_probe" "Probe")
+            bytes (.build (java.lang.classfile.ClassFile/of) desc
+                          (reify java.util.function.Consumer
+                            (accept [_ cb]
+                              (.withFlags ^java.lang.classfile.ClassBuilder cb (int 0x0011))
+                              (.withVersion ^java.lang.classfile.ClassBuilder cb 71 65535))))
+            cls (.defineClass (clojure.lang.DynamicClassLoader.) "raster.valhalla_probe.Probe" bytes nil)
+            is-value (some #(when (= "isValue" (.getName ^java.lang.reflect.Method %)) %)
+                           (.getMethods Class))]
+        (if is-value
+          (boolean (.invoke ^java.lang.reflect.Method is-value cls (object-array 0)))
+          true)))
+    (catch Throwable _ false)))
+
 (def valhalla-available?
-  "True if JDK supports Valhalla value classes (JDK 27+ with --enable-preview).
-  The ClassFile API alone (JDK 24+) is not sufficient — value classes require
-  the Valhalla extensions (no ACC_IDENTITY flag) which are only in JDK 27+."
+  "True if this JVM can define Valhalla value classes: JDK 27+ with the
+  ClassFile API, AND a value class actually loads (it needs --enable-preview
+  and a Valhalla-capable VM). A JDK 27 started without --enable-preview is
+  false here, so defvalue takes the identity-class path instead of failing."
   (try
     (Class/forName "java.lang.classfile.ClassFile")
-    ;; ClassFile API exists; now check if value classes are actually supported
-    ;; by verifying JDK version >= 27 (Valhalla preview)
-    (let [version (.feature (Runtime/version))]
-      (>= version 27))
+    (and (>= (.feature (Runtime/version)) 27)
+         (value-class-definable?))
     (catch ClassNotFoundException _ false)))
 
 ;; ================================================================
@@ -313,7 +334,11 @@
               bytes (generate-value-class-bytes class-name field-specs :interfaces interfaces)]
           (try
             (.defineClass ^clojure.lang.DynamicClassLoader loader class-name bytes nil)
-            (catch LinkageError _
+            (catch LinkageError e
+              ;; Only a duplicate definition is a plain LinkageError. Its subclasses
+              ;; (ClassFormatError, UnsupportedClassVersionError, VerifyError) are real
+              ;; failures and must surface, not turn into a ClassNotFoundException.
+              (when-not (= LinkageError (class e)) (throw e))
               ;; Class already defined in this loader (parametric cascading) — return existing.
               ;; This is expected during parametric specialization where multiple templates
               ;; reference the same defvalue type.
