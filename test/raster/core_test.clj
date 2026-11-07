@@ -132,10 +132,7 @@
 
 (def ^:private valhalla?
   "True if JDK supports Valhalla value classes (JDK 27+ with --enable-preview)."
-  (try
-    (Class/forName "java.lang.classfile.ClassFile")
-    (>= (.feature (Runtime/version)) 27)
-    (catch ClassNotFoundException _ false)))
+  @(requiring-resolve 'raster.compiler.backend.jvm.valhalla/valhalla-available?))
 
 (deftest defvalue-test
   (testing "creates record"
